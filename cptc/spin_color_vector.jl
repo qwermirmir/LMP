@@ -54,9 +54,13 @@ function Random_SpinM(matrix_type::String = "complex")
     elseif matrix_type == "real"
         # 4x4 실수 랜덤 행렬 생성
         mat = randn(4,4)
-
+        # 모든성분이 0인 행렬 생성 
     elseif matrix_type=="zero"
-        mat = zero(4,4)
+        mat = zeros(ComplexF64, 4,4)
+
+    elseif matrix_type=="Init"
+        mat = Matrix{ComplexF64}(I, 4, 4)
+    
     else
         error("지원하지 않는 matrix_type 입니다. 'complex' 혹은 'real'을 사용하세요.")
     end
@@ -81,7 +85,7 @@ end
 
 
 
-function zero(x::spin_color_vector) 
+function zero_spin!(x::spin_color_vector) 
     c1=similar(x[1])
     c2=similar(x[2])
     c3=similar(x[3])
@@ -206,8 +210,20 @@ function Base.:-(L::Array{G,1},K::Array{G,1}) where{G<:spin_color_vector}
 
 end    
 
+function Base.:*(A::Spin_matrix, B::Spin_matrix)
+    # A.sm, B.sm 는 각각 4x4 ComplexF64 행렬
+    return Spin_matrix(A.sm * B.sm)
+end
 
 
+function Base.:*(α::Number, W::Spin_matrix)
+    return Spin_matrix(α .* W.sm)
+end
+
+function Base.:+(A::Spin_matrix,B::Spin_matrix)
+    return Spin_matrix(A.sm+B.sm)
+
+end
 
 
 function Base.deepcopy_internal(f::spin_color_vector)
@@ -302,7 +318,7 @@ function PTC(U::Array{G,1},f::spin_color_vector) where{G<:AbstractGaugefields}
     W=Vector{Spin_matrix}()
 
     result=deepcopy(f)
-    zero(result)
+    zero_spin(result)
 
     for i=1:s
         m=Random_SpinM("real")
@@ -333,8 +349,95 @@ end
 
 
 function Clifford()
+    basis = Vector{Spin_matrix}()
 
-    basis=[]
+    # 1) 첫번째 기저: 단위행렬(Identity)
+    id4 = Random_SpinM("zero")
+    for i in 1:4
+        id4[i,i] = 1
+    end
+    push!(basis, id4)
+
+    # 2) gamma1
+    gamma1 = Random_SpinM("zero")
+    gamma1[1,3] = 1
+    gamma1[2,4] = 1
+    gamma1[3,1] = 1
+    gamma1[4,2] = 1
+    push!(basis, gamma1)
+
+    # 3) gamma2  (복소 항)
+    gamma2 = Random_SpinM("zero")
+    gamma2[1,4] = -im
+    gamma2[2,3] =  im
+    gamma2[3,2] =  im
+    gamma2[4,1] = -im
+    push!(basis, gamma2)
+
+    # 4) gamma3
+    gamma3 = Random_SpinM("zero")
+    gamma3[1,3] =  1
+    gamma3[2,4] = -1
+    gamma3[3,1] = -1
+    gamma3[4,2] =  1
+    push!(basis, gamma3)
+
+    # 5) gamma4 (혹은 gamma0)
+    gamma4 = Random_SpinM("zero")
+    gamma4[1,2] = 1
+    gamma4[2,1] = 1
+    gamma4[3,4] = -1
+    gamma4[4,3] = -1
+    push!(basis, gamma4)
+
+    # 6) gamma5 (단순 예: 대각에 -1, -1, +1, +1 인 경우)
+    gamma5 = Random_SpinM("zero")
+    gamma5[1,1] = -1
+    gamma5[2,2] = -1
+    gamma5[3,3] =  1
+    gamma5[4,4] =  1
+    push!(basis, gamma5)
+
+    # 7) pairwise products: gamma^mu gamma^nu (mu < nu)
+
+    push!(basis,gamma1*gamma2)
+    push!(basis,gamma1*gamma3)
+    push!(basis,gamma1*gamma4)
+    push!(basis,gamma2*gamma3)
+    push!(basis,gamma2*gamma4)
+    push!(basis,gamma3*gamma4)
+
+    # 8) gamma^5 gamma^mu (4개)
+    push!(basis, gamma5*gamma1)
+    push!(basis, gamma5*gamma2)
+    push!(basis, gamma5*gamma3)
+    push!(basis, gamma5*gamma4)
+
+
+
+    return basis
+end
+
+function Clifford(W::Spin_matrix)
+    
+    weight=Random_SpinM("zero")
+    basis=Clifford()
+
+    for i in 1:16
+        r = div(i-1, 4) + 1
+        c = mod(i-1, 4) + 1
+        weight += W[r,c] * basis[i]
+    end
+
+
+
+    return weight
+end 
+
+
+
+
+
 
 
 
