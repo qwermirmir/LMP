@@ -1,3 +1,16 @@
+module elementry_base  # 철자 수정
+
+
+export Hopping_operator
+export Onestep
+export Paths
+export PTC
+export CPTC
+export Random_SpinM
+export Generate_weight
+export Spin_matrix
+
+
 using LatticeQCD
 using Gaugefields
 using LatticeDiracOperators
@@ -258,6 +271,15 @@ function inner_product(x::WF3x1,f::WF3x1)
 end
 
 
+function norm2(x::WF3x1)
+    return inner_product(x,x)
+end
+
+
+
+
+
+
 
 
 struct path_number
@@ -287,20 +309,20 @@ end
 struct Paths
     various::Vector{Path}
 
-    # Paths 생성자를 확장하여 가변 길이 인수를 받음
-    function Paths(paths::Vector{Int64}...)
+    function Paths(paths::Vector{Vector{Int64}})
         various = [Path([path_number(x) for x in path]) for path in paths]
         return new(various)
     end
 end
 
 
+
 function Onestep()
     dirs = (1, 2, 3, 4, -1, -2, -3, -4)
-    # dirs를 Path로 매핑
     single_steps = [[d] for d in dirs]  # 각 값을 리스트로 감싸기
-    return Paths(single_steps...)  # 가변 인자로 넘겨주기
+    return Paths(single_steps)  # 가변 인자(...)를 제거
 end
+export Onestep
 
 
 struct Hopping_operator{G<:AbstractGaugefields}
@@ -405,5 +427,29 @@ function PTC(W::Vector{Spin_matrix},hop::Hopping_operator,x::WF3x1)
     
 
 end    
+
+
+function Base.:length(hop::Hopping_operator)
+    return length(hop.P)
+
+end
+
+
+function CPTC(hop::Hopping_operator,W::Vector{Spin_matrix},f::WF3x1)
+    
+    s=length(hop)
+    cW=Clifford(W)
+    result=PTC(cW,hop,f)
+
+
+    return result
+end
+
+end
+
+
+
+
+
 
 
