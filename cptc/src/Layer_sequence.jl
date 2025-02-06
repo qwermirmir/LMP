@@ -1,10 +1,20 @@
-include("elementry_base.jl")
 
 
 
 
+import ..ElementryBase
+using .elementry_base
 
-function Lossfunction(f::spin_color_vector,t::spin_color_vector)
+using LatticeQCD
+using Gaugefields
+using LatticeDiracOperators
+using LinearAlgebra
+const WF3x1 = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
+
+
+export PTC_Layer
+
+function Lossfunction(f::WF3x1,t::WF3x1)
 
     loss=f-t
     
@@ -19,10 +29,33 @@ struct PTC_Layer
     hop::Hopping_operator   # Hopping 연산자
     activation::Function    # 활성화 함수 (선택적)
 
-    function PTC_Layer(W::Vector{Spin_matrix}, hop::Hopping_operator; activation::Function = identity)
+    function PTC_Layer(hop::Hopping_operator{T}; W::Union{Nothing, Vector{Spin_matrix}}=nothing, activation::Function = identity) where T <: AbstractGaugefields
+        if W === nothing
+            W = Generate_weight(hop)
+        end
         new(W, hop, activation)
     end
 end
+
+struct CPTC_Layer
+    W::Vector{Spin_matrix}  # 가중치 행렬 (Spin_matrix 리스트)
+    hop::Hopping_operator   # Hopping 연산자
+    activation::Function    # 활성화 함수 (선택적)
+
+    function CPTC_Layer(hop::Hopping_operator{T}; W::Union{Nothing, Vector{Spin_matrix}}=nothing, activation::Function = identity) where T <: AbstractGaugefields
+        if W === nothing
+            W = Generate_weight(hop ,"Init")
+        end
+        new(W, hop, activation)
+    end
+end
+
+
+
+
+
+
+
 
 function (layer::PTC_Layer)(x::WF3x1)
     result = deepcopy(x)
@@ -52,9 +85,16 @@ end
 
 
 
+function forward_propagation(layers::Vector{PTC_Layer}, input::WF3x1)
+    result = deepcopy(input)
+    for layer in layers
+        result = layer(result)  # 각 레이어를 적용
+    end
+    return result
+end
 
 
-
+end
 
 
 
