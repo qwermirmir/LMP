@@ -1,0 +1,620 @@
+module Layer_types
+
+abstract type Layer end
+abstract type ActivationFunction end
+
+import ..elementry_base: Hopping_operator, Spin_matrix,AbstractSpinMatrix,Paths,Random_SpinM
+import ..gpu: Spin_matrix_GPU, Random_SpinM_GPU, Generate_weight
+
+
+using Gaugefields
+using LatticeDiracOperators
+using CUDA
+
+const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
+const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
+const GPUgauge=Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+
+const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
+
+export Layer, PTC_Layer, CPTC_Layer,ActivationFunction,Identity,Attention_Layer,Softmax,NormLayer,test_Layer,complexNormLayer
+export minmaxNormLayer, zscoreNormLayer
+export FullPTCAttention_Layer,Attention_Layer
+export xavier_init!
+export Dirac_Layer
+export PrallelTransportAttention_Layer
+export ModRelu
+export siteweight_Layer
+export RayleighQuotient_Layer
+export PtcRayleighQuotient_Layer
+# export L2Norm_Layer
+export HoppingRayleighQuotient_Layer
+export DenseLinearLayer
+export PTLayer
+export fermionfield_Layer
+export Orthogonal_Layer
+export Ritz_Layer  
+export GramSchmidt_Layer
+
+struct Identity <: ActivationFunction end
+
+struct Softmax <: ActivationFunction end
+
+struct RealSoftmax <: ActivationFunction end
+
+struct ModRelu <: ActivationFunction end
+
+
+
+
+
+function (Identity)(x::WF3x1)
+    return x
+end # 항등함수
+# Identity를 함수처럼 동작하게 만들기
+function (activation::Identity)(x)
+    return x  # 항등 함수
+end
+
+
+
+
+# mutable struct L2Norm_Layer <: Layer
+#     target::WF3x1
+#     activation::ActivationFunction
+#     function L2Norm_Layer(target::WF3x1,activation::ActivationFunction= Identity())
+#         new(target,activation)
+#     end
+# end
+
+
+
+
+
+mutable struct PTC_Layer{T<:AbstractSpinMatrix} <: Layer
+    W::Vector{T}  
+    hop::Hopping_operator   
+    residual::Bool
+    activation::ActivationFunction
+
+    function PTC_Layer(hop::Hopping_operator{G}, W::Vector{T}, residual::Bool=false, activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields, T<:AbstractArray{ComplexF64,2}}
+        new{T}(W, hop, residual, activation)
+    end
+
+    function PTC_Layer(hop::Hopping_operator{G}, W::Union{Nothing, Vector{T}}=nothing, residual::Bool=false, activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields, T<:AbstractArray{ComplexF64,2}}
+        if W === nothing
+            W = Generate_weight(hop)
+        end
+        return PTC_Layer(hop, W, residual, activation)
+    end
+end
+
+mutable struct CPTC_Layer{T<:AbstractSpinMatrix} <: Layer
+    W::Vector{T}  
+    hop::Hopping_operator   
+    residual::Bool   
+    activation::ActivationFunction
+
+    function CPTC_Layer(hop::Hopping_operator{G}, W::Union{Nothing, Vector{T}}=nothing, residual::Bool=false, activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields, T<:AbstractArray{ComplexF64,2}}
+        
+        if W === nothing
+            W = Generate_weight(hop, "Init")
+        end
+        
+        new{T}(W, hop, residual, activation)
+    end
+end
+
+
+struct Attention_Layer <: Layer
+    Q::Layer
+    K::Layer
+    V::Layer
+    nominator::Number
+    activation::ActivationFunction
+    
+    residual::Bool
+
+    function Attention_Layer(Q::Layer, K::Layer, V::Layer, nominator::Number , activation::ActivationFunction=Identity(), residual::Bool=false)
+        new(Q, K, V, nominator,activation, residual)
+    end
+
+    function Attention_Layer(Q::Layer, nominator::Number , activation::ActivationFunction=Identity(), residual::Bool=false)
+        K = deepcopy(Q)
+        V = deepcopy(Q)
+        WK = Generate_weight(K.hop)
+        WV = Generate_weight(V.hop)
+        K.W = WK
+        V.W = WV
+        new(Q, K, V, nominator, activation, residual)
+    end
+end
+
+
+mutable struct test_Layer <: Layer
+    Q::Layer
+    K::Layer
+    V::Layer
+    nominator::Float64
+    test::WF3x1
+    activation::ActivationFunction
+    residual::Bool
+
+    function test_Layer(Q::Layer, K::Layer, V::Layer, nominator::Float64 ,  test::WF3x1,  activation::ActivationFunction=Identity(), residual::Bool=false)
+        new(Q, K, V, nominator, test , activation,  residual)
+    end
+
+    function test_Layer(Q::Layer, nominator::Float64 ,test::WF3x1, activation::ActivationFunction=Identity(), residual::Bool=false )
+        K = deepcopy(Q)
+        V = deepcopy(Q)
+        WK = Generate_weight(K.hop)
+        WV = Generate_weight(V.hop)
+        K.W = WK
+        V.W = WV
+        new(Q, K, V, nominator, test, activation,  residual)
+    end
+end
+
+
+
+
+struct FullPTCAttention_Layer <: Layer
+    Q::Layer
+    K::Layer
+    V::Layer
+    nominator::Number
+    activation::ActivationFunction
+    residual::Bool
+
+    function FullPTCAttention_Layer(Q::Layer, K::Layer, V::Layer, nominator::Number ,    activation::ActivationFunction=Identity(), residual::Bool=false)
+        new(Q, K, V, nominator,  activation,  residual)
+    end
+
+    function FullPTCAttention_Layer(Q::Layer, nominator::Number ,activation::ActivationFunction=Identity(), residual::Bool=false )
+        K = deepcopy(Q)
+        V = deepcopy(Q)
+        WK = Generate_weight(K.hop)
+        WV = Generate_weight(V.hop)
+        K.W = WK
+        V.W = WV
+        new(Q, K, V, nominator,  activation,  residual)
+    end
+end
+
+
+struct PrallelTransportAttention_Layer <: Layer
+    Q::Layer
+    K::Layer
+    V::Layer
+    nominator::Number
+    activation::ActivationFunction
+    residual::Bool
+    bias::Float64
+
+    function PrallelTransportAttention_Layer(Q::Layer, K::Layer, V::Layer, nominator::Number ,  activation::ActivationFunction=Identity(), residual::Bool=false , bias::Float64=0.1)
+        new(Q, K, V, nominator,  activation,  residual,bias)
+    end
+
+    function PrallelTransportAttention_Layer(Q::Layer, nominator::Number ,activation::ActivationFunction=Identity(), residual::Bool=false , bias::Float64=0.1)
+        K = deepcopy(Q)
+        V = deepcopy(Q)
+        WK = Generate_weight(K.hop)
+        WV = Generate_weight(V.hop)
+        K.W = WK
+        V.W = WV
+
+        new(Q, K, V, nominator,  activation,  residual, bias)
+    end
+end
+
+
+
+
+struct siteweight_Layer<: Layer
+    Q::Layer
+    K::Layer
+    V::Layer
+    nominator::Number
+    activation::ActivationFunction
+    residual::Bool
+
+    function siteweight_Layer(Q::Layer, K::Layer, V::Layer, nominator::Number ,  activation::ActivationFunction=Identity(), residual::Bool=false)
+        new(Q, K, V, nominator,  activation,  residual)
+    end
+
+    function siteweight_Layer(Q::Layer, nominator::Number ,activation::ActivationFunction=Identity(), residual::Bool=false )
+        K = deepcopy(Q)
+        V = deepcopy(Q)
+        WK = Generate_weight(K.hop)
+        WV = Generate_weight(V.hop)
+        K.W = WK
+        V.W = WV
+        new(Q, K, V, nominator,  activation,  residual)
+    end
+end
+
+
+
+struct RayleighQuotient_Layer <: Layer
+    x::WF3x1
+    activation::ActivationFunction
+    function RayleighQuotient_Layer(x::WF3x1, activation::ActivationFunction= Identity())
+        new(x, activation)
+    end
+
+
+end 
+
+
+mutable struct PtcRayleighQuotient_Layer <: Layer
+    D::Any
+    activation::ActivationFunction
+    Out::Int
+    function PtcRayleighQuotient_Layer(D::Any, activation::ActivationFunction= Identity(),Out =1)
+        new(D, activation , Out)
+    end
+end 
+
+mutable struct HoppingRayleighQuotient_Layer <: Layer
+    hop::Hopping_operator
+    x::WF3x1
+    activation::ActivationFunction
+    function HoppingRayleighQuotient_Layer(hop::Hopping_operator, x::WF3x1, activation::ActivationFunction= Identity())
+        new(hop, x, activation)
+    end
+end
+
+mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
+    W::Vector{T}
+    In::Int
+    Out::Int
+    cuda::Bool
+    activation::ActivationFunction
+
+
+    function DenseLinearLayer(In::Int, Out::Int, cuda::Bool, activation::ActivationFunction=Identity() )
+        if cuda == true
+            W = Vector{Spin_matrix_GPU}(undef, In*Out)
+            for i in 1:In*Out
+                W[i] = Random_SpinM_GPU("complex")
+            end
+        else
+            W = Vector{Spin_matrix}(undef, In*Out)
+            for i in 1:In*Out
+                W[i] = Random_SpinM("complex")
+            end
+        end
+        # W = Vector{Spin_matrix}(undef, Out)
+        # for i in 1:Out
+        #     W[i] = Random_SpinM("complex")
+        # end
+        return new{eltype(W)}(W, In, Out, cuda, activation)  # ← 핵심
+    end
+end
+
+
+
+mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
+    paths::Vector{Paths}
+    U::Vector{G}
+    Out::Int
+    W::Vector{T}
+    activation::ActivationFunction
+
+    function PTLayer(paths::Vector{Paths}, U::Vector{G}, Out::Int,
+                     activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields}
+
+        if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator  # ★ U는 Vector니까 eltype(U)로 체크
+            W = Vector{Spin_matrix_GPU}(undef, length(paths)*Out)
+            for i in eachindex(W)
+                W[i] = Random_SpinM_GPU("complex")
+            end
+
+
+            return new{G, Spin_matrix_GPU}(paths, U, Out, W,  activation)
+        else
+            W = Vector{Spin_matrix}(undef, length(paths)*Out)
+            for i in eachindex(W)
+                W[i] = Random_SpinM("complex")
+            end
+
+            return new{G, Spin_matrix}(paths, U, Out, W,  activation)
+        end
+    end
+end
+
+
+# mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
+#     paths::Vector{Paths}
+#     U::Vector{G}
+#     Out::Int
+#     W::Vector{T}
+#     cache::Vector{WF3x1}
+#     activation::ActivationFunction
+
+#     function PTLayer_new(paths::Vector{Paths}, U::Vector{G}, Out::Int,
+#                      activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields}
+
+#         if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator  # ★ U는 Vector니까 eltype(U)로 체크
+#             W = Vector{Spin_matrix_GPU}(undef, length(paths)*Out)
+#             for i in eachindex(W)
+#                 W[i] = Random_SpinM_GPU("complex")
+#             end
+#             x = Initialize_pseudofermion_fields(U[1],"Wilson",nowing=true)
+#             cache = Vector{WF3x1}(undef, Out)
+#             for i in 1:Out
+#                 cache[i] = deepcopy(x)
+#             end
+
+#             return new{G, Spin_matrix_GPU}(paths, U, Out, W, cache, activation)
+#         else
+#             W = Vector{Spin_matrix}(undef, length(paths)*Out)
+#             for i in eachindex(W)
+#                 W[i] = Random_SpinM("complex")
+#             end
+#             x = Initialize_pseudofermion_fields(U[1],"Wilson",nowing=true)
+#             cache = Vector{WF3x1}(undef, Out)
+#             for i in 1:Out
+#                 cache[i] = deepcopy(x)
+#             end
+#             return new{G, Spin_matrix}(paths, U, Out, W, cache, activation)
+#         end
+#     end
+# end
+
+
+
+# mutable struct RptLayer{G<:AbstractGaugefields} <: Layer
+#     paths::Vector{Paths}
+#     U::Vector{G}
+#     W::Vector{WF3x1}
+#     activation ::ActivationFunction
+#     function RptLayer(paths::Vector{Paths}, U::Vector{G},
+#                      activation::ActivationFunction=Identity()
+#     )
+#         W = Vector{WF3x1}(undef, length(paths))
+#         x=Initialize_pseudofermion_fields(U[1],"Wilson",nowing=true)
+        
+#         for i in 1:length(W)
+#             gauss_distribution_fermion!(x)
+#             W[i] = x
+#         end
+#         new(paths, U, W, activation)
+#     end
+# end
+
+mutable struct fermionfield_Layer <: Layer
+    x::Vector{WF3x1}
+    In::Int
+    activation::ActivationFunction
+    function fermionfield_Layer(x::WF3x1, activation::ActivationFunction= Identity())
+        i=1
+        new([x], i, activation)
+    end
+    function fermionfield_Layer(x::WF3x1, In::Int, activation::ActivationFunction= Identity())
+        xs=Vector{WF3x1}(undef, In)
+        for i in 1:In
+            xs[i]=deepcopy(x)
+            gauss_distribution_fermion!(xs[i])
+        end
+        new(xs, In, activation)
+    end
+end
+
+
+struct Orthogonal_Layer <: Layer
+    coeff::Float64
+    activation::ActivationFunction
+    function Orthogonal_Layer(coeff::Float64, activation::ActivationFunction= Identity())
+        new(coeff, activation)
+    end 
+end
+
+
+mutable struct Ritz_Layer <: Layer
+    D::Any
+    activation::ActivationFunction
+    Out::Int
+    function Ritz_Layer(D::Any, activation::ActivationFunction= Identity(),Out =1)
+        new(D, activation , Out)
+    end
+end 
+
+
+mutable struct GramSchmidt_Layer <: Layer
+    x::Vector{WF3x1}
+    activation::ActivationFunction
+    function GramSchmidt_Layer(x::Any, activation::ActivationFunction= Identity())
+        new(x, activation)
+    end 
+end
+
+
+
+
+
+function (s::Softmax)(x::Spin_matrix)
+    A = x.sm
+    maxA = maximum(abs.(A), dims=2)      # 각 행의 복소수 절댓값 최대
+    expA = exp.(A .- maxA)               # 안정화된 지수
+    row_sum = sum(expA, dims=2)
+    return Spin_matrix(expA ./ row_sum)
+end
+
+
+function (s::Softmax)(x::Vector{Spin_matrix})
+    y = similar(x)
+
+    for i in 1:length(x)
+        A = x[i].sm
+        maxA = maximum(abs.(A), dims=2)
+        expA = exp.(A .- maxA)
+        row_sum = sum(expA, dims=2)
+        y[i] = Spin_matrix(expA ./ row_sum)
+    end
+
+    return y
+end
+
+function (s::Softmax)(x::Spin_matrix_GPU)
+    A= x.sm
+    maxA = maximum(abs.(A), dims=2)      # 각 행의 복소수 절댓값 최대
+    expA = exp.(A .- maxA)               # 안정화된 지수
+    row_sum = sum(expA, dims=2)
+    return Spin_matrix_GPU(expA ./ row_sum)
+end
+
+function (s::Softmax)(x::Vector{Spin_matrix_GPU})
+    y = similar(x)
+
+    for i in 1:length(x)
+        A = x[i].sm
+        maxA = maximum(abs.(A), dims=2)
+        expA = exp.(A .- maxA)
+        row_sum = sum(expA, dims=2)
+        y[i] = Spin_matrix_GPU(expA ./ row_sum)
+    end
+
+    return y
+end
+
+function (r::ModRelu)(x::Spin_matrix)
+    A = x.sm
+    modA = abs.(A)
+    phaseA = angle.(A)
+    activated_modA = max.(modA .-0.1, 0.0)  # ReLU 적용
+    activated_A = activated_modA .* exp.(im .* phaseA)
+    return Spin_matrix(activated_A)
+end
+
+# function (r::ModRelu)(x::Spin_matrix)
+#     A = x.sm
+#     for i in 1:4
+#         if abs(A[i,i])>0.1
+#             A[i,i]= (abs(A[i,i])-50.0)*A[i,i]/abs(A[i,i])
+#         else
+#             A[i,i]=0
+#         end
+#     end
+
+#     return Spin_matrix(A)
+# end
+
+
+
+
+
+
+
+function (r::ModRelu)(xs::Vector{Spin_matrix})
+    ys = similar(xs)
+    @inbounds for i in eachindex(xs)
+        ys[i] = r(xs[i])
+    end
+    return ys
+end
+
+
+
+
+
+
+
+
+
+
+
+struct Decoder <: Layer
+    activation::ActivationFunction
+    function Decoder(activation::ActivationFunction )
+        new(activation)
+    end 
+end 
+
+struct Dirac_Layer <: Layer
+    activation
+    W::Nothing
+    function Dirac_Layer(activation)
+        new(activation)
+    end
+end
+
+
+
+mutable struct NormLayer <: Layer
+    activation::ActivationFunction
+    alpha::Float64
+
+    function NormLayer(activation::ActivationFunction= Identity(),alpha::Float64=1.0)
+        new(activation,alpha)
+    end
+
+end 
+
+mutable struct complexNormLayer <: Layer
+    activation::ActivationFunction
+
+    function complexNormLayer(activation::ActivationFunction= Identity())
+        new(activation)
+    end
+
+end
+
+
+mutable struct zscoreNormLayer <: Layer
+    activation::ActivationFunction
+
+    function zscoreNormLayer(activation::ActivationFunction= Identity())
+        new(activation)
+    end
+end 
+
+mutable struct minmaxNormLayer <: Layer
+    activation::ActivationFunction
+
+    function minmaxNormLayer(activation::ActivationFunction= Identity())
+        new(activation)
+    end
+end
+
+function xavier_init!(W::Vector{T}, fan_in::Int, fan_out::Int) where {T<:AbstractArray{ComplexF64,2}}
+    scale = sqrt(6 / (fan_in + fan_out))
+    for M in W
+        for i in 1:size(M, 1), j in 1:size(M, 2)
+            real_part = rand() * 2 * scale - scale
+            imag_part = rand() * 2 * scale - scale
+            M[i, j] = complex(real_part, imag_part)
+        end
+    end
+end
+
+
+
+mutable struct LossSumLayer{L1<:Layer,L2<:Layer} <: Layer
+    l1::L1
+    l2::L2
+    w1::Float64
+    w2::Float64
+    activation::ActivationFunction
+
+    function LossSumLayer(l1::L1, l2::L2,
+                          w1::Real=1.0, w2::Real=1.0,
+                          activation::ActivationFunction=Identity()) where {L1<:Layer,L2<:Layer}
+        new{L1,L2}(l1, l2, Float64(w1), Float64(w2), activation)
+    end
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+end # module Layer_types

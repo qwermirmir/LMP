@@ -1,10 +1,2 @@
-/coldgauge.txt
-/gaugeshifttest.ipynb
-/Juliatest.ipynb
-/logs
-/measurements
-/ptc.ipynb
-/ptc_test.ipynb
-/test.toml
-/testconf.txt
-/Untitled-1.txt
+.ipynb_checkpoints/
+*.jld2
