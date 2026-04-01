@@ -168,7 +168,10 @@ function gradient(layer::Attention_Layer, ::Softmax, z::WF3x1, d::WF3x1, γ::Vec
     Hx=layer.V.hop(z)
 
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/fix/bigfiles
     Kx=KW*layer.K.hop(z)
     Qx=QW*layer.Q.hop(z)
     Vx=VW*layer.V.hop(z)
@@ -214,7 +217,10 @@ function gradient(layer::Attention_Layer, ::Softmax, z::WF3x1, d::WF3x1, γ::Vec
     #-------------------------------------------------------------------------------------------------------
     # Q의 graident를 계산하는 부분 
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/fix/bigfiles
     grad=similar(QW)
     grad1=similar(QW)
     
@@ -360,7 +366,10 @@ function DeltaRule(layer::Attention_Layer, ::Softmax, z::WF3x1, d::WF3x1)
 
 
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/fix/bigfiles
     Qx=QW*layer.Q.hop(z)
     Kx=KW*layer.K.hop(z)
     Vx=VW*layer.V.hop(z)
@@ -620,7 +629,10 @@ function gradient(layer::test_Layer, ::Softmax, z::WF3x1, d::WF3x1, γ::Vector{S
     # Q의 graident를 계산하는 부분 
     # PM= deepcopy(QW)
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/fix/bigfiles
     grad=similar(QW)
     grad1=similar(QW)
     
@@ -851,7 +863,10 @@ function DeltaRule(layer::test_Layer, ::Softmax, z::WF3x1, d::WF3x1)
     Qz=Qz1-Qz2
 
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/fix/bigfiles
     for i in 1:length(QW)
         result+=Qz[i]*conj(KH[i])/m
 
@@ -2458,12 +2473,20 @@ function DeltaRule(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, batch::Int)
     B = Matrix{ComplexF64}(undef, l, l)
     T = typeof(z[1])
     Dz = Vector{T}(undef, l)
+<<<<<<< HEAD
     temp = similar(z[1])
     @inbounds for i in 1:l
         Dz[i] = deepcopy(temp)
         mul!(Dz[i], D, z[i])   # mul!이 overwrite라고 가정 (누적이면 먼저 0으로 초기화 필요)
     end
 
+=======
+    # Dz 버퍼 한 번만 할당 (similar 대신 deepcopy)
+    @inbounds for i in 1:l
+        Dz[i] = deepcopy(z[1])
+        mul!(Dz[i], D, z[i])   # mul! overwrites Dz[i]
+    end
+>>>>>>> origin/fix/bigfiles
     @inbounds for i in 1:l
         # diagonal
         bii = inner_product(z[i],  z[i])
@@ -2487,17 +2510,21 @@ function DeltaRule(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, batch::Int)
     evals, evecs = eigen(A, B)
     @assert length(evals) == l "Eigenvalue decomposition failed in Ritz_Layer."
 
+<<<<<<< HEAD
     # k = 1
     # u = evecs[:,k]
     # λ = evals[k]
     # println(norm(A*u - λ*(B*u)))
 
+=======
+>>>>>>> origin/fix/bigfiles
 
     m = Vector{ComplexF64}(undef, l)
     for k in 1:l
         m[k] = dot(evecs[:,k], B*evecs[:,k])  # u_k^† B u_k
     end
 
+<<<<<<< HEAD
     result = Vector{WF3x1}(undef, l)
     VD     = Vector{WF3x1}(undef, l)
 
@@ -2518,13 +2545,52 @@ function DeltaRule(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, batch::Int)
         axpby!(1,f,-evals[k],ψ)   #
         # 네가 "왼쪽작용이 없어 오른쪽으로 하고 다시 conj"라 했으니 그 스타일 유지
         VD[k] = conj(ψ)
+=======
+    # result 버퍼 한 번만 할당
+    result = Vector{WF3x1}(undef, l)
+    for i in 1:l
+        result[i] = deepcopy(z[1])
+        zero_wf!(result[i])
+    end
+    
+    # VD 버퍼도 루프 밖에서 미리 할당
+    VD = Vector{WF3x1}(undef, l)
+    for i in 1:l
+        VD[i] = deepcopy(z[1])
+    end
+    
+    # 재사용 버퍼들 - 각 한 번만 할당
+    y = deepcopy(z[1])
+    f = deepcopy(z[1])
+    ψ = deepcopy(z[1])
+    r = deepcopy(z[1])
+    
+    # 모드 k마다 ψ_k 만들고, r_k = D†D ψ_k - λ_k ψ_k 만든다
+    for k in 1:l
+        zero_wf!(ψ)
+        for j in 1:l
+            axpby!(evecs[j,k],z[j], 1, ψ)   # ψ = Σ u_{jk} x_j
+        end
+
+        mul!(y,D,ψ)                    # y = D ψ_k
+        mul!(f,D',y)                   # f = D† D ψ_k
+        # r = ψ로 초기화 (inplace copy)
+        conj!(r, ψ)
+        conj!(r, r)                    # r = ψ (double conj = identity)
+        axpby!(1,f,-evals[k],r)        # r = f - λ_k ψ = D†D ψ_k - λ_k ψ_k
+        # 네가 "왼쪽작용이 없어 오른쪽으로 하고 다시 conj"라 했으니 그 스타일 유지
+        conj!(VD[k], r)
+>>>>>>> origin/fix/bigfiles
     end
 
     # ∂/∂V 를 반환하려면 계수는 evecs[i,k] (conj 없음)
     for i in 1:l
         for k in 1:l
             axpby!(evecs[i,k]/m[k],VD[k], 1, result[i])
+<<<<<<< HEAD
             # result[i] += evecs[i,k] * (VD[k] / m[k])
+=======
+>>>>>>> origin/fix/bigfiles
         end
     end
 
@@ -2537,16 +2603,29 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
 
     l = length(z)
     D = layer.D
+<<<<<<< HEAD
+=======
+    for i in 1:length(delta)
+        zero_wf!(delta[i])  
+    end
+>>>>>>> origin/fix/bigfiles
 
 
     A = Matrix{ComplexF64}(undef, l, l)
     B = Matrix{ComplexF64}(undef, l, l)
     T = typeof(z[1])
     Dz = Vector{T}(undef, l)
+<<<<<<< HEAD
     temp = similar(z[1])
     @inbounds for i in 1:l
         Dz[i] = deepcopy(temp)
         mul!(Dz[i], D, z[i])   # mul!이 overwrite라고 가정 (누적이면 먼저 0으로 초기화 필요)
+=======
+    # Dz 버퍼 한 번만 할당
+    @inbounds for i in 1:l
+        Dz[i] = deepcopy(z[1])
+        mul!(Dz[i], D, z[i])   # mul! overwrites Dz[i]
+>>>>>>> origin/fix/bigfiles
     end
 
     @inbounds for i in 1:l
@@ -2578,6 +2657,7 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
         m[k] = dot(evecs[:,k], B*evecs[:,k])  # u_k^† B u_k
     end
 
+<<<<<<< HEAD
     VD     = Vector{WF3x1}(undef, l)
     for i in 1:length(VD)
         zero_wf!(VD[i])
@@ -2603,11 +2683,41 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
         # 네가 "왼쪽작용이 없어 오른쪽으로 하고 다시 conj"라 했으니 그 스타일 유지
         # VD[k] = conj(ψ)
         conj!(VD[k], ψ)
+=======
+    # VD 버퍼 루프 밖에서 미리 할당
+    VD = Vector{WF3x1}(undef, l)
+    for i in 1:l
+        VD[i] = deepcopy(z[1])
+    end
+
+    # 재사용 버퍼들 - 각 한 번만 할당
+    y = deepcopy(z[1])
+    f = deepcopy(z[1])
+    ψ = deepcopy(z[1])
+    r = deepcopy(z[1])
+    
+    # 모드 k마다 ψ_k 만들고, r_k = D†D ψ_k - λ_k ψ_k 만든다
+    for k in 1:l
+        zero_wf!(ψ)
+        for j in 1:l
+            axpby!(evecs[j,k],z[j], 1, ψ)   # ψ = Σ u_{jk} x_j
+        end
+
+        mul!(y,D,ψ)                    # y = D ψ_k
+        mul!(f,D',y)                   # f = D† D ψ_k
+        # r = ψ로 초기화 (inplace copy)
+        conj!(r, ψ)
+        conj!(r, r)                    # r = ψ (double conj = identity)
+        axpby!(1,f,-evals[k],r)        # r = f - λ_k ψ = D†D ψ_k - λ_k ψ_k
+        # 네가 "왼쪽작용이 없어 오른쪽으로 하고 다시 conj"라 했으니 그 스타일 유지
+        conj!(VD[k], r)
+>>>>>>> origin/fix/bigfiles
     end
 
     # ∂/∂V 를 반환하려면 계수는 evecs[i,k] (conj 없음)
     for i in 1:l
         for k in 1:l
+<<<<<<< HEAD
             axpby!(evecs[i,k]/m[k],VD[k], 1, delta[i])
             # result[i] += evecs[i,k] * (VD[k] / m[k])
         end
@@ -2616,6 +2726,16 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
     for i in 1:l
         axpby!(0,delta[i], 2, delta[i])  # batch로 나누기
     end
+=======
+            axpby!(2*evecs[i,k]/m[k], VD[k], 1, delta[i])
+        end
+    end
+
+    # for i in 1:l
+    #     axpby!(0,delta[i], 1/batch, delta[i])  # batch로 나누기
+    # end
+
+>>>>>>> origin/fix/bigfiles
 
 
 end
@@ -2795,16 +2915,32 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
 
     n=length(layer.W)
 
+<<<<<<< HEAD
     grad=Vector{typeof(W[1])}(undef, n)
     for i in 1:n
         grad[i]=similar(W[i])
     end 
     @assert length(W) == length(paths)*Out "The length of W must be equal to length(paths)*Out."
+=======
+    @assert length(z) == length(paths) "PTLayer gradient: z의 길이는 paths 길이와 같아야 합니다. length(z)=$(length(z)), length(paths)=$(length(paths))"
+    @assert length(d) == Out "PTLayer gradient: d의 길이는 Out과 같아야 합니다. length(d)=$(length(d)), Out=$Out"
+    @assert length(W) == length(paths)*Out "The length of W must be equal to length(paths)*Out."
+
+    # grad 벡터 할당 최소화 (similar 대신 deepcopy)
+    grad=Vector{typeof(W[1])}(undef, n)
+    for i in 1:n
+        grad[i]=deepcopy(W[1])
+    end 
+>>>>>>> origin/fix/bigfiles
     for i in 1:length(paths)
         hop.P=paths[i]
         u = hop(z[i])
         for j in 1:Out
+<<<<<<< HEAD
             grad[(i-1)*Out+j]+=Matmul!(d[j],(u[1]))
+=======
+            grad[(i-1)*Out+j]=Matmul!(d[j],(u[1]))
+>>>>>>> origin/fix/bigfiles
         end
     end 
 
@@ -2828,11 +2964,25 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
     Nz = length(z)
     Nd = length(d)
     NW = length(W)
+<<<<<<< HEAD
     temp = similar(z[1])
     result = Vector{WF3x1}(undef, Nz)
 
     # ① d_conj[j] = conj(d[j]) 미리
     d_conj = Vector{WF3x1}(undef, Nd)
+=======
+    # result 버퍼 할당 (similar 제거, deepcopy만 사용)
+    result = Vector{WF3x1}(undef, Nz)
+    for i in 1:Nz
+        result[i] = deepcopy(z[1])
+    end
+
+    # ① d_conj[j] = conj(d[j]) 미리
+    d_conj = Vector{WF3x1}(undef, Nd)
+    for i in 1:Nd
+        d_conj[i] = deepcopy(z[1])
+    end
+>>>>>>> origin/fix/bigfiles
     if d[1] isa WF3x1CPU
         @inbounds for j in 1:Nd
             conj!(d_conj[j], d[j])
@@ -2860,15 +3010,30 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
 
     # ⑤ i 방향으로 병렬화
     if z[1] isa WF3x1CPU
+<<<<<<< HEAD
+=======
+        # 스레드별 버퍼 미리 할당 (similar 대신 각 스레드당 하나씩)
+        ri_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
+        
+>>>>>>> origin/fix/bigfiles
         @threads for i in 1:Nz
             # 이 스레드 전용 hop 사용
             invhop = invhops[threadid()]
             invhop.P = invpaths[i]
+<<<<<<< HEAD
             ri = similar(z[i])
             base = (i-1) * Out
             @inbounds for j in 1:Out
             tmp = invhop(d_conj[j])[1]      # invhop(conj(d[j]))[1]과 동일
             addmul!(ri, Wadj[base + j], tmp)
+=======
+            ri = ri_buffers[threadid()]
+            zero_wf!(ri)  # 버퍼 재사용을 위해 초기화
+            base = (i-1) * Out
+            @inbounds for j in 1:Out
+            hopped = invhop(d_conj[j])[1]
+            addmul!(ri, Wadj[base + j], hopped)
+>>>>>>> origin/fix/bigfiles
             end
 
             # 원래 코드와 같은 의미: result[i] = conj(result[i])
@@ -2876,16 +3041,30 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
             conj!(result[i], ri)
         end
     else
+<<<<<<< HEAD
  
+=======
+        # GPU는 병렬화 안 되므로 하나의 버퍼만 필요
+        ri = deepcopy(z[1])
+        
+>>>>>>> origin/fix/bigfiles
         for i in 1:Nz
         # 이 스레드 전용 hop 사용
         invhop = invhops[threadid()]
         invhop.P = invpaths[i]
+<<<<<<< HEAD
         ri = deepcopy(temp)
         base = (i-1) * Out
         @inbounds for j in 1:Out
             tmp = invhop(d_conj[j])[1]    
             gpuaddmul!(ri,Wadj[base + j],tmp)
+=======
+        zero_wf!(ri)  # 버퍼 재사용을 위해 초기화
+        base = (i-1) * Out
+        @inbounds for j in 1:Out
+            hopped = invhop(d_conj[j])[1]    
+            gpuaddmul!(ri,Wadj[base + j],hopped)
+>>>>>>> origin/fix/bigfiles
             end
             conj!(result[i], ri)
         end
@@ -2905,10 +3084,15 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
     paths = layer.paths
 
     @assert length(d) == Out "The length of d must be equal to Out."
+<<<<<<< HEAD
+=======
+    @assert length(delta) == length(z) "The length of delta must be equal to the length of z."
+>>>>>>> origin/fix/bigfiles
 
     Nz = length(z)
     Nd = length(d)
     NW = length(W)
+<<<<<<< HEAD
     temp = similar(z[1])
     ri = deepcopy(temp)
     # result = Vector{WF3x1}(undef, Nz)
@@ -2925,6 +3109,19 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
         end
     end
 
+=======
+    # temp 제거, 직접 deepcopy 사용
+
+    # ① d_conj[j] = conj(d[j]) 미리
+    d_conj = Vector{WF3x1}(undef, Nd)
+
+    @inbounds for i in 1:Nd
+        d_conj[i] = deepcopy(z[1])
+        conj!(d_conj[i], d[i])
+    end
+
+
+>>>>>>> origin/fix/bigfiles
     # ② 역경로 미리
     invpaths = Vector{typeof(paths[1])}(undef, Nz)
     @inbounds for i in 1:Nz
@@ -2942,15 +3139,30 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
 
     # ⑤ i 방향으로 병렬화
     if z[1] isa WF3x1CPU
+<<<<<<< HEAD
+=======
+        # 스레드별 버퍼 미리 할당
+        ri_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
+        
+>>>>>>> origin/fix/bigfiles
         @threads for i in 1:Nz
             # 이 스레드 전용 hop 사용
             invhop = invhops[threadid()]
             invhop.P = invpaths[i]
+<<<<<<< HEAD
             zero_wf!(ri)
             base = (i-1) * Out
             @inbounds for j in 1:Out
             temp = invhop(delta[j])[1]      # invhop(conj(d[j]))[1]과 동일
             addmul!(ri, Wadj[base + j], temp)
+=======
+            ri = ri_buffers[threadid()]
+            zero_wf!(ri)  # 버퍼 재사용을 위해 초기화
+            base = (i-1) * Out
+            @inbounds for j in 1:Out
+            hopped = invhop(d_conj[j])[1]
+            addmul!(ri, Wadj[base + j], hopped)
+>>>>>>> origin/fix/bigfiles
             end
 
             # 원래 코드와 같은 의미: result[i] = conj(result[i])
@@ -2958,16 +3170,30 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             conj!(delta[i], ri)
         end
     else
+<<<<<<< HEAD
  
+=======
+        # GPU는 병렬화 안 되므로 하나의 버퍼만 필요
+        ri = deepcopy(z[1])
+        
+>>>>>>> origin/fix/bigfiles
         for i in 1:Nz
         # 이 스레드 전용 hop 사용
         invhop = invhops[threadid()]
         invhop.P = invpaths[i]
+<<<<<<< HEAD
         zero_wf!(ri)
         base = (i-1) * Out
         @inbounds for j in 1:Out
             invhop(delta[j],[temp])[1]    
             gpuaddmul!(ri,Wadj[base + j],temp)
+=======
+        zero_wf!(ri)  # 버퍼 재사용을 위해 초기화
+        base = (i-1) * Out
+        @inbounds for j in 1:Out
+            hopped = invhop(d_conj[j])[1]    
+            gpuaddmul!(ri,Wadj[base + j],hopped)
+>>>>>>> origin/fix/bigfiles
             end
             conj!(delta[i], ri)
         end
@@ -3074,6 +3300,11 @@ function DeltaRule!(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}
 
 
     # result = Vector{WF3x1}(undef, length(z))
+<<<<<<< HEAD
+=======
+
+
+>>>>>>> origin/fix/bigfiles
     α = layer.alpha
 
 
@@ -3214,7 +3445,10 @@ function DeltaRule(layer::GramSchmidt_Layer, ::Identity,
     l = length(d)
 
     result = Vector{WF3x1}(undef, l)
+<<<<<<< HEAD
     temp   = similar(d[1])
+=======
+>>>>>>> origin/fix/bigfiles
 
     @inbounds for i in 1:l
         g = deepcopy(d[i])
@@ -3234,9 +3468,12 @@ function DeltaRule!(layer::GramSchmidt_Layer, ::Identity,
     V = layer.x
     l = length(d)
 
+<<<<<<< HEAD
     # result = Vector{WF3x1}(undef, l)
     temp   = similar(d[1])
 
+=======
+>>>>>>> origin/fix/bigfiles
     @inbounds for i in 1:l
         g = deepcopy(d[i])
         for j in 1:length(V)

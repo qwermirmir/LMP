@@ -11,7 +11,11 @@ import ..elementry_base: Hopping_operator, Spin_matrix, inner_product,g2vector_g
 import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minmax,spincolortrace
 import ..Optimizer: Opt, update!, Adam
 import ..activation:  gradient, DeltaRule,DeltaRule!
+<<<<<<< HEAD
 import ..gpu: Matmul!,gpuaddmul!
+=======
+import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU
+>>>>>>> origin/fix/bigfiles
 import ..Layer_types: DenseLinearLayer, PTLayer,fermionfield_Layer,GramSchmidt_Layer
 abstract type Operator end
 
@@ -39,9 +43,432 @@ const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 
 
 export forward_propagation, Lossfunction, train,  preD,Operator ,doubletrain,backward_propagation!
+<<<<<<< HEAD
 
 
 
+=======
+export refresh_fermionfield!, refresh_model!
+export substitute_Layer!
+
+
+
+function substitute_Layer!(layers::Vector{<:Layer})
+    # 첫 번째 layer의 GPU/CPU 여부를 판별하여 반대 방향으로 변환
+    if _is_gpu_layer(layers)
+        # GPU → CPU
+        for i in eachindex(layers)
+            layers[i] = _to_cpu(layers[i])
+        end
+    else
+        # CPU → GPU
+        for i in eachindex(layers)
+            layers[i] = _to_gpu(layers[i])
+        end
+    end
+    return layers
+end
+
+# --- Layer 벡터가 GPU인지 판별 ---
+function _is_gpu_layer(layers::Vector{<:Layer})
+    for layer in layers
+        if _has_gpu(layer)
+            return true
+        end
+    end
+    return false
+end
+
+_has_gpu(::Layer) = false
+_has_gpu(layer::PTC_Layer{Spin_matrix_GPU}) = true
+_has_gpu(layer::PTC_Layer) = eltype(layer.hop.Gauge) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+_has_gpu(layer::CPTC_Layer{Spin_matrix_GPU}) = true
+_has_gpu(layer::CPTC_Layer) = eltype(layer.hop.Gauge) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+_has_gpu(layer::DenseLinearLayer{Spin_matrix_GPU}) = true
+_has_gpu(layer::PTLayer) = eltype(layer.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+_has_gpu(layer::Attention_Layer) = _has_gpu(layer.Q)
+_has_gpu(layer::FullPTCAttention_Layer) = _has_gpu(layer.Q)
+_has_gpu(layer::PrallelTransportAttention_Layer) = _has_gpu(layer.Q)
+_has_gpu(layer::siteweight_Layer) = _has_gpu(layer.Q)
+_has_gpu(layer::test_Layer) = _has_gpu(layer.Q)
+_has_gpu(layer::LossSumLayer) = _has_gpu(layer.l1) || _has_gpu(layer.l2)
+_has_gpu(layer::fermionfield_Layer) = !isempty(layer.x) && layer.x[1] isa WF3x1GPU
+_has_gpu(layer::GramSchmidt_Layer) = !isempty(layer.x) && layer.x[1] isa WF3x1GPU
+function _has_gpu(layer::Ritz_Layer)
+    try; return eltype(layer.D.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator; catch; return false; end
+end
+function _has_gpu(layer::PtcRayleighQuotient_Layer)
+    try; return eltype(layer.D.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator; catch; return false; end
+end
+function _has_gpu(layer::HoppingRayleighQuotient_Layer)
+    return eltype(layer.hop.Gauge) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator || layer.x isa WF3x1GPU
+end
+
+# --- GPU→CPU gauge field 변환 ---
+function _to_cpu_gauge(U::Vector{G}) where {G<:AbstractGaugefields}
+    if G <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+        NC = U[1].NC
+        NX = U[1].NX; NY = U[1].NY; NZ = U[1].NZ; NT = U[1].NT
+        Ucpu = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold")
+        substitute_U!(Ucpu, U)
+        return Ucpu
+    else
+        return U
+    end
+end
+
+# --- GPU→CPU Hopping_operator 변환 ---
+function _to_cpu_hop(hop::Hopping_operator)
+    Ucpu = _to_cpu_gauge(hop.Gauge)
+    if Ucpu === hop.Gauge
+        return hop
+    end
+    return Hopping_operator(Ucpu, hop.P)
+end
+
+# --- GPU→CPU Spin matrix 벡터 변환 ---
+_to_cpu_W(W::Vector{Spin_matrix_GPU}) = Convertsm(W)
+_to_cpu_W(W::Vector{Spin_matrix}) = W
+_to_cpu_W(W::Vector{T}) where {T<:AbstractArray{ComplexF64,2}} = W
+
+# --- GPU→CPU fermion field 변환 ---
+function _to_cpu_fermion(x::WF3x1GPU)
+    NC = x.NC
+    NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT
+    Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold")
+    xcpu = Initialize_pseudofermion_fields(Utmp[1], "Wilson", nowing=true)
+    substitute_fermion!(xcpu, x)
+    return xcpu
+end
+_to_cpu_fermion(x::WF3x1CPU) = x
+
+function _to_cpu_fermions(xs::Vector{<:WF3x1})
+    if isempty(xs) || xs[1] isa WF3x1CPU
+        return xs
+    end
+    NC = xs[1].NC
+    NX = xs[1].NX; NY = xs[1].NY; NZ = xs[1].NZ; NT = xs[1].NT
+    Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold")
+    result = Vector{WF3x1CPU}(undef, length(xs))
+    for i in eachindex(xs)
+        result[i] = Initialize_pseudofermion_fields(Utmp[1], "Wilson", nowing=true)
+        substitute_fermion!(result[i], xs[i])
+    end
+    return result
+end
+
+# --- 기본: GPU 성분이 없는 Layer ---
+_to_cpu(layer::Layer) = layer
+
+# --- PTC_Layer ---
+function _to_cpu(layer::PTC_Layer)
+    hop_cpu = _to_cpu_hop(layer.hop)
+    W_cpu = _to_cpu_W(layer.W)
+    return PTC_Layer(hop_cpu, W_cpu, layer.residual, layer.activation)
+end
+
+# --- CPTC_Layer ---
+function _to_cpu(layer::CPTC_Layer)
+    hop_cpu = _to_cpu_hop(layer.hop)
+    W_cpu = _to_cpu_W(layer.W)
+    return CPTC_Layer(hop_cpu, W_cpu, layer.residual, layer.activation)
+end
+
+# --- Attention_Layer ---
+function _to_cpu(layer::Attention_Layer)
+    return Attention_Layer(_to_cpu(layer.Q), _to_cpu(layer.K), _to_cpu(layer.V),
+                           layer.nominator, layer.activation, layer.residual)
+end
+
+# --- test_Layer ---
+function _to_cpu(layer::test_Layer)
+    layer.Q = _to_cpu(layer.Q)
+    layer.K = _to_cpu(layer.K)
+    layer.V = _to_cpu(layer.V)
+    if layer.test isa WF3x1GPU
+        layer.test = _to_cpu_fermion(layer.test)
+    end
+    return layer
+end
+
+# --- FullPTCAttention_Layer ---
+function _to_cpu(layer::FullPTCAttention_Layer)
+    return FullPTCAttention_Layer(_to_cpu(layer.Q), _to_cpu(layer.K), _to_cpu(layer.V),
+                                  layer.nominator, layer.activation, layer.residual)
+end
+
+# --- PrallelTransportAttention_Layer ---
+function _to_cpu(layer::PrallelTransportAttention_Layer)
+    return PrallelTransportAttention_Layer(_to_cpu(layer.Q), _to_cpu(layer.K), _to_cpu(layer.V),
+                                            layer.nominator, layer.activation, layer.residual, layer.bias)
+end
+
+# --- siteweight_Layer ---
+function _to_cpu(layer::siteweight_Layer)
+    return siteweight_Layer(_to_cpu(layer.Q), _to_cpu(layer.K), _to_cpu(layer.V),
+                            layer.nominator, layer.activation, layer.residual)
+end
+
+# --- DenseLinearLayer ---
+function _to_cpu(layer::DenseLinearLayer{Spin_matrix_GPU})
+    new_layer = DenseLinearLayer(layer.In, layer.Out, false, layer.activation)
+    W_cpu = Convertsm(layer.W)
+    for j in eachindex(W_cpu)
+        new_layer.W[j] = W_cpu[j]
+    end
+    return new_layer
+end
+
+# --- PTLayer ---
+function _to_cpu(layer::PTLayer)
+    U_cpu = _to_cpu_gauge(layer.U)
+    new_layer = PTLayer(layer.paths, U_cpu, layer.Out, layer.activation)
+    W_cpu = _to_cpu_W(layer.W)
+    new_layer.W = W_cpu
+    return new_layer
+end
+
+# --- fermionfield_Layer ---
+function _to_cpu(layer::fermionfield_Layer)
+    layer.x = _to_cpu_fermions(layer.x)
+    return layer
+end
+
+# --- GramSchmidt_Layer ---
+function _to_cpu(layer::GramSchmidt_Layer)
+    layer.x = _to_cpu_fermions(layer.x)
+    return layer
+end
+
+# --- HoppingRayleighQuotient_Layer ---
+function _to_cpu(layer::HoppingRayleighQuotient_Layer)
+    layer.hop = _to_cpu_hop(layer.hop)
+    if layer.x isa WF3x1GPU
+        layer.x = _to_cpu_fermion(layer.x)
+    end
+    return layer
+end
+
+# --- LossSumLayer ---
+function _to_cpu(layer::LossSumLayer)
+    l1_cpu = _to_cpu(layer.l1)
+    l2_cpu = _to_cpu(layer.l2)
+    return LossSumLayer(l1_cpu, l2_cpu, layer.w1, layer.w2, layer.activation)
+end
+
+# --- Dirac operator GPU→CPU 변환 (D.U로 gauge field 접근) ---
+function _to_cpu_dirac(D)
+    U = D.U
+    if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+        Ucpu = _to_cpu_gauge(U)
+        xcpu = Initialize_pseudofermion_fields(Ucpu[1], "Wilson", nowing=true)
+        params = Dict{String,Any}()
+        params["Dirac_operator"] = "Wilson"
+        params["κ"] = D.κ
+        params["eps_CG"] = D.eps_CG
+        params["faster version"] = isa(D, LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator_faster)
+        return Dirac_operator(Ucpu, xcpu, params)
+    else
+        return D
+    end
+end
+
+# --- Ritz_Layer ---
+function _to_cpu(layer::Ritz_Layer)
+    layer.D = _to_cpu_dirac(layer.D)
+    return layer
+end
+
+# --- PtcRayleighQuotient_Layer ---
+function _to_cpu(layer::PtcRayleighQuotient_Layer)
+    layer.D = _to_cpu_dirac(layer.D)
+    return layer
+end
+
+
+# ============================================================
+#  CPU → GPU 변환
+# ============================================================
+
+# --- CPU→GPU gauge field 변환 ---
+function _to_gpu_gauge(U::Vector{G}) where {G<:AbstractGaugefields}
+    if G <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+        return U  # 이미 GPU
+    end
+    NC = U[1].NC
+    NX = U[1].NX; NY = U[1].NY; NZ = U[1].NZ; NT = U[1].NT
+    Ugpu = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true)
+    substitute_U!(Ugpu, U)
+    return Ugpu
+end
+
+# --- CPU→GPU Hopping_operator 변환 ---
+function _to_gpu_hop(hop::Hopping_operator)
+    Ugpu = _to_gpu_gauge(hop.Gauge)
+    if Ugpu === hop.Gauge
+        return hop
+    end
+    return Hopping_operator(Ugpu, hop.P)
+end
+
+# --- CPU→GPU Spin matrix 벡터 변환 ---
+_to_gpu_W(W::Vector{Spin_matrix_GPU}) = W
+_to_gpu_W(W::Vector{Spin_matrix}) = [Spin_matrix_GPU(w) for w in W]
+
+# --- CPU→GPU fermion field 변환 ---
+function _to_gpu_fermion(x::WF3x1CPU)
+    NC = x.NC
+    NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT
+    Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true)
+    xgpu = Initialize_pseudofermion_fields(Utmp[1], "Wilson", nowing=true)
+    substitute_fermion!(xgpu, x)
+    return xgpu
+end
+_to_gpu_fermion(x::WF3x1GPU) = x
+
+function _to_gpu_fermions(xs::Vector{<:WF3x1})
+    if isempty(xs) || xs[1] isa WF3x1GPU
+        return xs
+    end
+    NC = xs[1].NC
+    NX = xs[1].NX; NY = xs[1].NY; NZ = xs[1].NZ; NT = xs[1].NT
+    Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true)
+    result = Vector{WF3x1GPU}(undef, length(xs))
+    for i in eachindex(xs)
+        result[i] = Initialize_pseudofermion_fields(Utmp[1], "Wilson", nowing=true)
+        substitute_fermion!(result[i], xs[i])
+    end
+    return result
+end
+
+# --- Dirac operator CPU→GPU 변환 ---
+function _to_gpu_dirac(D)
+    U = D.U
+    if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+        return D  # 이미 GPU
+    end
+    Ugpu = _to_gpu_gauge(U)
+    xgpu = Initialize_pseudofermion_fields(Ugpu[1], "Wilson", nowing=true)
+    params = Dict{String,Any}()
+    params["Dirac_operator"] = "Wilson"
+    params["κ"] = D.κ
+    params["eps_CG"] = D.eps_CG
+    params["faster version"] = isa(D, LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator_faster)
+    return Dirac_operator(Ugpu, xgpu, params)
+end
+
+# --- 기본: CPU 전용 성분만 있는 Layer ---
+_to_gpu(layer::Layer) = layer
+
+# --- PTC_Layer ---
+function _to_gpu(layer::PTC_Layer)
+    hop_gpu = _to_gpu_hop(layer.hop)
+    W_gpu = _to_gpu_W(layer.W)
+    return PTC_Layer(hop_gpu, W_gpu, layer.residual, layer.activation)
+end
+
+# --- CPTC_Layer ---
+function _to_gpu(layer::CPTC_Layer)
+    hop_gpu = _to_gpu_hop(layer.hop)
+    W_gpu = _to_gpu_W(layer.W)
+    return CPTC_Layer(hop_gpu, W_gpu, layer.residual, layer.activation)
+end
+
+# --- Attention_Layer ---
+function _to_gpu(layer::Attention_Layer)
+    return Attention_Layer(_to_gpu(layer.Q), _to_gpu(layer.K), _to_gpu(layer.V),
+                           layer.nominator, layer.activation, layer.residual)
+end
+
+# --- test_Layer ---
+function _to_gpu(layer::test_Layer)
+    layer.Q = _to_gpu(layer.Q)
+    layer.K = _to_gpu(layer.K)
+    layer.V = _to_gpu(layer.V)
+    if layer.test isa WF3x1CPU
+        layer.test = _to_gpu_fermion(layer.test)
+    end
+    return layer
+end
+
+# --- FullPTCAttention_Layer ---
+function _to_gpu(layer::FullPTCAttention_Layer)
+    return FullPTCAttention_Layer(_to_gpu(layer.Q), _to_gpu(layer.K), _to_gpu(layer.V),
+                                  layer.nominator, layer.activation, layer.residual)
+end
+
+# --- PrallelTransportAttention_Layer ---
+function _to_gpu(layer::PrallelTransportAttention_Layer)
+    return PrallelTransportAttention_Layer(_to_gpu(layer.Q), _to_gpu(layer.K), _to_gpu(layer.V),
+                                            layer.nominator, layer.activation, layer.residual, layer.bias)
+end
+
+# --- siteweight_Layer ---
+function _to_gpu(layer::siteweight_Layer)
+    return siteweight_Layer(_to_gpu(layer.Q), _to_gpu(layer.K), _to_gpu(layer.V),
+                            layer.nominator, layer.activation, layer.residual)
+end
+
+# --- DenseLinearLayer ---
+function _to_gpu(layer::DenseLinearLayer{Spin_matrix})
+    new_layer = DenseLinearLayer(layer.In, layer.Out, true, layer.activation)
+    W_gpu = [Spin_matrix_GPU(w) for w in layer.W]
+    for j in eachindex(W_gpu)
+        new_layer.W[j] = W_gpu[j]
+    end
+    return new_layer
+end
+
+# --- PTLayer ---
+function _to_gpu(layer::PTLayer)
+    U_gpu = _to_gpu_gauge(layer.U)
+    new_layer = PTLayer(layer.paths, U_gpu, layer.Out, layer.activation)
+    W_gpu = _to_gpu_W(layer.W)
+    new_layer.W = W_gpu
+    return new_layer
+end
+
+# --- fermionfield_Layer ---
+function _to_gpu(layer::fermionfield_Layer)
+    layer.x = _to_gpu_fermions(layer.x)
+    return layer
+end
+
+# --- GramSchmidt_Layer ---
+function _to_gpu(layer::GramSchmidt_Layer)
+    layer.x = _to_gpu_fermions(layer.x)
+    return layer
+end
+
+# --- HoppingRayleighQuotient_Layer ---
+function _to_gpu(layer::HoppingRayleighQuotient_Layer)
+    layer.hop = _to_gpu_hop(layer.hop)
+    if layer.x isa WF3x1CPU
+        layer.x = _to_gpu_fermion(layer.x)
+    end
+    return layer
+end
+
+# --- Ritz_Layer ---
+function _to_gpu(layer::Ritz_Layer)
+    layer.D = _to_gpu_dirac(layer.D)
+    return layer
+end
+
+# --- PtcRayleighQuotient_Layer ---
+function _to_gpu(layer::PtcRayleighQuotient_Layer)
+    layer.D = _to_gpu_dirac(layer.D)
+    return layer
+end
+
+# --- LossSumLayer ---
+function _to_gpu(layer::LossSumLayer)
+    l1_gpu = _to_gpu(layer.l1)
+    l2_gpu = _to_gpu(layer.l2)
+    return LossSumLayer(l1_gpu, l2_gpu, layer.w1, layer.w2, layer.activation)
+end
+
+>>>>>>> origin/fix/bigfiles
 
 function Lossfunction(f::WF3x1,t::WF3x1)
 
@@ -496,6 +923,10 @@ function (layer::DenseLinearLayer)(x::Vector{WF3x1GPU})
     @assert length(W) == length(x)*Out "W의 길이는 Out이어야 합니다."
     result = Vector{WF3x1}(undef, Out)
     yi = deepcopy(x[1])
+<<<<<<< HEAD
+=======
+    substitute_fermion!(yi, x[1])
+>>>>>>> origin/fix/bigfiles
 
     for k in 1:length(x)
         @inbounds for i in 1:Out
@@ -514,17 +945,28 @@ function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
 
     @assert length(W) == length(x)*Out "W의 길이는 Out이어야 합니다."
     result = Vector{WF3x1}(undef, Out)
+<<<<<<< HEAD
     temp = similar(x[1])
     for i in 1:Out
         result[i] = deepcopy(temp)  # 초기화 (GPU에서는 이 부분이 병목이 될 수 있음)
+=======
+    for i in 1:Out
+        result[i] = deepcopy(x[1])
+        zero_wf!(result[i])
+>>>>>>> origin/fix/bigfiles
     end
     yi = deepcopy(x[1])
 
     for k in 1:length(x)
         @inbounds for i in 1:Out
+<<<<<<< HEAD
                 # yi용 버퍼 1개 생성
             mul!(yi, W[i+(k-1)*Out], x[k])            # yi = W[i]*x 를 "할당 없이" 계산
             result[i] += layer.activation(yi)  # activation이 새로 만들면 여기서 또 alloc
+=======
+            mul!(yi, W[i+(k-1)*Out], x[k])
+            result[i] += layer.activation(yi)
+>>>>>>> origin/fix/bigfiles
         end
     end 
     return result
@@ -566,6 +1008,7 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     @assert npaths == length(x) "입력 x의 길이는 paths의 길이와 같아야 합니다."
     @assert length(W) == Out * npaths "W의 길이는 Out*paths이어야 합니다."
 
+<<<<<<< HEAD
     # 1) hop(x[i])[1]을 미리 전부 계산 (단일 스레드)
     hop = Hopping_operator(layer.U, paths[1])
     # y=deepcopy(x[1])
@@ -582,6 +1025,34 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     result = Vector{WF3x1}(undef, Out)
     for j in 1:Out
         result[j] = deepcopy(temp)
+=======
+    # 1) 결과 벡터 초기화 및 hopped 버퍼 할당
+    result = Vector{WF3x1}(undef, Out)
+    hopped = Vector{WF3x1}(undef, npaths)
+    
+    # 버퍼 할당 (한 번만)
+    @inbounds for i in 1:npaths
+        hopped[i] = deepcopy(x[1])
+    end
+    for j in 1:Out
+        result[j] = deepcopy(x[1])
+    end
+
+    # 2) hop 연산 - CPU는 preallocated 버전, GPU는 기존 방식
+    if x[1] isa WF3x1CPU
+        hop = Hopping_operator(layer.U, paths[1])
+        @inbounds for i in 1:npaths
+            hop.P = paths[i]
+            hop(x[i], [hopped[i]])  # preallocated 버전 사용
+        end
+    else
+        # GPU는 기존 방식 유지
+        hop = Hopping_operator(layer.U, paths[1])
+        @inbounds for i in 1:npaths
+            hop.P = paths[i]
+            hopped[i] = hop(x[i])[1]
+        end
+>>>>>>> origin/fix/bigfiles
     end
 
     # 3) Out 방향으로 병렬화
@@ -610,6 +1081,7 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
 end
 
 function (layer::fermionfield_Layer)(x::Any)
+<<<<<<< HEAD
 
 
 
@@ -633,6 +1105,64 @@ function (layer::fermionfield_Layer)(x::Any)
     return layer.x
 end
 
+=======
+    return layer.x
+end
+
+"""
+    refresh_fermionfield!(layer::fermionfield_Layer, U)
+
+JLD2 로드 후 stale CuArray를 가진 fermion field를 현재 GPU context로 재생성.
+substitute_fermion!으로 데이터를 복사합니다.
+"""
+function refresh_fermionfield!(layer::fermionfield_Layer, U)
+    for i in eachindex(layer.x)
+        # stale CuArray는 읽을 수 없으므로 새로 생성 + 초기화
+        new_x = Initialize_pseudofermion_fields(U[1], "Wilson", nowing=true)
+        substitute_fermion!(new_x, layer.x[i])
+        layer.x[i] = new_x
+    end
+    return layer
+end
+
+"""
+    refresh_model!(layers, D_new, U_new)
+
+JLD2로 로드한 모델의 stale CuArray를 현재 GPU context의 새 객체로 교체.
+- Ritz_Layer, PtcRayleighQuotient_Layer: D 교체
+- PTLayer: U 교체
+- fermionfield_Layer: x 재생성
+- GramSchmidt_Layer: x 재생성
+- LossSumLayer: 재귀적으로 처리
+"""
+function refresh_model!(layers::Vector{<:Layer}, D_new, U_new)
+    for layer in layers
+        _refresh_layer!(layer, D_new, U_new)
+    end
+    return layers
+end
+
+_refresh_layer!(layer::Ritz_Layer, D_new, U_new) = (layer.D = D_new)
+_refresh_layer!(layer::PtcRayleighQuotient_Layer, D_new, U_new) = (layer.D = D_new)
+_refresh_layer!(layer::PTLayer, D_new, U_new) = (layer.U = U_new)
+_refresh_layer!(layer::fermionfield_Layer, D_new, U_new) = refresh_fermionfield!(layer, U_new)
+
+function _refresh_layer!(layer::GramSchmidt_Layer, D_new, U_new)
+    for i in eachindex(layer.x)
+        new_x = Initialize_pseudofermion_fields(U_new[1], "Wilson", nowing=true)
+        gauss_distribution_fermion!(new_x)
+        layer.x[i] = new_x
+    end
+end
+
+function _refresh_layer!(layer::LossSumLayer, D_new, U_new)
+    _refresh_layer!(layer.l1, D_new, U_new)
+    _refresh_layer!(layer.l2, D_new, U_new)
+end
+
+_refresh_layer!(layer::Layer, D_new, U_new) = nothing
+
+>>>>>>> origin/fix/bigfiles
 
 
 
@@ -760,8 +1290,13 @@ function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
     T = typeof(x[1])
     Dx = Vector{T}(undef, l)
     @inbounds for i in 1:l
+<<<<<<< HEAD
         Dx[i] = similar(x[i])
         mul!(Dx[i], layer.D, x[i])   # mul!이 overwrite라고 가정 (누적이면 먼저 0으로 초기화 필요)
+=======
+        Dx[i] = deepcopy(x[1])
+        mul!(Dx[i], layer.D, x[i])   # mul! overwrites Dx[i]
+>>>>>>> origin/fix/bigfiles
     end
 
     # 2) Gram matrices: A_ij=<Dx_i, Dx_j>, B_ij=<x_i, x_j>
@@ -822,10 +1357,14 @@ function (layer::GramSchmidt_Layer)(x::Vector{WF3x1})
     V = layer.x                 # V[j] 들은 서로 직교라고 가정
     l = length(x)
 
+<<<<<<< HEAD
 
     
     result = Vector{WF3x1}(undef, l)
     temp   = similar(x[1])
+=======
+    result = Vector{WF3x1}(undef, l)
+>>>>>>> origin/fix/bigfiles
 
     @inbounds for i in 1:l
         y = deepcopy(x[i])      # y = x_i
@@ -833,7 +1372,10 @@ function (layer::GramSchmidt_Layer)(x::Vector{WF3x1})
             denom = inner_product(V[j], V[j])
             coeff = inner_product(V[j], y) / denom
             axpby!(-coeff, V[j], 1, y)   # y -= coeff * V[j]
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/fix/bigfiles
         end
         result[i] = y
     end
@@ -912,6 +1454,31 @@ function forward_propagation(layers::Vector{T}, input::Any, target::Any) where {
     return u, f
 end
 
+<<<<<<< HEAD
+=======
+# Inplace 버전 - 미리 할당된 u 재사용
+function forward_propagation!(layers::Vector{T}, input::Any, target::Any, u::Vector{Any}) where {T<:Layer}
+    L = length(layers)
+    @assert length(u) == L "u의 길이는 layers 길이와 같아야 합니다."
+
+    let last = layers[L]
+        if hasfield(typeof(last), :target)
+            last.target = target
+        end
+    end
+
+    u[1] = [input]
+
+    for i in 1:(L-1)
+        u[i+1] = layers[i](u[i])
+    end
+
+    f = layers[L](u[L])
+
+    return f
+end
+
+>>>>>>> origin/fix/bigfiles
 
 export backward_propagation
 
@@ -945,6 +1512,7 @@ function backward_propagation(layers::Vector{T},  u::Vector{Any}, batch::Int) wh
     return delta
 end
 
+<<<<<<< HEAD
 function backward_propagation!(layers::Vector{T},  u::Vector{Any}, batch::Int, delta::Vector{Any}) where T<:Layer
     @assert length(u) == length(layers) 
     @assert all(isassigned(u, j) for j in 1:length(u))  # u가 전부 채워졌는지 안전 확인(선택)
@@ -972,6 +1540,30 @@ function backward_propagation!(layers::Vector{T},  u::Vector{Any}, batch::Int, d
 
 
     return delta
+=======
+function backward_propagation!(layers::Vector{T}, u::Vector{Any}, batch::Int, delta::Vector{Any}) where T<:Layer
+    L = length(layers)
+
+    @assert length(u) == L
+    @assert length(delta) == L-1
+
+    # delta[k] = ∂f/∂u[k+1]
+
+    # 마지막 레이어: u[L] -> scalar
+    DeltaRule!(layers[L], layers[L].activation, u[L], delta[L-1], batch)
+
+    # hidden layers: j = L-1, ..., 2
+    for j in (L-1):-1:2
+        DeltaRule!(
+            layers[j],
+            layers[j].activation,
+            u[j],          # <- 여기 중요
+            delta[j],      # = ∂f/∂u[j+1]
+            delta[j-1]     # = ∂f/∂u[j]
+        )
+    end
+
+>>>>>>> origin/fix/bigfiles
 end
 
 using Plots
@@ -1010,16 +1602,31 @@ function train(opt::Opt, layers::Vector{T}, input::WF3x1, target::WF3x1 , Dirac_
 
     D = Dirac_operator
 
+<<<<<<< HEAD
 
     y = similar(input)
     x= similar(input)
     # target=deepcopy(input)
+=======
+    # 재사용 버퍼 (similar 대신 deepcopy)
+    y = deepcopy(input)
+    x = deepcopy(input)
+
+    # 메모리 최적화: epoch 밖에서 버퍼 미리 할당
+    u = Vector{Any}(undef, depth)
+    delta = Vector{Any}(undef, depth-1)
+    d = Vector{Any}(undef, depth)
+    temp = Vector{ComplexF64}(undef, batch)
+>>>>>>> origin/fix/bigfiles
 
     for epoch in 1:epochs
 
         current_loss = 0.0
+<<<<<<< HEAD
         temp=Vector{ComplexF64}(undef, batch)
         d=Vector{Any}(undef, depth)
+=======
+>>>>>>> origin/fix/bigfiles
         # for i in 1:depth
         #     if layers[i].W === nothing
         #         d[i]=nothing
@@ -1073,6 +1680,7 @@ function train(opt::Opt, layers::Vector{T}, input::WF3x1, target::WF3x1 , Dirac_
             # target=similar(input)
 
 
+<<<<<<< HEAD
             u,f = forward_propagation(layers, input , target)
             temp[b]=f
 
@@ -1089,6 +1697,20 @@ function train(opt::Opt, layers::Vector{T}, input::WF3x1, target::WF3x1 , Dirac_
                 end
                 # d[i] += gradient(layers[i], layers[i].activation::Any, u[i], delta[depth - i + 1]/batch,γ)
 
+=======
+            f = forward_propagation!(layers, input, target, u)
+            temp[b] = f
+
+            backward_propagation!(layers, u, batch, delta)
+
+            for i in 1:depth-1
+                if b == 1
+                    d[i] = gradient(layers[i], layers[i].activation::Any, u[i], delta[depth - i], γ)
+                else
+                    # batch > 1일 때 누적 (향후 구현)
+                    # d[i] = add_gradient(d[i], gradient(...))
+                end
+>>>>>>> origin/fix/bigfiles
             end
 
 
@@ -1161,7 +1783,13 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
 
     x = Initialize_pseudofermion_fields(config[1][1],"Wilson")
     D= Dirac_operator(config[1],x,params)
+<<<<<<< HEAD
     delta ,f = forward_propagation(layers, D , D)
+=======
+    dummy ,f = forward_propagation(layers, D , D)
+
+    delta=deepcopy(dummy[2:end])  # delta는 레이어 수보다 하나 적음에 주의
+>>>>>>> origin/fix/bigfiles
 
     for epoch in 1:epochs
         k=mod(epoch-1,length(config))+1
@@ -1198,7 +1826,11 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
 
 
             for i in 1:depth-1
+<<<<<<< HEAD
                 gi = gradient(layers[i], layers[i].activation, u[i], delta[i+1], γ)
+=======
+                gi = gradient(layers[i], layers[i].activation, u[i], delta[i], γ)
+>>>>>>> origin/fix/bigfiles
 
                 gi === nothing && continue
 
