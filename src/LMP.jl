@@ -12,6 +12,10 @@ include("activation.jl")
 include("Optimizer.jl")  # ✅ Optimizer 모듈 포함
 include("Layer_sequence.jl")
 include("Gauge.jl")
+<<<<<<< HEAD
+=======
+include("DDalphaAMG.jl")
+>>>>>>> origin/fix/bigfiles
 
 
 using .elementry_base 
@@ -21,6 +25,10 @@ using .activation
 using .Optimizer
 using .Layer_sequence
 using .Gauge
+<<<<<<< HEAD
+=======
+using .DDalphaAMG
+>>>>>>> origin/fix/bigfiles
 using DisplayAs
 # ✅ `Optimizer`를 정확히 가져오고, 필요한 함수 import
 
@@ -92,5 +100,18 @@ export GramSchmidt_Layer
 export conj!
 export gpuconj!
 export backward_propagation!
+<<<<<<< HEAD
+=======
+export zero_wf!
+export refresh_fermionfield!, refresh_model!
+export substitute_Layer!
+export blockize
+export unblockize
+export DDalphaAMG_Setup, CoarseVector
+export setup_DDalphaAMG, solve_DDalphaAMG, vcycle
+export restrict_f2c, prolongate_c2f, coarse_apply
+export mr_smooth!, sap_smooth!
+export block_orthonormalize!
+>>>>>>> origin/fix/bigfiles
 end  # module LMP
 

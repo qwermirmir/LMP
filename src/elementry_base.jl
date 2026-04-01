@@ -16,6 +16,12 @@ export mean
 export standardization
 export minmax
 export g2vector_generator!
+<<<<<<< HEAD
+=======
+export substitute_fermion!
+export blockize
+export unblockize
+>>>>>>> origin/fix/bigfiles
 
 # using LatticeQCD
 using Gaugefields
@@ -190,7 +196,10 @@ function Base.:*(M::Spin_matrix,x::WF3x1)
                         e3 = f[ic, ix, iy, iz, it, 3]
                         e4 = f[ic, ix, iy, iz, it, 4]
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/fix/bigfiles
                         f[ic, ix, iy, iz, it, 1] =
                             M[1, 1] * e1 + M[1, 2] * e2 + M[1, 3] * e3 + M[1, 4] * e4
                         f[ic, ix, iy, iz, it, 2] =
@@ -628,6 +637,17 @@ function norm2(x::WF3x1)
 end
 
 
+<<<<<<< HEAD
+=======
+# CPU 버전 substitute_fermion! - inplace copy (메모리 할당 없음)
+function substitute_fermion!(dest::WF3x1CPU, src::WF3x1CPU)
+    @assert size(dest.f) == size(src.f) "dest와 src의 크기가 같아야 합니다."
+    copyto!(dest.f, src.f)
+    return dest
+end
+
+
+>>>>>>> origin/fix/bigfiles
 
 
 
@@ -729,17 +749,27 @@ function (hop::Hopping_operator)(x::WF3x1CPU)
 
     U = hop.Gauge
     shifts = Vector{WF3x1}()
+<<<<<<< HEAD
     # push!(shifts,deepcopy(x))
 
     for k in 1:length(hop.P.various)
         Ucopy = deepcopy(U)
+=======
+
+    for k in 1:length(hop.P.various)
+        # Ucopy 삭제 - U는 읽기만 하므로 deepcopy 불필요
+>>>>>>> origin/fix/bigfiles
         copyx = deepcopy(x)
         for step in hop.P.various[k].steps
             a = step.f
             if a > 0
 
                 shift_x=shift_fermion(copyx , -a)
+<<<<<<< HEAD
                 Uminus = shift_U(Ucopy[a], -a)
+=======
+                Uminus = shift_U(U[a], -a)  # Ucopy 대신 U 사용
+>>>>>>> origin/fix/bigfiles
 
                 mul!(copyx, Uminus',shift_x)
 
@@ -750,7 +780,11 @@ function (hop::Hopping_operator)(x::WF3x1CPU)
 
                 shift_x=shift_fermion(copyx, a)
 
+<<<<<<< HEAD
                 mul!(copyx, Ucopy[a], shift_x)
+=======
+                mul!(copyx, U[a], shift_x)  # Ucopy 대신 U 사용
+>>>>>>> origin/fix/bigfiles
             
             elseif a == 0
 
@@ -772,14 +806,22 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
     shifts = Vector{WF3x1}()
 
     for k in 1:length(hop.P.various)
+<<<<<<< HEAD
         Ucopy = deepcopy(U)
+=======
+        # Ucopy 삭제 - U는 읽기만 하므로 deepcopy 불필요
+>>>>>>> origin/fix/bigfiles
         copyx = deepcopy(x[k])
         for step in hop.P.various[k].steps
             a = step.f
             if a > 0
 
                 shift_x=shift_fermion(copyx , -a)
+<<<<<<< HEAD
                 Uminus = shift_U(Ucopy[a], -a)
+=======
+                Uminus = shift_U(U[a], -a)  # Ucopy 대신 U 사용
+>>>>>>> origin/fix/bigfiles
 
                 mul!(copyx, Uminus',shift_x)
             
@@ -788,7 +830,11 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
 
                 shift_x=shift_fermion(copyx, a)
 
+<<<<<<< HEAD
                 mul!(copyx, Ucopy[a], shift_x)
+=======
+                mul!(copyx, U[a], shift_x)  # Ucopy 대신 U 사용
+>>>>>>> origin/fix/bigfiles
             elseif a == 0
                 copyx = deepcopy(x[k])
                 
@@ -802,6 +848,44 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
 end
 
 
+<<<<<<< HEAD
+=======
+# Preallocated 버퍼를 받는 버전 - 메모리 할당 최소화
+function (hop::Hopping_operator)(x::WF3x1CPU, V::AbstractVector{T}) where {T<:WF3x1CPU}
+    @assert length(V) == length(hop.P.various) "V의 길이는 paths의 개수와 같아야 합니다."
+    
+    U = hop.Gauge
+
+    @inbounds for k in eachindex(V)
+        copyx = V[k]
+        
+        # copyx를 x로 초기화 (inplace copy)
+        substitute_fermion!(copyx, x)
+
+        for step in hop.P.various[k].steps
+            a = step.f
+            if a > 0
+                shift_x = shift_fermion(copyx, -a)
+                Uminus = shift_U(U[a], -a)
+                mul!(copyx, Uminus', shift_x)
+
+            elseif a < 0
+                aa = -a
+                shift_x = shift_fermion(copyx, aa)
+                mul!(copyx, U[aa], shift_x)
+            
+            else
+                # a == 0: copyx를 x로 재설정
+                substitute_fermion!(copyx, x)
+            end
+        end
+    end
+
+    return V
+end
+
+
+>>>>>>> origin/fix/bigfiles
 
 
 
@@ -866,7 +950,10 @@ function CPTC(hop::Hopping_operator,W::Vector{Spin_matrix},f::WF3x1)
 end
 
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/fix/bigfiles
 function mean(x::WF3x1)
     NX = x.NX
     NY = x.NY
@@ -1098,6 +1185,102 @@ end
 
 
 
+<<<<<<< HEAD
+=======
+"""
+    blockize(x::WF3x1, r::Int)
+
+페르미온 벡터 `x`를 시공간 방향마다 `r`개씩 묶어 블록화한다.
+NX, NY, NZ, NT 각각이 `r`로 나누어떨어져야 한다.
+
+반환값: `Vector{WF3x1}` — 길이 `(NX÷r)*(NY÷r)*(NZ÷r)*(NT÷r)`.
+각 원소는 원래와 같은 격자 크기의 WF3x1이며,
+해당 블록에 속하는 사이트만 원래 값을 갖고 나머지는 0.
+블록 순서는 (bx, by, bz, bt)를 row-major로 flatten한 것.
+"""
+function blockize(x::WF3x1, r::Int)
+    NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
+    NC, NG = x.NC, x.NG
+
+    @assert NX % r == 0 "NX=$NX 는 r=$r 로 나누어떨어져야 합니다."
+    @assert NY % r == 0 "NY=$NY 는 r=$r 로 나누어떨어져야 합니다."
+    @assert NZ % r == 0 "NZ=$NZ 는 r=$r 로 나누어떨어져야 합니다."
+    @assert NT % r == 0 "NT=$NT 는 r=$r 로 나누어떨어져야 합니다."
+
+    NBX = NX ÷ r
+    NBY = NY ÷ r
+    NBZ = NZ ÷ r
+    NBT = NT ÷ r
+
+    blocks = Vector{typeof(x)}(undef, NBX * NBY * NBZ * NBT)
+
+    idx = 0
+    @inbounds for bt = 1:NBT
+        for bz = 1:NBZ
+            for by = 1:NBY
+                for bx = 1:NBX
+                    idx += 1
+                    blk = similar(x)   # 0으로 초기화된 WF3x1
+                    for lt = 1:r
+                        it = (bt - 1) * r + lt
+                        for lz = 1:r
+                            iz = (bz - 1) * r + lz
+                            for ly = 1:r
+                                iy = (by - 1) * r + ly
+                                for lx = 1:r
+                                    ix = (bx - 1) * r + lx
+                                    for ig = 1:NG
+                                        @simd for ic = 1:NC
+                                            blk[ic, ix, iy, iz, it, ig] =
+                                                x[ic, ix, iy, iz, it, ig]
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    blocks[idx] = blk
+                end
+            end
+        end
+    end
+
+    return blocks
+end
+
+"""
+    unblockize(blocks::Vector{WF3x1})
+
+`blockize`의 역연산. 블록 벡터들을 모두 더해 원래 페르미온 벡터를 복원한다.
+각 블록은 서로 겹치지 않는 사이트를 갖고 있으므로 단순 합산으로 복원 가능.
+"""
+function unblockize(blocks::Vector{T}) where {T<:WF3x1}
+    f = similar(blocks[1])
+    NX, NY, NZ, NT = f.NX, f.NY, f.NZ, f.NT
+    NC, NG = f.NC, f.NG
+
+    for blk in blocks
+        @inbounds for it = 1:NT
+            for iz = 1:NZ
+                for iy = 1:NY
+                    for ix = 1:NX
+                        for ig = 1:NG
+                            @simd for ic = 1:NC
+                                f[ic, ix, iy, iz, it, ig] +=
+                                    blk[ic, ix, iy, iz, it, ig]
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return f
+end
+
+
+>>>>>>> origin/fix/bigfiles
 end # module
 
 

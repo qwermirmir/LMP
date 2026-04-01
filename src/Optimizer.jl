@@ -155,7 +155,10 @@ function update!(layer::CPTC_Layer, opt::Adam,  grad)
 end
 
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/fix/bigfiles
 function update!(layer::PTC_Layer, opt::Adam,  grad)
     
     opt.t += 1
