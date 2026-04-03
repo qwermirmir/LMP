@@ -35,6 +35,7 @@ export fermionfield_Layer
 export Orthogonal_Layer
 export Ritz_Layer  
 export GramSchmidt_Layer
+export BlockScalar_Layer
 
 struct Identity <: ActivationFunction end
 
@@ -601,6 +602,32 @@ mutable struct LossSumLayer{L1<:Layer,L2<:Layer} <: Layer
                           w1::Real=1.0, w2::Real=1.0,
                           activation::ActivationFunction=Identity()) where {L1<:Layer,L2<:Layer}
         new{L1,L2}(l1, l2, Float64(w1), Float64(w2), activation)
+    end
+end
+
+
+"""
+    BlockScalar_Layer
+
+blockize로 블록화된 벡터 각각에 스칼라(복소수) 가중치를 곱하는 학습 레이어.
+
+# Fields
+- `W::Vector{ComplexF64}` — 블록 개수만큼의 스칼라 가중치
+- `r::Int` — blockize에 사용되는 블록 크기
+- `residual::Bool` — residual connection 활성화 여부
+- `activation::ActivationFunction` — 활성화 함수
+"""
+mutable struct BlockScalar_Layer <: Layer
+    W::Vector{ComplexF64}
+    r::Int
+    residual::Bool
+    activation::ActivationFunction
+
+    function BlockScalar_Layer(nblocks::Int, r::Int,
+                               residual::Bool=false,
+                               activation::ActivationFunction=Identity())
+        W = ones(ComplexF64, nblocks)
+        new(W, r, residual, activation)
     end
 end
 

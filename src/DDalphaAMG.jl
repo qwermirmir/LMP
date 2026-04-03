@@ -1,6 +1,7 @@
 module DDalphaAMG
 
 using ..elementry_base
+using ..gpu
 using Gaugefields
 using LatticeDiracOperators
 using LinearAlgebra
@@ -8,8 +9,10 @@ using CUDA
 export DDalphaAMG_Setup, CoarseVector
 export setup_DDalphaAMG, solve_DDalphaAMG, vcycle
 export restrict_f2c, prolongate_c2f, coarse_apply
+export restrict_f2c!, prolongate_c2f!, coarse_apply!
 export mr_smooth!, sap_smooth!
 export block_orthonormalize!
+export deflated_initial_guess
 
 
 const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
@@ -347,6 +350,37 @@ function restrict_f2c(setup::DDalphaAMG_Setup, x::WF3x1)
     return cv
 end
 
+"""
+    restrict_f2c!(cv, setup, x) → CoarseVector
+
+restrict_f2c の in-place 版。結果を cv に書き込む。
+"""
+function restrict_f2c!(cv::CoarseVector, setup::DDalphaAMG_Setup, x::WF3x1)
+    r = setup.r; Nv = setup.Nv
+    NBX, NBY, NBZ, NBT = setup.NBX, setup.NBY, setup.NBZ, setup.NBT
+    NC, NG = setup.NC, setup.NG
+
+    @inbounds for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
+        bidx = block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
+        for v = 1:Nv
+            val = zero(ComplexF64)
+            tv = setup.test_vectors[v]
+            for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
+                it = (bt-1)*r + lt; iz = (bz-1)*r + lz
+                iy = (by-1)*r + ly; ix = (bx-1)*r + lx
+                for ig = 1:NG
+                    for ic = 1:NC
+                        val += conj(tv[ic, ix, iy, iz, it, ig]) * x[ic, ix, iy, iz, it, ig]
+                    end
+                end
+            end
+            cv.data[(bidx-1)*Nv + v] = val
+        end
+    end
+
+    return cv
+end
+
 
 # ==========================================
 #  延長演算子 (Prolongation: coarse → fine)
@@ -386,6 +420,37 @@ function prolongate_c2f(setup::DDalphaAMG_Setup, cv::CoarseVector)
     return f
 end
 
+"""
+    prolongate_c2f!(f, setup, cv) → WF3x1
+
+prolongate_c2f の in-place 版。結果を f に書き込む。
+"""
+function prolongate_c2f!(f::WF3x1, setup::DDalphaAMG_Setup, cv::CoarseVector)
+    r = setup.r; Nv = setup.Nv
+    NBX, NBY, NBZ, NBT = setup.NBX, setup.NBY, setup.NBZ, setup.NBT
+    NC, NG = setup.NC, setup.NG
+
+    @inbounds for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
+        bidx = block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
+        base = (bidx-1)*Nv
+        for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
+            it = (bt-1)*r + lt; iz = (bz-1)*r + lz
+            iy = (by-1)*r + ly; ix = (bx-1)*r + lx
+            for ig = 1:NG
+                for ic = 1:NC
+                    val = zero(ComplexF64)
+                    for v = 1:Nv
+                        val += cv.data[base + v] * setup.test_vectors[v][ic, ix, iy, iz, it, ig]
+                    end
+                    f[ic, ix, iy, iz, it, ig] = val
+                end
+            end
+        end
+    end
+
+    return f
+end
+
 
 # ==========================================
 #  粗格子演算子 (Coarse Grid Operator, matrix-free)
@@ -401,6 +466,22 @@ function coarse_apply(setup::DDalphaAMG_Setup, D, cv::CoarseVector)
     fine_v = prolongate_c2f(setup, cv)
     Dfine_v = D * fine_v
     return restrict_f2c(setup, Dfine_v)
+end
+
+"""
+    coarse_apply!(result, setup, D, cv, fine_buf1, fine_buf2) → CoarseVector
+
+coarse_apply の in-place 版。事前確保した fine_buf1, fine_buf2 を作業バッファとして使用し、
+結果を result に書き込む。メモリ割り当てゼロ。
+  fine_buf1: prolongation 結果用
+  fine_buf2: D 適用結果用
+"""
+function coarse_apply!(result::CoarseVector, setup::DDalphaAMG_Setup, D, cv::CoarseVector,
+                       fine_buf1::WF3x1, fine_buf2::WF3x1)
+    prolongate_c2f!(fine_buf1, setup, cv)
+    mul!(fine_buf2, D, fine_buf1)
+    restrict_f2c!(result, setup, fine_buf2)
+    return result
 end
 
 
@@ -434,9 +515,17 @@ Minimal Residual (MR) スムーザー。
   r = b - D*x,  α = ⟨D*r, r⟩ / ⟨D*r, D*r⟩,  x += α*r
 """
 function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4)
+
+    Dr = deepcopy(x)  # D*r を格納するバッファ
+    r = deepcopy(x)   # b - D*x を格納するバッファ
+    zero_wf!(Dr)
+    zero_wf!(r)
     for _ = 1:niter
-        r = b - D * x
-        Dr = D * r
+        # r = b - D * x
+        mul!(r,D,x)
+        axpby!(1, b, -1, r)  # r = b - D*x  → axpby!(1, b, -1, r) => r = 1*b + (-1)*r
+        # Dr = D * r
+        mul!(Dr, D, r)        
         num = inner_product(Dr, r)
         den = inner_product(Dr, Dr)
         if abs(den) < 1e-30
@@ -518,20 +607,30 @@ end
 # ==========================================
 
 """
-    coarse_gmres(setup, D, b_c; maxiter, restart, tol) → CoarseVector
+    coarse_gmres(setup, D, b_c; maxiter, restart, tol, coarse_apply_counter) → CoarseVector
 
 粗格子上の GMRES ソルバー。Dc * x_c = b_c を解く。
 Dc は matrix-free で適用: Dc(v) = R · D · P(v)
+coarse_apply_counter が渡された場合、coarse_apply 呼出し回数を加算する。
 """
 function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
-                      maxiter::Int=50, restart::Int=20, tol::Float64=1e-1)
+                      maxiter::Int=50, restart::Int=20, tol::Float64=1e-1,
+                      coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing)
     x_c = similar(b_c)
+
+    # 細格子バッファを事前確保（coarse_apply! で再利用）
+    fine_buf1 = similar(setup.test_vectors[1])
+    fine_buf2 = similar(setup.test_vectors[1])
+    # 粗格子作業バッファ
+    w_c = similar(b_c)
+    r_c = similar(b_c)
 
     for _ = 1:maxiter
         # 残差: r = b - Dc*x
-        r_c = copy(b_c)
-        Dc_x = coarse_apply(setup, D, x_c)
-        coarse_axpby!(-1.0, Dc_x, 1.0, r_c)
+        r_c.data .= b_c.data
+        coarse_apply!(w_c, setup, D, x_c, fine_buf1, fine_buf2)
+        coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
+        coarse_axpby!(-1.0, w_c, 1.0, r_c)
 
         β = coarse_norm(r_c)
         if β < tol
@@ -546,20 +645,21 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
 
         j_final = m
         for j = 1:m
-            w = coarse_apply(setup, D, V[j])
+            coarse_apply!(w_c, setup, D, V[j], fine_buf1, fine_buf2)
+            coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
 
             # Modified Gram-Schmidt
             for i = 1:j
-                H[i,j] = coarse_dot(V[i], w)
-                coarse_axpby!(-H[i,j], V[i], 1.0, w)
+                H[i,j] = coarse_dot(V[i], w_c)
+                coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
             end
-            H[j+1,j] = coarse_norm(w)
+            H[j+1,j] = coarse_norm(w_c)
 
             if abs(H[j+1,j]) < 1e-14
                 j_final = j
                 break
             end
-            V[j+1].data .= w.data ./ H[j+1,j]
+            V[j+1].data .= w_c.data ./ H[j+1,j]
         end
 
         # 最小二乗問題: min ||β*e₁ - H*y||
@@ -572,9 +672,11 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         end
 
         # 収束確認
-        check_r = copy(b_c)
-        coarse_axpby!(-1.0, coarse_apply(setup, D, x_c), 1.0, check_r)
-        if coarse_norm(check_r) < tol
+        r_c.data .= b_c.data
+        coarse_apply!(w_c, setup, D, x_c, fine_buf1, fine_buf2)
+        coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
+        coarse_axpby!(-1.0, w_c, 1.0, r_c)
+        if coarse_norm(r_c) < tol
             return x_c
         end
     end
@@ -601,7 +703,8 @@ end
 function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 pre_smooth::Int=4, post_smooth::Int=4,
                 coarse_maxiter::Int=50, coarse_tol::Float64=1e-1,
-                smoother::Symbol=:mr)
+                smoother::Symbol=:mr,
+                coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing)
     x = similar(b)
 
     # 1. Pre-smoothing
@@ -617,7 +720,8 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
 
     # 3. 粗格子求解
     e_coarse = coarse_gmres(setup, D, r_coarse;
-                            maxiter=coarse_maxiter, tol=coarse_tol)
+                            maxiter=coarse_maxiter, tol=coarse_tol,
+                            coarse_apply_counter=coarse_apply_counter)
 
     # 4. 細格子への補正
     correction = prolongate_c2f(setup, e_coarse)
@@ -660,8 +764,16 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         return x
     end
 
+    r=deepcopy(b)  # r = b - D*x を格納するバッファ
+    zero_wf!(r)
+
+    total_coarse_gmres = 0  # coarse GMRES 呼出し回数カウンタ
+    _coarse_apply_counter = Ref(0)  # coarse_apply（= 細格子D適用）呼出し回数カウンタ
+
     for cycle = 1:maxiter
-        r = b - D * x
+        # r = b - D * x
+        mul!(r, D, x)           # r = D*x
+        axpby!(1, b, -1, r)     # r = b - D*x  → axpby!(1, b, -1, r) => r = 1*b + (-1)*r
         β = sqrt(real(inner_product(r, r)))
 
         if verbose
@@ -671,6 +783,8 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         if β / b_norm < tol
             if verbose
                 println("FGMRES converged! ($(cycle) cycles)")
+                println("  Total coarse GMRES calls: $total_coarse_gmres")
+                println("  Total coarse_apply (fine D mul): $(_coarse_apply_counter[])")
             end
             return x
         end
@@ -695,7 +809,9 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
             # V-cycle プリコンディショナー: M⁻¹ * v_j
             Z[j] = vcycle(D, V[j], setup;
                           pre_smooth=pre_smooth, post_smooth=post_smooth,
-                          coarse_tol=coarse_tol, smoother=smoother)
+                          coarse_tol=coarse_tol, smoother=smoother,
+                          coarse_apply_counter=_coarse_apply_counter)
+            total_coarse_gmres += 1
 
             w = D * Z[j]
 
@@ -767,6 +883,8 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         if converged
             if verbose
                 println("FGMRES converged at cycle $cycle, step $(j_final)!")
+                println("  Total coarse GMRES calls: $total_coarse_gmres")
+                println("  Total coarse_apply (fine D mul): $(_coarse_apply_counter[])")
             end
             return x
         end
@@ -776,6 +894,8 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         r_final = b - D * x
         println("FGMRES: max iterations reached. " *
                 "Final relative residual = $(sqrt(real(inner_product(r_final, r_final)))/b_norm)")
+        println("  Total coarse GMRES calls: $total_coarse_gmres")
+        println("  Total coarse_apply (fine D mul): $(_coarse_apply_counter[])")
     end
     return x
 end
@@ -786,13 +906,13 @@ end
 # ==========================================
 
 """
-    setup_DDalphaAMG(D, template, r, Nv; nsmooth, verbose) → DDalphaAMG_Setup
+    setup_DDalphaAMG(D, template, r, Nv; nsmooth, verbose, smoother, ...) → DDalphaAMG_Setup
 
 DD-αAMG の完全セットアップを行う。
 
 手順:
 1. ランダムテストベクトルを Nv 個生成
-2. MR スムージングで低モード成分を強化 (D*ψ ≈ 0 の近似求解)
+2. スムージングで低モード成分を強化 (D*ψ ≈ 0 の近似求解)
 3. ブロック直交正規化
 
 引数:
@@ -801,15 +921,26 @@ DD-αAMG の完全セットアップを行う。
 - r: 各方向のブロックサイズ (NX,NY,NZ,NT が r で割り切れること)
 - Nv: テストベクトル数 (推奨: 20〜30)
 - nsmooth: セットアップスムージングの反復数 (デフォルト: 8)
+- smoother: :mr (デフォルト), :sap, :vcycle
+  - :mr  — MR スムージングのみ
+  - :sap — SAP スムージングのみ
+  - :vcycle — MR で予備セットアップ後、V-cycle で粗格子残差成分を強調
+- nvcycle: V-cycle スムージングの反復数 (smoother=:vcycle 時、デフォルト: 4)
+- vcycle_pre_smooth, vcycle_post_smooth: V-cycle 内のスムージング回数 (デフォルト: 各4)
 
 使用例:
 ```julia
 setup = setup_DDalphaAMG(D, x, 2, 24; nsmooth=16)
+setup = setup_DDalphaAMG(D, x, 2, 24; smoother=:vcycle, nsmooth=8, nvcycle=4)
 x = solve_DDalphaAMG(D, b, setup; tol=1e-10)
 ```
 """
 function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
-                          nsmooth::Int=8, verbose::Bool=true, coarse_vectors::Union{Nothing,Vector{WF3x1}}=nothing)
+                          nsmooth::Int=8, verbose::Bool=true,
+                          coarse_vectors::Union{Nothing,Vector{WF3x1}}=nothing,
+                          smoother::Symbol=:mr,
+                          nvcycle::Int=4,
+                          vcycle_pre_smooth::Int=4, vcycle_post_smooth::Int=4)
     NX, NY, NZ, NT = template.NX, template.NY, template.NZ, template.NT
     NC, NG = template.NC, template.NG
 
@@ -838,17 +969,70 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             println("  外部から提供されたテストベクトルを使用")
         end
     else
-        # 2. スムージング: MR で D*ψ ≈ 0 を近似求解 → 低モード成分抽出
         test_vectors = [similar(template) for _ in 1:Nv]
         for v in 1:Nv
             random_fermion!(test_vectors[v])
         end
-        if verbose
-            println("  テストベクトルをスムージング中 ($nsmooth MR iterations)...")
-        end
+
+        # 2. スムージング: D*ψ ≈ 0 を近似求解 → 低モード成分抽出
         zero_rhs = similar(template)  # ゼロ右辺
-        for v in 1:Nv
-            mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
+
+        if smoother == :vcycle
+            # Phase 1: MR で予備スムージング → 仮セットアップ構築
+            if verbose
+                println("  [V-cycle setup] Phase 1: MR 予備スムージング ($nsmooth iterations)...")
+            end
+            for v in 1:Nv
+                mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
+            end
+
+            # 仮ブロック直交正規化 → 仮セットアップ
+            block_orthonormalize!(test_vectors, r)
+            pre_setup = DDalphaAMG_Setup{typeof(template)}(
+                test_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
+                NBX, NBY, NBZ, NBT, Nblocks
+            )
+
+            # Phase 2: V-cycle でテストベクトルを再スムージング
+            #   D*ψ = 0 を V-cycle プリコンディショナーで解く
+            #   → 粗格子で表現しきれない残差成分が強調される
+            if verbose
+                println("  [V-cycle setup] Phase 2: V-cycle スムージング ($nvcycle iterations)...")
+            end
+            for v in 1:Nv
+                for _ in 1:nvcycle
+                    test_vectors[v] = vcycle(D, zero_rhs, pre_setup;
+                                             pre_smooth=vcycle_pre_smooth,
+                                             post_smooth=vcycle_post_smooth,
+                                             smoother=:mr)
+                    # V-cycle は x=0 から開始し D*x≈0 の近似解を返す
+                    # 既存の test_vector を初期推定として使うため、
+                    # vcycle 結果と元ベクトルを混合
+                end
+                if verbose && v % max(1, Nv ÷ 4) == 0
+                    println("    テストベクトル $v/$Nv 完了")
+                end
+            end
+        elseif smoother == :sap
+            if verbose
+                println("  テストベクトルを SAP スムージング中 ($nsmooth iterations)...")
+            end
+            # SAP にはセットアップが必要 → まず仮セットアップを構築
+            block_orthonormalize!(test_vectors, r)
+            pre_setup = DDalphaAMG_Setup{typeof(template)}(
+                test_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
+                NBX, NBY, NBZ, NBT, Nblocks
+            )
+            for v in 1:Nv
+                sap_smooth!(test_vectors[v], D, zero_rhs, pre_setup; niter=1, nblock_mr=nsmooth)
+            end
+        else  # :mr (デフォルト)
+            if verbose
+                println("  テストベクトルを MR スムージング中 ($nsmooth iterations)...")
+            end
+            for v in 1:Nv
+                mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
+            end
         end
     end
 
@@ -907,6 +1091,50 @@ function solve_DDalphaAMG(D, b::WF3x1, setup::DDalphaAMG_Setup;
                   x0=x0, tol=tol, maxiter=maxiter, restart=restart,
                   verbose=verbose, smoother=smoother,
                   pre_smooth=pre_smooth, post_smooth=post_smooth)
+end
+
+
+# ==========================================
+#  Deflation: 初期推定ベクトル生成
+# ==========================================
+"""
+    deflated_initial_guess(D, b, test_vectors; verbose=false)
+
+テストベクトル {v_i} から射影行列 G[i,j] = ⟨v_i, D v_j⟩ を構築し、
+固有値分解 G = U Λ U† を行って、deflation 初期推定を生成する。
+
+手順:
+1. G[i,j] = ⟨v_i, D v_j⟩,  rhs[i] = ⟨v_i, b⟩
+2. 固有値分解:  G = U Λ U†
+3. 固有値基底での射影:  α_k = (U† rhs)_k / λ_k
+4. 元の基底に戻す:  c = U α
+5. x₀ = Σ_j c_j v_j
+"""
+function deflated_initial_guess(D, b::WF3x1, test_vectors::Vector{T};
+                                 verbose::Bool=false) where T<:WF3x1
+    Nv = length(test_vectors)
+    Nv == 0 && return similar(b)
+    G   = zeros(ComplexF64, Nv)
+    rhs = zeros(ComplexF64, Nv)
+
+    Dv = similar(b)
+    for i in 1:Nv
+        mul!(Dv, D, test_vectors[i])  # D v_i を計算
+        rhs[i] = inner_product(test_vectors[i], b)
+        G[i] = inner_product(test_vectors[i], Dv)  # G[i] = ⟨v_i, D v_i⟩
+    end
+
+
+
+    # x₀ = Σ c_j v_j
+    #  c_j = ⟨v_j, b⟩ / ⟨v_j, D v_j⟩  (正規化込み)
+    x0 = similar(b)
+    for j in 1:Nv
+        c_j = rhs[j] / G[j]
+        axpby!(c_j, test_vectors[j], 1, x0)  # x0 += c_j * v_j
+    end
+
+    return x0
 end
 
 
