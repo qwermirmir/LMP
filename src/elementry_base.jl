@@ -16,12 +16,9 @@ export mean
 export standardization
 export minmax
 export g2vector_generator!
-<<<<<<< HEAD
-=======
 export substitute_fermion!
 export blockize
 export unblockize
->>>>>>> origin/fix/bigfiles
 
 # using LatticeQCD
 using Gaugefields
@@ -196,10 +193,6 @@ function Base.:*(M::Spin_matrix,x::WF3x1)
                         e3 = f[ic, ix, iy, iz, it, 3]
                         e4 = f[ic, ix, iy, iz, it, 4]
 
-<<<<<<< HEAD
-
-=======
->>>>>>> origin/fix/bigfiles
                         f[ic, ix, iy, iz, it, 1] =
                             M[1, 1] * e1 + M[1, 2] * e2 + M[1, 3] * e3 + M[1, 4] * e4
                         f[ic, ix, iy, iz, it, 2] =
@@ -637,8 +630,6 @@ function norm2(x::WF3x1)
 end
 
 
-<<<<<<< HEAD
-=======
 # CPU 버전 substitute_fermion! - inplace copy (메모리 할당 없음)
 function substitute_fermion!(dest::WF3x1CPU, src::WF3x1CPU)
     @assert size(dest.f) == size(src.f) "dest와 src의 크기가 같아야 합니다."
@@ -647,7 +638,6 @@ function substitute_fermion!(dest::WF3x1CPU, src::WF3x1CPU)
 end
 
 
->>>>>>> origin/fix/bigfiles
 
 
 
@@ -737,7 +727,6 @@ end
 
 
 
-
 mutable struct Hopping_operator{G<:AbstractGaugefields}
     Gauge::Vector{G}
     P::Paths
@@ -749,27 +738,16 @@ function (hop::Hopping_operator)(x::WF3x1CPU)
 
     U = hop.Gauge
     shifts = Vector{WF3x1}()
-<<<<<<< HEAD
-    # push!(shifts,deepcopy(x))
-
-    for k in 1:length(hop.P.various)
-        Ucopy = deepcopy(U)
-=======
 
     for k in 1:length(hop.P.various)
         # Ucopy 삭제 - U는 읽기만 하므로 deepcopy 불필요
->>>>>>> origin/fix/bigfiles
         copyx = deepcopy(x)
         for step in hop.P.various[k].steps
             a = step.f
             if a > 0
 
                 shift_x=shift_fermion(copyx , -a)
-<<<<<<< HEAD
-                Uminus = shift_U(Ucopy[a], -a)
-=======
                 Uminus = shift_U(U[a], -a)  # Ucopy 대신 U 사용
->>>>>>> origin/fix/bigfiles
 
                 mul!(copyx, Uminus',shift_x)
 
@@ -780,11 +758,7 @@ function (hop::Hopping_operator)(x::WF3x1CPU)
 
                 shift_x=shift_fermion(copyx, a)
 
-<<<<<<< HEAD
-                mul!(copyx, Ucopy[a], shift_x)
-=======
                 mul!(copyx, U[a], shift_x)  # Ucopy 대신 U 사용
->>>>>>> origin/fix/bigfiles
             
             elseif a == 0
 
@@ -806,22 +780,14 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
     shifts = Vector{WF3x1}()
 
     for k in 1:length(hop.P.various)
-<<<<<<< HEAD
-        Ucopy = deepcopy(U)
-=======
         # Ucopy 삭제 - U는 읽기만 하므로 deepcopy 불필요
->>>>>>> origin/fix/bigfiles
         copyx = deepcopy(x[k])
         for step in hop.P.various[k].steps
             a = step.f
             if a > 0
 
                 shift_x=shift_fermion(copyx , -a)
-<<<<<<< HEAD
-                Uminus = shift_U(Ucopy[a], -a)
-=======
                 Uminus = shift_U(U[a], -a)  # Ucopy 대신 U 사용
->>>>>>> origin/fix/bigfiles
 
                 mul!(copyx, Uminus',shift_x)
             
@@ -830,11 +796,7 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
 
                 shift_x=shift_fermion(copyx, a)
 
-<<<<<<< HEAD
-                mul!(copyx, Ucopy[a], shift_x)
-=======
                 mul!(copyx, U[a], shift_x)  # Ucopy 대신 U 사용
->>>>>>> origin/fix/bigfiles
             elseif a == 0
                 copyx = deepcopy(x[k])
                 
@@ -848,8 +810,6 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
 end
 
 
-<<<<<<< HEAD
-=======
 # Preallocated 버퍼를 받는 버전 - 메모리 할당 최소화
 function (hop::Hopping_operator)(x::WF3x1CPU, V::AbstractVector{T}) where {T<:WF3x1CPU}
     @assert length(V) == length(hop.P.various) "V의 길이는 paths의 개수와 같아야 합니다."
@@ -885,7 +845,6 @@ function (hop::Hopping_operator)(x::WF3x1CPU, V::AbstractVector{T}) where {T<:WF
 end
 
 
->>>>>>> origin/fix/bigfiles
 
 
 
@@ -950,10 +909,6 @@ function CPTC(hop::Hopping_operator,W::Vector{Spin_matrix},f::WF3x1)
 end
 
 
-<<<<<<< HEAD
-
-=======
->>>>>>> origin/fix/bigfiles
 function mean(x::WF3x1)
     NX = x.NX
     NY = x.NY
@@ -1185,8 +1140,6 @@ end
 
 
 
-<<<<<<< HEAD
-=======
 """
     blockize(x::WF3x1, r::Int)
 
@@ -1280,7 +1233,6 @@ function unblockize(blocks::Vector{T}) where {T<:WF3x1}
 end
 
 
->>>>>>> origin/fix/bigfiles
 end # module
 
 

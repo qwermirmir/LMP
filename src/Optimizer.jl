@@ -8,6 +8,7 @@ import ..Layer_types: CPTC_Layer, PTC_Layer, Layer, ActivationFunction, Identity
 import ..elementry_base: AbstractSpinMatrix
 import ..Layer_types: PrallelTransportAttention_Layer,siteweight_Layer,Dirac_Layer,RayleighQuotient_Layer,HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer
 import ..Layer_types: fermionfield_Layer
+import ..Layer_types: BlockScalar_Layer
 
 const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
 const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
@@ -155,10 +156,6 @@ function update!(layer::CPTC_Layer, opt::Adam,  grad)
 end
 
 
-<<<<<<< HEAD
-
-=======
->>>>>>> origin/fix/bigfiles
 function update!(layer::PTC_Layer, opt::Adam,  grad)
     
     opt.t += 1
@@ -645,7 +642,36 @@ function wf_adam_step!(param::WF3x1GPU, opt::Adam, grad::WF3x1GPU)
 end
 
 
+function update!(layer::BlockScalar_Layer, opt::Adam, grad::Vector{ComplexF64})
+    opt.t += 1
+    for i in eachindex(layer.W)
+        # real part
+        re_key = objectid(layer) + UInt(2i - 1)
+        st_re = get!(opt.scalar_state, re_key) do
+            AdamState{Float64}(0.0, 0.0)
+        end
+        g_re = real(grad[i])
+        st_re.m = opt.β1 * st_re.m + (1 - opt.β1) * g_re
+        st_re.v = opt.β2 * st_re.v + (1 - opt.β2) * g_re^2
+        m_hat_re = st_re.m / (1 - opt.β1^opt.t)
+        v_hat_re = st_re.v / (1 - opt.β2^opt.t)
+        Δ_re = opt.α * m_hat_re / (sqrt(v_hat_re) + opt.ε)
 
+        # imag part
+        im_key = objectid(layer) + UInt(2i)
+        st_im = get!(opt.scalar_state, im_key) do
+            AdamState{Float64}(0.0, 0.0)
+        end
+        g_im = imag(grad[i])
+        st_im.m = opt.β1 * st_im.m + (1 - opt.β1) * g_im
+        st_im.v = opt.β2 * st_im.v + (1 - opt.β2) * g_im^2
+        m_hat_im = st_im.m / (1 - opt.β1^opt.t)
+        v_hat_im = st_im.v / (1 - opt.β2^opt.t)
+        Δ_im = opt.α * m_hat_im / (sqrt(v_hat_im) + opt.ε)
+
+        layer.W[i] -= complex(Δ_re, Δ_im)
+    end
+end
 
 
 end # module Optimizer

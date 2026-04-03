@@ -294,13 +294,13 @@ function (hop::Hopping_operator)(x::WF3x1GPU)
             a = step.f
             if a > 0
 
-                mul!(copyx,hop.Gauge'[a],x)
+                mul!(copyx,hop.Gauge'[a],copyx)
                 shift_x=shift_fermion(copyx , -a)
                 substitute_fermion!(copyx,shift_x)
 
             elseif a < 0
                 a = -a
-                shift_x=shift_fermion(x, a)
+                shift_x=shift_fermion(copyx, a)
                 mul!(copyx, hop.Gauge[a], shift_x)
             elseif a == 0
                 copyx = deepcopy(x)     
@@ -325,7 +325,7 @@ function (hop::Hopping_operator)( x::WF3x1GPU,V::AbstractVector{T}) where {T<:WF
             a = step.f
 
             if a > 0
-                mul!(copyx, adjoint(hop.Gauge[a]), x)
+                mul!(copyx, adjoint(hop.Gauge[a]), copyx)
 
                 # 여기 shift_fermion이 out-of-place면 여기가 또 할당 포인트
                 shift_x = shift_fermion(copyx, -a)
@@ -333,7 +333,7 @@ function (hop::Hopping_operator)( x::WF3x1GPU,V::AbstractVector{T}) where {T<:WF
 
             elseif a < 0
                 aa = -a
-                shift_x = shift_fermion(x, aa)
+                shift_x = shift_fermion(copyx, aa)
                 mul!(copyx, hop.Gauge[aa], shift_x)
 
             else
