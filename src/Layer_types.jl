@@ -301,6 +301,18 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
     Out::Int
     W::Vector{T}
     activation::ActivationFunction
+    # --- 캐시 버퍼 (매 epoch deepcopy 방지) ---
+    _hopped::Vector{WF3x1}      # forward에서 hop 결과 저장 (gradient에서 재사용)
+    _result::Vector{WF3x1}      # forward 출력 버퍼
+    _initialized::Bool           # 버퍼 초기화 여부
+    # --- DeltaRule 캐시 버퍼 ---
+    _invpaths::Vector{Paths}     # reverse_paths 캐시 (paths 불변이므로 1회만 계산)
+    _d_conj_buf::Vector{WF3x1}  # conj(d) 작업용 버퍼
+    _ci_buffers::Vector{WF3x1}  # 스레드별 ci 버퍼
+    _delta_init::Bool            # DeltaRule 버퍼 초기화 여부
+    _Wadj::Vector{T}             # adjoint(W) 캐시 벡터
+    _invhops::Vector{Any}        # 스레드별 Hopping_operator 캐시
+    _hop_out::Vector{Vector{WF3x1}} # 스레드별 hop 출력 버퍼 (1-element)
 
     function PTLayer(paths::Vector{Paths}, U::Vector{G}, Out::Int,
                      activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields}
@@ -310,16 +322,19 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
             for i in eachindex(W)
                 W[i] = Random_SpinM_GPU("complex")
             end
-
-
-            return new{G, Spin_matrix_GPU}(paths, U, Out, W,  activation)
+            return new{G, Spin_matrix_GPU}(paths, U, Out, W, activation,
+                       WF3x1[], WF3x1[], false,
+                       Paths[], WF3x1[], WF3x1[], false,
+                       Spin_matrix_GPU[], Any[], Vector{WF3x1}[])
         else
             W = Vector{Spin_matrix}(undef, length(paths)*Out)
             for i in eachindex(W)
                 W[i] = Random_SpinM("complex")
             end
-
-            return new{G, Spin_matrix}(paths, U, Out, W,  activation)
+            return new{G, Spin_matrix}(paths, U, Out, W, activation,
+                       WF3x1[], WF3x1[], false,
+                       Paths[], WF3x1[], WF3x1[], false,
+                       Spin_matrix[], Any[], Vector{WF3x1}[])
         end
     end
 end
@@ -416,8 +431,13 @@ mutable struct Ritz_Layer <: Layer
     D::Any
     activation::ActivationFunction
     Out::Int
+    # --- 캐시 버퍼 (Dirac 재계산 방지) ---
+    _Dz::Vector{Any}        # forward에서 D*z 캐시 → DeltaRule!에서 재사용
+    _VD::Vector{Any}         # DeltaRule! VD 버퍼
+    _work::Vector{Any}       # DeltaRule! workspace [y, f, ψ, r]
+    _ritz_init::Bool
     function Ritz_Layer(D::Any, activation::ActivationFunction= Identity(),Out =1)
-        new(D, activation , Out)
+        new(D, activation , Out, Any[], Any[], Any[], false)
     end
 end 
 
@@ -642,6 +662,13 @@ end
 
 
 
+# --- CuArray 표시 시 CUDA context 에러 방지 ---
+function Base.show(io::IO, layer::Ritz_Layer)
+    print(io, "Ritz_Layer(Out=$(layer.Out))")
+end
 
+function Base.show(io::IO, layer::PTLayer)
+    print(io, "PTLayer(paths=$(length(layer.paths)), Out=$(layer.Out))")
+end
 
 end # module Layer_types

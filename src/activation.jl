@@ -14,7 +14,7 @@ import ..elementry_base: Spin_matrix, inner_product, Clifford, reverse_paths,Hop
 import ..Layer_types: CPTC_Layer, PTC_Layer, Layer,ActivationFunction,Identity ,Attention_Layer,Softmax,NormLayer,test_Layer,complexNormLayer,minmaxNormLayer,zscoreNormLayer,siteweight_Layer
 import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,ModRelu,RayleighQuotient_Layer,PtcRayleighQuotient_Layer
 import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer
-import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!
+import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch
 
 export gradient, DeltaRule,DeltaRule!
 export Identity, ReLU, Sigmoid, Tanh
@@ -2546,12 +2546,17 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
 
     A = Matrix{ComplexF64}(undef, l, l)
     B = Matrix{ComplexF64}(undef, l, l)
-    T = typeof(z[1])
-    Dz = Vector{T}(undef, l)
-    # Dz 버퍼 한 번만 할당
-    @inbounds for i in 1:l
-        Dz[i] = deepcopy(z[1])
-        mul!(Dz[i], D, z[i])   # mul! overwrites Dz[i]
+
+    # forward에서 캐싱된 Dz 재사용 (Dirac 연산 2회 절약)
+    if layer._ritz_init && length(layer._Dz) == l
+        Dz = layer._Dz
+    else
+        T = typeof(z[1])
+        Dz = Vector{T}(undef, l)
+        @inbounds for i in 1:l
+            Dz[i] = deepcopy(z[1])
+            mul!(Dz[i], D, z[i])
+        end
     end
 
     @inbounds for i in 1:l
@@ -2583,17 +2588,24 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
         m[k] = dot(evecs[:,k], B*evecs[:,k])  # u_k^† B u_k
     end
 
-    # VD 버퍼 루프 밖에서 미리 할당
-    VD = Vector{WF3x1}(undef, l)
-    for i in 1:l
-        VD[i] = deepcopy(z[1])
+    # VD, y, f, ψ, r 버퍼 캐시 (매 epoch deepcopy 방지)
+    need_vd_reinit = isempty(layer._VD) || length(layer._VD) != l
+    if !need_vd_reinit
+        need_vd_reinit = typeof(layer._VD[1]) != typeof(z[1])
+    end
+    if need_vd_reinit
+        layer._VD = Vector{Any}(undef, l)
+        for i in 1:l
+            layer._VD[i] = deepcopy(z[1])
+        end
+        layer._work = Any[deepcopy(z[1]), deepcopy(z[1]), deepcopy(z[1]), deepcopy(z[1])]
     end
 
-    # 재사용 버퍼들 - 각 한 번만 할당
-    y = deepcopy(z[1])
-    f = deepcopy(z[1])
-    ψ = deepcopy(z[1])
-    r = deepcopy(z[1])
+    VD = layer._VD
+    y  = layer._work[1]
+    f  = layer._work[2]
+    ψ  = layer._work[3]
+    r  = layer._work[4]
     
     # 모드 k마다 ψ_k 만들고, r_k = D†D ψ_k - λ_k ψ_k 만든다
     for k in 1:l
@@ -2720,16 +2732,26 @@ function gradient(layer::DenseLinearLayer, ::Identity,
                   d::AbstractVector{TD},
                   M::Any) where {TZ<:WF3x1, TD<:WF3x1}
     
-    grad=Vector{typeof(layer.W[1])}(undef, length(layer.W))
+    n = length(layer.W)
+    nd = length(d)
+    grad=Vector{typeof(layer.W[1])}(undef, n)
 
-    for i in 1:length(layer.W)
-        grad[i]=similar(layer.W[i])
-    end
-
-    for k in 1:length(z)
-
-        for i in 1:length(d)
-            grad[i+(k-1)*length(d)]=Matmul!(d[i],z[k])
+    if d[1] isa WF3x1GPU
+        # GPU: batched Matmul
+        Qs = Vector{WF3x1GPU}(undef, n)
+        Ks = Vector{WF3x1GPU}(undef, n)
+        @inbounds for idx in 1:n
+            i = ((idx-1) % nd) + 1
+            k = ((idx-1) ÷ nd) + 1
+            Qs[idx] = d[i]
+            Ks[idx] = z[k]
+        end
+        grad .= Matmul_batch(Qs, Ks)
+    else
+        @threads for idx in 1:n
+            i = ((idx-1) % nd) + 1
+            k = ((idx-1) ÷ nd) + 1
+            grad[idx]=Matmul!(d[i],z[k])
         end
     end 
 
@@ -2798,30 +2820,60 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
     W=layer.W
     paths=layer.paths
 
-    hop=Hopping_operator(layer.U,paths[1])
-
     n=length(layer.W)
 
     @assert length(z) == length(paths) "PTLayer gradient: z의 길이는 paths 길이와 같아야 합니다. length(z)=$(length(z)), length(paths)=$(length(paths))"
     @assert length(d) == Out "PTLayer gradient: d의 길이는 Out과 같아야 합니다. length(d)=$(length(d)), Out=$Out"
     @assert length(W) == length(paths)*Out "The length of W must be equal to length(paths)*Out."
 
-    # grad 벡터 할당 최소화 (similar 대신 deepcopy)
     grad=Vector{typeof(W[1])}(undef, n)
-    for i in 1:n
-        grad[i]=deepcopy(W[1])
-    end 
-    for i in 1:length(paths)
-        hop.P=paths[i]
-        u = hop(z[i])
-        for j in 1:Out
-            grad[(i-1)*Out+j]=Matmul!(d[j],(u[1]))
-        end
-    end 
 
+    # forward에서 캐싱된 hopped 결과 재사용 (hop 재계산 방지)
+    if layer._initialized && length(layer._hopped) == length(paths)
+        if d[1] isa WF3x1GPU
+            # GPU: batched Matmul로 sync 1회만
+            Qs = Vector{WF3x1GPU}(undef, n)
+            Ks = Vector{WF3x1GPU}(undef, n)
+            @inbounds for idx in 1:n
+                j = ((idx-1) % Out) + 1
+                i = ((idx-1) ÷ Out) + 1
+                Qs[idx] = d[j]
+                Ks[idx] = layer._hopped[i]
+            end
+            grad .= Matmul_batch(Qs, Ks)
+        else
+            # CPU: @threads 병렬화
+            @threads for idx in 1:n
+                j = ((idx-1) % Out) + 1
+                i = ((idx-1) ÷ Out) + 1
+                grad[idx]=Matmul!(d[j], layer._hopped[i])
+            end
+        end
+    else
+        hop=Hopping_operator(layer.U,paths[1])
+        for i in 1:length(paths)
+            hop.P=paths[i]
+            u = hop(z[i])
+            if d[1] isa WF3x1GPU
+                Qs = Vector{WF3x1GPU}(undef, Out)
+                Ks = Vector{WF3x1GPU}(undef, Out)
+                @inbounds for j in 1:Out
+                    Qs[j] = d[j]
+                    Ks[j] = u[1]
+                end
+                batch_result = Matmul_batch(Qs, Ks)
+                @inbounds for j in 1:Out
+                    grad[(i-1)*Out+j] = batch_result[j]
+                end
+            else
+                @threads for j in 1:Out
+                    grad[(i-1)*Out+j]=Matmul!(d[j],(u[1]))
+                end
+            end
+        end
+    end
 
     return [grad]
-
 
 end 
 
@@ -2839,82 +2891,89 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
     Nz = length(z)
     Nd = length(d)
     NW = length(W)
-    # result 버퍼 할당 (similar 제거, deepcopy만 사용)
     result = Vector{WF3x1}(undef, Nz)
     for i in 1:Nz
         result[i] = deepcopy(z[1])
+        zero_wf!(result[i])
     end
 
-    # ① d_conj[j] = conj(d[j]) 미리
-    d_conj = Vector{WF3x1}(undef, Nd)
-    for i in 1:Nd
-        d_conj[i] = deepcopy(z[1])
-    end
-    if d[1] isa WF3x1CPU
-        @inbounds for j in 1:Nd
-            conj!(d_conj[j], d[j])
+    # ① d_conj 버퍼 캐시
+    if !layer._delta_init || length(layer._d_conj_buf) != Nd
+        layer._d_conj_buf = Vector{WF3x1}(undef, Nd)
+        for i in 1:Nd
+            layer._d_conj_buf[i] = deepcopy(d[1])
         end
-    else
-        @inbounds for j in 1:Nd
-            conj!(d_conj[j], d[j])
+        layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
+        layer._delta_init = true
+    end
+    d_conj = layer._d_conj_buf
+    @inbounds for j in 1:Nd
+        conj!(d_conj[j], d[j])
+    end
+
+    # ② 역경로 캐시 (paths 불변이므로 1회만 계산)
+    if isempty(layer._invpaths) || length(layer._invpaths) != Nz
+        layer._invpaths = Vector{typeof(paths[1])}(undef, Nz)
+        @inbounds for i in 1:Nz
+            layer._invpaths[i] = reverse_paths(paths[i])
         end
     end
+    invpaths = layer._invpaths
 
-    # ② 역경로 미리
-    invpaths = Vector{typeof(paths[1])}(undef, Nz)
-    @inbounds for i in 1:Nz
-        invpaths[i] = reverse_paths(paths[i])
+    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 매번 갱신)
+    if length(layer._Wadj) != NW
+        layer._Wadj = Vector{typeof(W[1])}(undef, NW)
     end
-
-    # ③ Wadj[k] = adjoint(W[k]) 미리
-    Wadj = Vector{typeof(W[1])}(undef, NW)
+    Wadj = layer._Wadj
     @inbounds for k in 1:NW
         Wadj[k] = adjoint(W[k])
     end
 
-    # ④ 스레드별로 쓸 invhop 준비 (공유 금지)
-    invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nthreads()]
+    # ④ invhops + hop 출력 버퍼 캐시
+    nt = nthreads()
+    if isempty(layer._invhops) || length(layer._invhops) != nt
+        layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
+        layer._hop_out = [Vector{WF3x1}([deepcopy(z[1])]) for _ in 1:nt]
+    else
+        @inbounds for t in 1:nt
+            layer._invhops[t].Gauge = layer.U
+        end
+    end
+    invhops = layer._invhops
+    hop_out = layer._hop_out
 
-    # ⑤ i 방향으로 병렬화
+    # ⑤ 최적화: 먼저 c_i = Σ_j Wadj_{ij} * d_conj[j] 계산 후, hop 1회만 수행
     if z[1] isa WF3x1CPU
-        # 스레드별 버퍼 미리 할당 (similar 대신 각 스레드당 하나씩)
-        ri_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
-        
+        ci_buffers = layer._ci_buffers
+
         @threads for i in 1:Nz
-            # 이 스레드 전용 hop 사용
-            invhop = invhops[threadid()]
-            invhop.P = invpaths[i]
-            ri = ri_buffers[threadid()]
-            zero_wf!(ri)  # 버퍼 재사용을 위해 초기화
+            tid = threadid()
+            ci = ci_buffers[tid]
+            zero_wf!(ci)
             base = (i-1) * Out
             @inbounds for j in 1:Out
-            hopped = invhop(d_conj[j])[1]
-            addmul!(ri, Wadj[base + j], hopped)
+                addmul!(ci, Wadj[base + j], d_conj[j])
             end
-
-            # 원래 코드와 같은 의미: result[i] = conj(result[i])
-            # result[i] = conj(ri)
-            conj!(result[i], ri)
+            invhop = invhops[tid]
+            invhop.P = invpaths[i]
+            invhop(ci, hop_out[tid])  # preallocated 버전 사용
+            conj!(result[i], hop_out[tid][1])
         end
     else
-        # GPU는 병렬화 안 되므로 하나의 버퍼만 필요
-        ri = deepcopy(z[1])
-        
+        ci = deepcopy(z[1])
+
         for i in 1:Nz
-        # 이 스레드 전용 hop 사용
-        invhop = invhops[threadid()]
-        invhop.P = invpaths[i]
-        zero_wf!(ri)  # 버퍼 재사용을 위해 초기화
-        base = (i-1) * Out
-        @inbounds for j in 1:Out
-            hopped = invhop(d_conj[j])[1]    
-            gpuaddmul!(ri,Wadj[base + j],hopped)
+            zero_wf!(ci)
+            base = (i-1) * Out
+            @inbounds for j in 1:Out
+                gpuaddmul!(ci, Wadj[base + j], d_conj[j])
             end
-            conj!(result[i], ri)
+            invhop = invhops[1]
+            invhop.P = invpaths[i]
+            hopped_ci = invhop(ci)[1]
+            conj!(result[i], hopped_ci)
         end
-
     end
-
 
     return result
 end
@@ -2933,70 +2992,83 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
     Nz = length(z)
     Nd = length(d)
     NW = length(W)
-    # temp 제거, 직접 deepcopy 사용
 
-    # ① d_conj[j] = conj(d[j]) 미리
-    d_conj = Vector{WF3x1}(undef, Nd)
-
+    # ① d_conj 버퍼 캐시 (매 호출 deepcopy 방지)
+    if !layer._delta_init || length(layer._d_conj_buf) != Nd
+        layer._d_conj_buf = Vector{WF3x1}(undef, Nd)
+        for i in 1:Nd
+            layer._d_conj_buf[i] = deepcopy(d[1])
+        end
+        layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
+        layer._delta_init = true
+    end
+    d_conj = layer._d_conj_buf
     @inbounds for i in 1:Nd
-        d_conj[i] = deepcopy(z[1])
         conj!(d_conj[i], d[i])
     end
 
-
-    # ② 역경로 미리
-    invpaths = Vector{typeof(paths[1])}(undef, Nz)
-    @inbounds for i in 1:Nz
-        invpaths[i] = reverse_paths(paths[i])
+    # ② 역경로 캐시 (paths 불변이므로 1회만 계산)
+    if isempty(layer._invpaths) || length(layer._invpaths) != Nz
+        layer._invpaths = Vector{typeof(paths[1])}(undef, Nz)
+        @inbounds for i in 1:Nz
+            layer._invpaths[i] = reverse_paths(paths[i])
+        end
     end
+    invpaths = layer._invpaths
 
-    # ③ Wadj[k] = adjoint(W[k]) 미리
-    Wadj = Vector{typeof(W[1])}(undef, NW)
+    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 매번 갱신)
+    if length(layer._Wadj) != NW
+        layer._Wadj = Vector{typeof(W[1])}(undef, NW)
+    end
+    Wadj = layer._Wadj
     @inbounds for k in 1:NW
         Wadj[k] = adjoint(W[k])
     end
 
-    # ④ 스레드별로 쓸 invhop 준비 (공유 금지)
-    invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nthreads()]
+    # ④ invhops + hop 출력 버퍼 캐시 (공유 금지)
+    nt = nthreads()
+    if isempty(layer._invhops) || length(layer._invhops) != nt
+        layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
+        layer._hop_out = [Vector{WF3x1}([deepcopy(z[1])]) for _ in 1:nt]
+    else
+        @inbounds for t in 1:nt
+            layer._invhops[t].Gauge = layer.U
+        end
+    end
+    invhops = layer._invhops
+    hop_out = layer._hop_out
 
-    # ⑤ i 방향으로 병렬화
+    # ⑤ 최적화: 먼저 c_i = Σ_j Wadj_{ij} * d_conj[j] 계산 후, hop 1회만 수행
     if z[1] isa WF3x1CPU
-        # 스레드별 버퍼 미리 할당
-        ri_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
-        
+        ci_buffers = layer._ci_buffers
+
         @threads for i in 1:Nz
-            # 이 스레드 전용 hop 사용
-            invhop = invhops[threadid()]
-            invhop.P = invpaths[i]
-            ri = ri_buffers[threadid()]
-            zero_wf!(ri)  # 버퍼 재사용을 위해 초기화
+            tid = threadid()
+            ci = ci_buffers[tid]
+            zero_wf!(ci)
             base = (i-1) * Out
             @inbounds for j in 1:Out
-            hopped = invhop(d_conj[j])[1]
-            addmul!(ri, Wadj[base + j], hopped)
+                addmul!(ci, Wadj[base + j], d_conj[j])
             end
-
-            # 원래 코드와 같은 의미: result[i] = conj(result[i])
-            # result[i] = conj(ri)
-            conj!(delta[i], ri)
+            invhop = invhops[tid]
+            invhop.P = invpaths[i]
+            invhop(ci, hop_out[tid])  # preallocated 버전 사용
+            conj!(delta[i], hop_out[tid][1])
         end
     else
-        # GPU는 병렬화 안 되므로 하나의 버퍼만 필요
-        ri = deepcopy(z[1])
-        
-        for i in 1:Nz
-        # 이 스레드 전용 hop 사용
-        invhop = invhops[threadid()]
-        invhop.P = invpaths[i]
-        zero_wf!(ri)  # 버퍼 재사용을 위해 초기화
-        base = (i-1) * Out
-        @inbounds for j in 1:Out
-            hopped = invhop(d_conj[j])[1]    
-            gpuaddmul!(ri,Wadj[base + j],hopped)
-            end
-            conj!(delta[i], ri)
-        end
+        ci = deepcopy(z[1])
 
+        for i in 1:Nz
+            zero_wf!(ci)
+            base = (i-1) * Out
+            @inbounds for j in 1:Out
+                gpuaddmul!(ci, Wadj[base + j], d_conj[j])
+            end
+            invhop = invhops[1]
+            invhop.P = invpaths[i]
+            hopped_ci = invhop(ci)[1]
+            conj!(delta[i], hopped_ci)
+        end
     end
 
     return nothing
