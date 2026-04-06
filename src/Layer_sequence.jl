@@ -104,10 +104,16 @@ function _to_cpu_gauge(U::Vector{G}) where {G<:AbstractGaugefields}
         NC = U[1].NC
         NX = U[1].NX; NY = U[1].NY; NZ = U[1].NZ; NT = U[1].NT
         Ucpu = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold")
-        substitute_U!(Ucpu, U)
+        try
+            substitute_U!(Ucpu, U)
+        catch
+            @warn "GPU gauge 데이터 복구 불가 → identity gauge로 대체. layer.U를 수동으로 설정하세요."
+        end
         return Ucpu
 
 end
+
+
 
 # --- GPU→CPU Hopping_operator 변환 ---
 function _to_cpu_hop(hop::Hopping_operator)
@@ -124,12 +130,17 @@ _to_cpu_W(W::Vector{Spin_matrix}) = W
 _to_cpu_W(W::Vector{T}) where {T<:AbstractArray{ComplexF64,2}} = W
 
 # --- GPU→CPU fermion field 변환 ---
+# GPU 메모리가 해제된 경우 (JLD2 로드 등) 빈 CPU fermion으로 대체
 function _to_cpu_fermion(x::WF3x1GPU)
     NC = x.NC
     NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT
     Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold")
     xcpu = Initialize_pseudofermion_fields(Utmp[1], "Wilson", nowing=true)
-    substitute_fermion!(xcpu, x)
+    try
+        substitute_fermion!(xcpu, x)
+    catch
+        @warn "GPU fermion 데이터 복구 불가 → 0으로 초기화된 CPU fermion으로 대체"
+    end
     return xcpu
 end
 _to_cpu_fermion(x::WF3x1CPU) = x
@@ -142,9 +153,21 @@ function _to_cpu_fermions(xs::Vector{<:WF3x1})
     NX = xs[1].NX; NY = xs[1].NY; NZ = xs[1].NZ; NT = xs[1].NT
     Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold")
     result = Vector{WF3x1CPU}(undef, length(xs))
+    warned = false
     for i in eachindex(xs)
         result[i] = Initialize_pseudofermion_fields(Utmp[1], "Wilson", nowing=true)
-        substitute_fermion!(result[i], xs[i])
+        if xs[i] isa WF3x1GPU
+            try
+                substitute_fermion!(result[i], xs[i])
+            catch
+                if !warned
+                    @warn "GPU fermion 데이터 복구 불가 → 0으로 초기화된 CPU fermion으로 대체"
+                    warned = true
+                end
+            end
+        elseif xs[i] isa WF3x1CPU
+            substitute_fermion!(result[i], xs[i])
+        end
     end
     return result
 end
@@ -978,59 +1001,68 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     W     = layer.W
     paths = layer.paths
 
-
     npaths = length(paths)
 
     @assert npaths == length(x) "입력 x의 길이는 paths의 길이와 같아야 합니다."
     @assert length(W) == Out * npaths "W의 길이는 Out*paths이어야 합니다."
 
-    # 1) 결과 벡터 초기화 및 hopped 버퍼 할당
-    result = Vector{WF3x1}(undef, Out)
-    hopped = Vector{WF3x1}(undef, npaths)
-    
-    # 버퍼 할당 (한 번만)
-    @inbounds for i in 1:npaths
-        hopped[i] = deepcopy(x[1])
-    end
-    for j in 1:Out
-        result[j] = deepcopy(x[1])
+    # 1) 캐시 버퍼를 한 번만 할당, 이후 재사용
+    if !layer._initialized || length(layer._hopped) != npaths || length(layer._result) != Out
+        layer._hopped = Vector{WF3x1}(undef, npaths)
+        layer._result = Vector{WF3x1}(undef, Out)
+        for i in 1:npaths
+            layer._hopped[i] = deepcopy(x[1])
+        end
+        for j in 1:Out
+            layer._result[j] = deepcopy(x[1])
+        end
+        layer._initialized = true
     end
 
-    # 2) hop 연산 - CPU는 preallocated 버전, GPU는 기존 방식
+    hopped = layer._hopped
+    result = layer._result
+
+    # zero 초기화 (deepcopy 대신)
+    @inbounds for j in 1:Out
+        zero_wf!(result[j])
+    end
+
+    # 2) hop 연산
     if x[1] isa WF3x1CPU
         hop = Hopping_operator(layer.U, paths[1])
+        hop_buf = WF3x1CPU[hopped[1]]  # 1-element buffer 재사용
         @inbounds for i in 1:npaths
             hop.P = paths[i]
-            hop(x[i], [hopped[i]])  # preallocated 버전 사용
+            hop_buf[1] = hopped[i]
+            hop(x[i], hop_buf)
         end
     else
-        # GPU는 기존 방식 유지
         hop = Hopping_operator(layer.U, paths[1])
+        hop_buf = WF3x1GPU[hopped[1]]  # GPU도 preallocated 버전 사용
         @inbounds for i in 1:npaths
             hop.P = paths[i]
-            hopped[i] = hop(x[i])[1]
+            hop_buf[1] = hopped[i]
+            hop(x[i], hop_buf)
         end
     end
 
     # 3) Out 방향으로 병렬화
     if x[1] isa WF3x1CPU
         @threads for j in 1:Out
-            rj = result[j]    # 이 스레드가 책임지는 출력
-
+            rj = result[j]
             @inbounds for i in 1:npaths
                 w = W[(i-1)*Out + j]
                 addmul!(rj, w, hopped[i])
             end
-        result[j] = rj   
+            result[j] = rj
         end
     else
         for j in 1:Out
-            rj = result[j]   
-
+            rj = result[j]
             @inbounds for i in 1:npaths
                 gpuaddmul!(rj, W[(i-1)*Out + j], hopped[i])
             end
-            result[j] = rj   
+            result[j] = rj
         end
     end
 
@@ -1217,11 +1249,22 @@ function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
     l = length(x)
 
 
-    # 1) Dx[i] = D * x[i] 를 i당 1번만 계산
-    T = typeof(x[1])
-    Dx = Vector{T}(undef, l)
+    # 1) Dx[i] = D * x[i] 를 i당 1번만 계산 + 캐시 (DeltaRule!에서 재사용)
+    need_reinit = !layer._ritz_init || length(layer._Dz) != l
+    if !need_reinit
+        # 타입이 바뀌었으면 (GPU↔CPU 전환 등) 캐시 무효화
+        need_reinit = typeof(layer._Dz[1]) != typeof(x[1])
+    end
+    if need_reinit
+        layer._Dz = Vector{Any}(undef, l)
+        for i in 1:l
+            layer._Dz[i] = deepcopy(x[1])
+        end
+        layer._ritz_init = true
+    end
+
+    Dx = layer._Dz
     @inbounds for i in 1:l
-        Dx[i] = deepcopy(x[1])
         mul!(Dx[i], layer.D, x[i])   # mul! overwrites Dx[i]
     end
 
@@ -1661,14 +1704,22 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
     γ=Clifford()
 
     x = Initialize_pseudofermion_fields(config[1][1],"Wilson")
-    D= Dirac_operator(config[1],x,params)
+
+    # config 수만큼 Dirac operator를 미리 생성 (매 epoch 재생성 방지)
+    Ds = Vector{Any}(undef, length(config))
+    for k in 1:length(config)
+        Ds[k] = Dirac_operator(config[k], x, params)
+    end
+
+    D = Ds[1]
     dummy ,f = forward_propagation(layers, D , D)
 
     delta=deepcopy(dummy[2:end])  # delta는 레이어 수보다 하나 적음에 주의
+    u = dummy  # u 버퍼 재사용 (매 epoch 재할당 방지)
 
     for epoch in 1:epochs
         k=mod(epoch-1,length(config))+1
-        D= Dirac_operator(config[k],x,params)
+        D = Ds[k]
         for i in 1:depth
             if layers[i] isa PTLayer
                 layers[i].U= config[k]
@@ -1685,16 +1736,13 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
             end
         end
         if layers[end] isa Ritz_Layer
-            # DdagD=DdagD_operator(config[k],x,params)
-            # layers[end].D=DdagD
-            D= Dirac_operator(config[k],x,params)
             layers[end].D=D
         end
         temp=Vector{ComplexF64}(undef, batch)
         d=Vector{Any}(undef, depth)
         fill!(d, nothing)
         for b in 1:batch
-             u,f = forward_propagation(layers, D , D)
+             f = forward_propagation!(layers, D , D, u)
             temp[b]=f
             backward_propagation!(layers, u, batch, delta)
 

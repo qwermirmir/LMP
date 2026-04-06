@@ -467,6 +467,91 @@ function Base.conj(W::Spin_matrix_GPU)
 end
 
 
+# ====== Batched Matmul: N 개의 (Q,K) 쌍을 한번에 계산, GPU→CPU sync 1회 ======
+function kernel_matmul_batched!(
+    M_all::CuDeviceArray{ComplexF64,3},   # (NG, NG, batch)
+    Q_ptrs::CuDeviceArray{ComplexF64,4},  # 현재 Q의 f
+    K_ptrs::CuDeviceArray{ComplexF64,4},  # 현재 K의 f
+    NC::Int, NG::Int, blocksize::Int, rsize::Int,
+    batch_idx::Int
+)
+    tid = threadIdx().x
+    bid = blockIdx().x
+
+    fg = (bid - 1) % NG + 1
+    xg = (bid - 1) ÷ NG + 1
+    if xg > NG
+        return
+    end
+
+    N = NC * blocksize * rsize
+    acc = zero(ComplexF64)
+
+    stride = blockDim().x
+    k = tid
+    while k <= N
+        k0 = k - 1
+        ic = (k0 % NC) + 1
+        t  = k0 ÷ NC
+        b  = (t % blocksize) + 1
+        r  = (t ÷ blocksize) + 1
+
+        @inbounds acc += Q_ptrs[ic, fg, b, r] * K_ptrs[ic, xg, b, r]
+        k += stride
+    end
+
+    sh = CUDA.CuStaticSharedArray(ComplexF64, 256)
+    @inbounds sh[tid] = acc
+    CUDA.sync_threads()
+
+    offset = stride >>> 1
+    while offset >= 1
+        if tid <= offset
+            @inbounds sh[tid] += sh[tid + offset]
+        end
+        CUDA.sync_threads()
+        offset >>>= 1
+    end
+
+    if tid == 1
+        @inbounds M_all[fg, xg, batch_idx] = sh[1]
+    end
+    return nothing
+end
+
+"""
+    Matmul_batch(Qs, Ks) → Vector{Spin_matrix_GPU}
+
+N개의 (Q,K) 쌍에 대해 Matmul을 계산. GPU→CPU sync는 1회만 수행.
+"""
+function Matmul_batch(Qs::AbstractVector{<:WF3x1GPU}, Ks::AbstractVector{<:WF3x1GPU})
+    n = length(Qs)
+    @assert n == length(Ks)
+    NC, NG = Qs[1].NC, Qs[1].NG
+    blocksize = Qs[1].blockinfo.blocksize
+    rsize     = Qs[1].blockinfo.rsize
+
+    M_all = CUDA.zeros(ComplexF64, NG, NG, n)
+
+    threads = 256
+    blocks  = NG * NG
+
+    for idx in 1:n
+        CUDA.@cuda threads=threads blocks=blocks kernel_matmul_batched!(
+            M_all, Qs[idx].f, Ks[idx].f, NC, NG, blocksize, rsize, idx)
+    end
+
+    # GPU→CPU sync 1회
+    M_cpu = Array(M_all)
+
+    result = Vector{Spin_matrix_GPU}(undef, n)
+    @inbounds for idx in 1:n
+        result[idx] = Spin_matrix_GPU(MMatrix{4,4,ComplexF64}(M_cpu[:,:,idx]))
+    end
+    return result
+end
+
+export Matmul_batch
 
 
 
