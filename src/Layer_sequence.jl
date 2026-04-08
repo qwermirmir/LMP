@@ -11,7 +11,7 @@ import ..elementry_base: Hopping_operator, Spin_matrix, inner_product,g2vector_g
 import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minmax,spincolortrace
 import ..Optimizer: Opt, update!, Adam
 import ..activation:  gradient, DeltaRule,DeltaRule!
-import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU
+import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu
 import ..Layer_types: DenseLinearLayer, PTLayer,fermionfield_Layer,GramSchmidt_Layer
 import ..Layer_types: BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
@@ -1134,7 +1134,7 @@ _refresh_layer!(layer::Layer, D_new, U_new) = nothing
 
 
 
-function (layer::NormLayer)(x::Vector{WF3x1})
+function (layer::NormLayer)(x::AbstractVector{<:WF3x1})
 
     result = Vector{WF3x1}(undef, length(x))
     for i in 1:length(x)
@@ -1190,7 +1190,7 @@ function (layer::RayleighQuotient_Layer)(D::Dirac_operator)
 end
 
 
-function (layer::PtcRayleighQuotient_Layer)(x::Vector{WF3x1})
+function (layer::PtcRayleighQuotient_Layer)(x::AbstractVector{<:WF3x1})
 
     D=layer.D
     rq=0.0
@@ -1302,7 +1302,7 @@ end
 
 
 
-function (layer::Orthogonal_Layer)(x::Vector{WF3x1})
+function (layer::Orthogonal_Layer)(x::AbstractVector{<:WF3x1})
 
     l=length(x)
     cl=(l-1)*l/2
@@ -1322,23 +1322,27 @@ function (layer::Orthogonal_Layer)(x::Vector{WF3x1})
 end 
 
 
-function (layer::GramSchmidt_Layer)(x::Vector{WF3x1})
-    V = layer.x                 # V[j] 들은 서로 직교라고 가정
+function (layer::GramSchmidt_Layer)(x::AbstractVector{<:WF3x1})
     l = length(x)
 
-    result = Vector{WF3x1}(undef, l)
+    # 버퍼 초기화 (최초 1회 또는 크기 변경 시)
+    if length(layer.x) != l
+        layer.x = [deepcopy(x[i]) for i in 1:l]
+    end
+    q = layer.x
 
-    @inbounds for i in 1:l
-        y = deepcopy(x[i])      # y = x_i
-        for j in 1:length(V)
-            denom = inner_product(V[j], V[j])
-            coeff = inner_product(V[j], y) / denom
-            axpby!(-coeff, V[j], 1, y)   # y -= coeff * V[j]
+    # Modified Gram-Schmidt: 입력 벡터들을 서로 직교화
+    copyto!(q[1].f, x[1].f)
+    @inbounds for i in 2:l
+        copyto!(q[i].f, x[i].f)
+        for j in 1:i-1
+            denom = inner_product(q[j], q[j])
+            coeff = inner_product(q[j], q[i]) / denom
+            axpby!(-coeff, q[j], 1, q[i])   # q[i] -= proj_{q[j]}(q[i])
         end
-        result[i] = y
     end
 
-    return result
+    return q
 end
 
 
@@ -1355,7 +1359,7 @@ end
 # end
 
 
-function (L::LossSumLayer)(x::Vector{WF3x1})
+function (L::LossSumLayer)(x::AbstractVector{<:WF3x1})
     return L.w1 * L.l1(x) + L.w2 * L.l2(x)
 end
 
@@ -1374,28 +1378,33 @@ function (layers::Vector{T})(x::Any) where T<:Layer
 end
 
 
-function (layer::BlockScalar_Layer)(x::Vector{WF3x1})
-    return [_blockscalar_forward(layer, xi) for xi in x]
-end
+function (layer::BlockScalar_Layer)(x::AbstractVector{<:WF3x1})
+    n = length(x)
+    nblocks = size(layer.W, 1)
+    result = Vector{WF3x1}(undef, n)
 
-function (layer::BlockScalar_Layer)(x::WF3x1)
-    return _blockscalar_forward(layer, x)
-end
-
-function _blockscalar_forward(layer::BlockScalar_Layer, x::WF3x1)
-    blocks = blockize(x, layer.r)
-    @assert length(blocks) == length(layer.W) "블록 수($(length(blocks)))와 가중치 수($(length(layer.W)))가 일치해야 합니다."
-
-    for i in eachindex(blocks)
-        axpby!(layer.W[i], blocks[i], 0, blocks[i])   # blocks[i] = W[i] * blocks[i]
-    end
-
-    result = unblockize(blocks)
-
-    result = layer.activation(result)
-
-    if layer.residual
-        axpby!(1, x, 1, result)   # result += x
+    if x[1] isa WF3x1GPU
+        # GPU: broadcast 곱셈 (.f 직접 조작)
+        for k in 1:n
+            result[k] = deepcopy(x[k])
+            w_gpu = _build_block_weight_gpu(view(layer.W, :, k), layer.r, x[k])
+            result[k].f .= w_gpu .* x[k].f
+            if layer.residual
+                axpby!(1, x[k], 1, result[k])
+            end
+        end
+    else
+        # CPU: blockize/unblockize
+        for k in 1:n
+            blocks = blockize(x[k], layer.r)
+            for i in 1:nblocks
+                axpby!(layer.W[i, k], blocks[i], 0, blocks[i])
+            end
+            result[k] = unblockize(blocks)
+            if layer.residual
+                axpby!(1, x[k], 1, result[k])
+            end
+        end
     end
 
     return result

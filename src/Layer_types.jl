@@ -443,10 +443,10 @@ end
 
 
 mutable struct GramSchmidt_Layer <: Layer
-    x::Vector{WF3x1}
+    x::Vector{WF3x1}           # forward에서 직교화 결과 캐시 (backward에서 재사용)
     activation::ActivationFunction
-    function GramSchmidt_Layer(x::Any, activation::ActivationFunction= Identity())
-        new(x, activation)
+    function GramSchmidt_Layer(activation::ActivationFunction= Identity())
+        new(WF3x1[], activation)
     end 
 end
 
@@ -638,15 +638,16 @@ blockize로 블록화된 벡터 각각에 스칼라(복소수) 가중치를 곱�
 - `activation::ActivationFunction` — 활성화 함수
 """
 mutable struct BlockScalar_Layer <: Layer
-    W::Vector{ComplexF64}
+    W::Matrix{ComplexF64}   # (nblocks, n) — 블록별 × 벡터별 스칼라 가중치
     r::Int
     residual::Bool
     activation::ActivationFunction
 
-    function BlockScalar_Layer(nblocks::Int, r::Int,
+    function BlockScalar_Layer(x::WF3x1, n::Int, r::Int,
                                residual::Bool=false,
                                activation::ActivationFunction=Identity())
-        W = ones(ComplexF64, nblocks)
+        nblocks = (x.NX ÷ r) * (x.NY ÷ r) * (x.NZ ÷ r) * (x.NT ÷ r)
+        W = ones(ComplexF64, nblocks, n)
         new(W, r, residual, activation)
     end
 end

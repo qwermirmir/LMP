@@ -796,6 +796,50 @@ function zero_wf!(v::AbstractVector{<:WF3x1})
 end
 
 
+"""
+    _build_block_weight_gpu(W_col, r, x::WF3x1GPU)
+
+BlockScalar_Layer용: GPU 페르미온 `.f`(shape NC×NG×blocksize×rsize)에
+broadcast 곱셈 가능한 가중치 CuArray(shape 1×1×blocksize×rsize)를 생성.
+
+`W_col[i]`는 블록 i의 가중치, `r`은 blockize 블록 크기.
+Blockindices의 (b,r)→(ix,iy,iz,it) 매핑을 사용.
+"""
+function _build_block_weight_gpu(W_col::AbstractVector{<:Number}, r::Int, x::WF3x1GPU)
+    bi = x.blockinfo
+    NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
+    NBX = NX ÷ r; NBY = NY ÷ r; NBZ = NZ ÷ r; NBT = NT ÷ r
+
+    blocksize = bi.blocksize
+    rsize     = bi.rsize
+
+    w_cpu = zeros(ComplexF64, blocksize, rsize)
+
+    @inbounds for r_idx = 1:rsize
+        for b_idx = 1:blocksize
+            ix = 1 + mod(div(b_idx-1, bi.blocks_s[1]), bi.blocks[1]) +
+                     mod(div(r_idx-1, bi.blocknumbers_s[1]), bi.blocknumbers[1]) * bi.blocks[1]
+            iy = 1 + mod(div(b_idx-1, bi.blocks_s[2]), bi.blocks[2]) +
+                     mod(div(r_idx-1, bi.blocknumbers_s[2]), bi.blocknumbers[2]) * bi.blocks[2]
+            iz = 1 + mod(div(b_idx-1, bi.blocks_s[3]), bi.blocks[3]) +
+                     mod(div(r_idx-1, bi.blocknumbers_s[3]), bi.blocknumbers[3]) * bi.blocks[3]
+            it = 1 + mod(div(b_idx-1, bi.blocks_s[4]), bi.blocks[4]) +
+                     mod(div(r_idx-1, bi.blocknumbers_s[4]), bi.blocknumbers[4]) * bi.blocks[4]
+
+            bx = (ix - 1) ÷ r + 1
+            by = (iy - 1) ÷ r + 1
+            bz = (iz - 1) ÷ r + 1
+            bt = (it - 1) ÷ r + 1
+            block_id = bx + NBX * ((by - 1) + NBY * ((bz - 1) + NBZ * (bt - 1)))
+
+            w_cpu[b_idx, r_idx] = W_col[block_id]
+        end
+    end
+
+    return CuArray(reshape(w_cpu, 1, 1, blocksize, rsize))
+end
+
+export _build_block_weight_gpu
 
 
 end # module gpu

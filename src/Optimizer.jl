@@ -642,15 +642,15 @@ function wf_adam_step!(param::WF3x1GPU, opt::Adam, grad::WF3x1GPU)
 end
 
 
-function update!(layer::BlockScalar_Layer, opt::Adam, grad::Vector{ComplexF64})
+function update!(layer::BlockScalar_Layer, opt::Adam, grad::Matrix{ComplexF64})
     opt.t += 1
-    for i in eachindex(layer.W)
+    for idx in eachindex(layer.W)
         # real part
-        re_key = objectid(layer) + UInt(2i - 1)
+        re_key = objectid(layer) + UInt(2idx - 1)
         st_re = get!(opt.scalar_state, re_key) do
             AdamState{Float64}(0.0, 0.0)
         end
-        g_re = real(grad[i])
+        g_re = real(grad[idx])
         st_re.m = opt.β1 * st_re.m + (1 - opt.β1) * g_re
         st_re.v = opt.β2 * st_re.v + (1 - opt.β2) * g_re^2
         m_hat_re = st_re.m / (1 - opt.β1^opt.t)
@@ -658,18 +658,18 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad::Vector{ComplexF64})
         Δ_re = opt.α * m_hat_re / (sqrt(v_hat_re) + opt.ε)
 
         # imag part
-        im_key = objectid(layer) + UInt(2i)
+        im_key = objectid(layer) + UInt(2idx)
         st_im = get!(opt.scalar_state, im_key) do
             AdamState{Float64}(0.0, 0.0)
         end
-        g_im = imag(grad[i])
+        g_im = imag(grad[idx])
         st_im.m = opt.β1 * st_im.m + (1 - opt.β1) * g_im
         st_im.v = opt.β2 * st_im.v + (1 - opt.β2) * g_im^2
         m_hat_im = st_im.m / (1 - opt.β1^opt.t)
         v_hat_im = st_im.v / (1 - opt.β2^opt.t)
         Δ_im = opt.α * m_hat_im / (sqrt(v_hat_im) + opt.ε)
 
-        layer.W[i] -= complex(Δ_re, Δ_im)
+        layer.W[idx] -= complex(Δ_re, Δ_im)
     end
 end
 

@@ -87,6 +87,7 @@ mutable struct DDalphaAMG_Setup{T<:WF3x1}
     NC::Int; NG::Int
     NBX::Int; NBY::Int; NBZ::Int; NBT::Int
     Nblocks::Int
+    Dc_matrix::Union{Nothing, Matrix{ComplexF64}}
 end
 
 
@@ -486,6 +487,49 @@ end
 
 
 # ==========================================
+#  粗格子演算子の事前計算
+# ==========================================
+
+"""
+    precompute_coarse_operator!(setup, D)
+
+粗格子演算子 Dc = R·D·P を密行列として事前計算し、setup.Dc_matrix に格納する。
+これにより coarse_gmres 内の coarse_apply が行列ベクトル積になり、
+fine grid D の適用が不要になる。
+"""
+function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D; verbose::Bool=false)
+    Nv = setup.Nv
+    Nblocks = setup.Nblocks
+    n = Nv * Nblocks
+
+    if verbose
+        println("  粗格子演算子を事前計算中... ($(n)×$(n) 行列, $(round(n*n*16/1024/1024, digits=1)) MB)")
+    end
+
+    Dc = zeros(ComplexF64, n, n)
+    e_c = CoarseVector(Nv, Nblocks)
+    fine_buf1 = similar(setup.test_vectors[1])
+    fine_buf2 = similar(setup.test_vectors[1])
+    result_c = CoarseVector(Nv, Nblocks)
+
+    for j in 1:n
+        fill!(e_c.data, zero(ComplexF64))
+        e_c.data[j] = one(ComplexF64)
+        coarse_apply!(result_c, setup, D, e_c, fine_buf1, fine_buf2)
+        @inbounds for i in 1:n
+            Dc[i, j] = result_c.data[i]
+        end
+    end
+
+    setup.Dc_matrix = Dc
+    if verbose
+        println("  粗格子演算子の事前計算完了!")
+    end
+    return setup
+end
+
+
+# ==========================================
 #  ランダムフェルミオン生成 (Setup用)
 # ==========================================
 
@@ -617,19 +661,32 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
                       maxiter::Int=50, restart::Int=20, tol::Float64=1e-1,
                       coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing)
     x_c = similar(b_c)
+    has_Dc = setup.Dc_matrix !== nothing
 
-    # 細格子バッファを事前確保（coarse_apply! で再利用）
-    fine_buf1 = similar(setup.test_vectors[1])
-    fine_buf2 = similar(setup.test_vectors[1])
+    # 事前計算済み行列がない場合のみ細格子バッファを確保
+    local fine_buf1, fine_buf2
+    if !has_Dc
+        fine_buf1 = similar(setup.test_vectors[1])
+        fine_buf2 = similar(setup.test_vectors[1])
+    end
     # 粗格子作業バッファ
     w_c = similar(b_c)
     r_c = similar(b_c)
 
+    # 粗格子演算子適用のヘルパー
+    @inline function apply_Dc!(w, v)
+        if has_Dc
+            mul!(w.data, setup.Dc_matrix, v.data)
+        else
+            coarse_apply!(w, setup, D, v, fine_buf1, fine_buf2)
+        end
+        coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
+    end
+
     for _ = 1:maxiter
         # 残差: r = b - Dc*x
         r_c.data .= b_c.data
-        coarse_apply!(w_c, setup, D, x_c, fine_buf1, fine_buf2)
-        coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
+        apply_Dc!(w_c, x_c)
         coarse_axpby!(-1.0, w_c, 1.0, r_c)
 
         β = coarse_norm(r_c)
@@ -645,8 +702,7 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
 
         j_final = m
         for j = 1:m
-            coarse_apply!(w_c, setup, D, V[j], fine_buf1, fine_buf2)
-            coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
+            apply_Dc!(w_c, V[j])
 
             # Modified Gram-Schmidt
             for i = 1:j
@@ -673,8 +729,7 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
 
         # 収束確認
         r_c.data .= b_c.data
-        coarse_apply!(w_c, setup, D, x_c, fine_buf1, fine_buf2)
-        coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
+        apply_Dc!(w_c, x_c)
         coarse_axpby!(-1.0, w_c, 1.0, r_c)
         if coarse_norm(r_c) < tol
             return x_c
@@ -975,7 +1030,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         end
 
         # 2. スムージング: D*ψ ≈ 0 を近似求解 → 低モード成分抽出
-        zero_rhs = similar(template)  # ゼロ右辺
+        zero_rhs = similar(template)
 
         if smoother == :vcycle
             # Phase 1: MR で予備スムージング → 仮セットアップ構築
@@ -986,28 +1041,46 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                 mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
             end
 
-            # 仮ブロック直交正規化 → 仮セットアップ
-            block_orthonormalize!(test_vectors, r)
+            # 仮ブロック直交正規化 → 仮セットアップ（固定コピーを使用）
+            pre_vectors = deepcopy(test_vectors)
+            block_orthonormalize!(pre_vectors, r)
             pre_setup = DDalphaAMG_Setup{typeof(template)}(
-                test_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
-                NBX, NBY, NBZ, NBT, Nblocks
+                pre_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
+                NBX, NBY, NBZ, NBT, Nblocks, nothing
             )
+            # pre_setup は一時的なので Dc_matrix の事前計算は行わない
+            # (coarse_gmres は matrix-free fallback を使用)
 
             # Phase 2: V-cycle でテストベクトルを再スムージング
-            #   D*ψ = 0 を V-cycle プリコンディショナーで解く
-            #   → 粗格子で表現しきれない残差成分が強調される
+            #   pre_setup は固定（Phase 1 の basis のコピー）で、
+            #   test_vectors[v] を in-place に改善する。
             if verbose
                 println("  [V-cycle setup] Phase 2: V-cycle スムージング ($nvcycle iterations)...")
             end
+            # バッファを事前確保（ループ内で再利用）
+            r_fine = deepcopy(zero_rhs)
+            correction = deepcopy(zero_rhs)
+            r_coarse = CoarseVector(Nv, Nblocks)
             for v in 1:Nv
                 for _ in 1:nvcycle
-                    test_vectors[v] = vcycle(D, zero_rhs, pre_setup;
-                                             pre_smooth=vcycle_pre_smooth,
-                                             post_smooth=vcycle_post_smooth,
-                                             smoother=:mr)
-                    # V-cycle は x=0 から開始し D*x≈0 の近似解を返す
-                    # 既存の test_vector を初期推定として使うため、
-                    # vcycle 結果と元ベクトルを混合
+                    # 1. Pre-smoothing (in-place)
+                    mr_smooth!(test_vectors[v], D, zero_rhs; niter=vcycle_pre_smooth)
+
+                    # 2. 残差 r = 0 - D*ψ_v → 粗格子に射影
+                    mul!(r_fine, D, test_vectors[v])       # r_fine = D*ψ_v
+                    axpby!(1, zero_rhs, -1, r_fine)        # r_fine = 0 - D*ψ_v = -D*ψ_v
+                    restrict_f2c!(r_coarse, pre_setup, r_fine)
+
+                    # 3. 粗格子求解: Dc * e_c = r_c
+                    e_coarse = coarse_gmres(pre_setup, D, r_coarse;
+                                            maxiter=50, tol=1e-1)
+
+                    # 4. 補正を細格子に戻して適用: ψ_v += P(e_c)
+                    prolongate_c2f!(correction, pre_setup, e_coarse)
+                    axpby!(1, correction, 1, test_vectors[v])
+
+                    # 5. Post-smoothing (in-place)
+                    mr_smooth!(test_vectors[v], D, zero_rhs; niter=vcycle_post_smooth)
                 end
                 if verbose && v % max(1, Nv ÷ 4) == 0
                     println("    テストベクトル $v/$Nv 完了")
@@ -1021,7 +1094,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             block_orthonormalize!(test_vectors, r)
             pre_setup = DDalphaAMG_Setup{typeof(template)}(
                 test_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
-                NBX, NBY, NBZ, NBT, Nblocks
+                NBX, NBY, NBZ, NBT, Nblocks, nothing
             )
             for v in 1:Nv
                 sap_smooth!(test_vectors[v], D, zero_rhs, pre_setup; niter=1, nblock_mr=nsmooth)
@@ -1046,8 +1119,11 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
 
     setup = DDalphaAMG_Setup{typeof(template)}(
         test_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
-        NBX, NBY, NBZ, NBT, Nblocks
+        NBX, NBY, NBZ, NBT, Nblocks, nothing
     )
+
+    # 粗格子演算子を事前計算
+    precompute_coarse_operator!(setup, D; verbose=verbose)
 
     if verbose
         println("  セットアップ完了!")
