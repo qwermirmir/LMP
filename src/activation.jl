@@ -10,11 +10,12 @@ using Base.Threads
   # 활성화 함수 추상 타입
 
 
-import ..elementry_base: Spin_matrix, inner_product, Clifford, reverse_paths,Hopping_operator,norm2,mean,minmax,spincolortrace,addmul!
+import ..elementry_base: Spin_matrix, inner_product, Clifford, reverse_paths,Hopping_operator,norm2,mean,minmax,spincolortrace,addmul!,substitute_fermion!
 import ..Layer_types: CPTC_Layer, PTC_Layer, Layer,ActivationFunction,Identity ,Attention_Layer,Softmax,NormLayer,test_Layer,complexNormLayer,minmaxNormLayer,zscoreNormLayer,siteweight_Layer
 import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,ModRelu,RayleighQuotient_Layer,PtcRayleighQuotient_Layer
-import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer
-import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch
+import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer,BlockScalar_Layer
+import ..elementry_base: blockize, unblockize
+import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,_build_block_weight_gpu
 
 export gradient, DeltaRule,DeltaRule!
 export Identity, ReLU, Sigmoid, Tanh
@@ -2788,22 +2789,26 @@ end
 function DeltaRule!(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{WF3x1}, delta::Vector{WF3x1}) where T<:WF3x1
 
     W=layer.W
-    # result=Vector{WF3x1}(undef,length(z))
-    y=similar(z[1])
-    # for i in 1:length(z)
-    #     delta[i]=deepcopy(y)
-    # end
+
+    # conj 버퍼 초기화 (1회만, deepcopy/similar 방지)
+    if !layer._delta_init_dl || typeof(layer._conj_buf[1]) != typeof(z[1])
+        layer._conj_buf = [deepcopy(z[1]), deepcopy(z[1])]  # [conj_d, conj_y]
+        layer._delta_init_dl = true
+    end
+    conj_d = layer._conj_buf[1]
+    conj_y = layer._conj_buf[2]
+    y = layer._yi[1]  # forward에서 이미 초기화된 버퍼 재사용
+
     zero_wf!(delta)
     for k in 1:length(z)
 
         for i in 1:length(d)
 
-            # addmul!(result,adjoint(W[i]),(conj(d[i])))
+            conj!(conj_d, d[i])
+            mul!(y,adjoint(W[i+(k-1)*length(d)]),conj_d)
 
-            mul!(y,adjoint(W[i+(k-1)*length(d)]),(conj(d[i])))
-
-            axpby!(1,conj(y),1,delta[k])
-            # result=result+y
+            conj!(conj_y, y)
+            axpby!(1,conj_y,1,delta[k])
         end 
     end 
     return nothing
@@ -2920,13 +2925,22 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
     end
     invpaths = layer._invpaths
 
-    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 매번 갱신)
+    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 in-place 갱신)
     if length(layer._Wadj) != NW
         layer._Wadj = Vector{typeof(W[1])}(undef, NW)
+        @inbounds for k in 1:NW
+            layer._Wadj[k] = adjoint(W[k])
+        end
     end
     Wadj = layer._Wadj
     @inbounds for k in 1:NW
-        Wadj[k] = adjoint(W[k])
+        wsm = W[k].sm
+        wadj_sm = Wadj[k].sm
+        for j in 1:4
+            for i in 1:4
+                wadj_sm[i,j] = conj(wsm[j,i])
+            end
+        end
     end
 
     # ④ invhops + hop 출력 버퍼 캐시
@@ -3016,20 +3030,30 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
     end
     invpaths = layer._invpaths
 
-    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 매번 갱신)
+    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 in-place 갱신)
     if length(layer._Wadj) != NW
         layer._Wadj = Vector{typeof(W[1])}(undef, NW)
+        @inbounds for k in 1:NW
+            layer._Wadj[k] = adjoint(W[k])
+        end
     end
     Wadj = layer._Wadj
     @inbounds for k in 1:NW
-        Wadj[k] = adjoint(W[k])
+        wsm = W[k].sm
+        wadj_sm = Wadj[k].sm
+        for j in 1:4
+            for i in 1:4
+                wadj_sm[i,j] = conj(wsm[j,i])
+            end
+        end
     end
 
     # ④ invhops + hop 출력 버퍼 캐시 (공유 금지)
     nt = nthreads()
     if isempty(layer._invhops) || length(layer._invhops) != nt
         layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
-        layer._hop_out = [Vector{WF3x1}([deepcopy(z[1])]) for _ in 1:nt]
+        TF = typeof(z[1])
+        layer._hop_out = [Vector{TF}([deepcopy(z[1])]) for _ in 1:nt]
     else
         @inbounds for t in 1:nt
             layer._invhops[t].Gauge = layer.U
@@ -3056,7 +3080,8 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             conj!(delta[i], hop_out[tid][1])
         end
     else
-        ci = deepcopy(z[1])
+        ci = layer._ci_buffers[1]     # GPU: 캐시된 버퍼 재사용 (deepcopy 방지)
+        hop_buf_gpu = Vector{typeof(z[1])}([hop_out[1][1]])  # concrete 타입 벡터로 래핑
 
         for i in 1:Nz
             zero_wf!(ci)
@@ -3066,8 +3091,8 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             end
             invhop = invhops[1]
             invhop.P = invpaths[i]
-            hopped_ci = invhop(ci)[1]
-            conj!(delta[i], hopped_ci)
+            invhop(ci, hop_buf_gpu)          # preallocated 버전 사용 (WF3x1GPU 할당 방지)
+            conj!(delta[i], hop_buf_gpu[1])
         end
     end
 
@@ -3168,23 +3193,27 @@ end
 
 function DeltaRule!(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
 
-
-
-    # result = Vector{WF3x1}(undef, length(z))
-
-
     α = layer.alpha
 
+    # conj 버퍼 초기화 (1회만, deepcopy 방지)
+    if isempty(layer._conj_buf) || typeof(layer._conj_buf[1]) != typeof(z[1])
+        layer._conj_buf = [deepcopy(z[1])]
+    end
+    cj_buf = layer._conj_buf[1]
 
     @inbounds for i in 1:length(z)
-        cz=conj(z[i])
-        norm = sqrt(norm2(z[i]))
-        eta1 = inner_product(cz, d[i])/2                  # z† d
-        eta2 = inner_product(z[i], conj(d[i]))/2            # zᵗ d*
+        nrm = sqrt(norm2(z[i]))
+        inv_n = 1.0 / nrm
+        inv_n3 = inv_n^3
 
-        delta[i] = d[i] / norm
-        delta[i] -= (eta1 * cz) / norm^3
-        delta[i] -= (eta2 * cz) / norm^3
+        conj!(cj_buf, z[i])                       # cj_buf = conj(z[i])  (재사용)
+        eta1 = inner_product(cj_buf, d[i]) / 2
+        # eta2 = conj(eta1) なので eta1+eta2 = 2*real(eta1)
+        coeff = -2 * real(eta1) * inv_n3
+
+        # delta[i] = d[i]/norm + coeff * conj(z[i])
+        axpby!(inv_n, d[i], 0, delta[i])           # delta[i] = d[i] / norm
+        axpby!(coeff, cj_buf, 1, delta[i])          # delta[i] += coeff * conj(z[i])
     end
 
 
@@ -3309,19 +3338,17 @@ end
 function DeltaRule(layer::GramSchmidt_Layer, ::Identity,
                    z::Vector{WF3x1}, d::Vector{T}) where T<:WF3x1
 
-    V = layer.x
+    q = layer.x  # forward에서 캐시된 직교화 벡터
     l = length(d)
 
-    result = Vector{WF3x1}(undef, l)
+    result = [deepcopy(d[i]) for i in 1:l]
 
     @inbounds for i in 1:l
-        g = deepcopy(d[i])
-        for j in 1:length(V)
-            denom = inner_product(V[j], V[j])
-            coeff = inner_product(V[j], g) / denom
-            axpby!(-coeff, V[j], 1, g)   # g -= coeff * V[j]
+        for j in 1:i-1
+            denom = inner_product(q[j], q[j])
+            coeff = inner_product(q[j], result[i]) / denom
+            axpby!(-coeff, q[j], 1, result[i])
         end
-        result[i] = g
     end
 
     return result
@@ -3329,22 +3356,131 @@ end
 function DeltaRule!(layer::GramSchmidt_Layer, ::Identity,
                    z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
 
-    V = layer.x
+    q = layer.x  # forward에서 캐시된 직교화 벡터
     l = length(d)
 
     @inbounds for i in 1:l
-        g = deepcopy(d[i])
-        for j in 1:length(V)
-            denom = inner_product(V[j], V[j])
-            coeff = inner_product(V[j], g) / denom
-            axpby!(-coeff, V[j], 1, g)   # g -= coeff * V[j]
+        copyto!(delta[i].f, d[i].f)
+        for j in 1:i-1
+            denom = inner_product(q[j], q[j])
+            coeff = inner_product(q[j], delta[i]) / denom
+            axpby!(-coeff, q[j], 1, delta[i])
         end
-        delta[i] = g
     end
 
 end
 
 
+# --- BlockScalar_Layer ---
+function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, γ::Vector{Spin_matrix}) where T<:WF3x1
+    nblocks, n = size(layer.W)
+    grad_W = zeros(ComplexF64, nblocks, n)
+
+    if z[1] isa WF3x1GPU
+        # GPU: .f broadcast로 사이트별 내적 → 블록별 합산
+        r = layer.r
+        bi = z[1].blockinfo
+        NX, NY, NZ, NT = z[1].NX, z[1].NY, z[1].NZ, z[1].NT
+        NBX = NX÷r; NBY = NY÷r; NBZ = NZ÷r; NBT = NT÷r
+        blocksize = bi.blocksize
+        rsize = bi.rsize
+
+        for k in 1:n
+            # 사이트별 내적: sum over color & spinor → (blocksize, rsize) on GPU
+            prod_gpu = conj.(z[k].f) .* d[k].f
+            site_ip = dropdims(sum(prod_gpu, dims=(1,2)), dims=(1,2))
+            site_ip_cpu = Array(site_ip)  # (blocksize, rsize) → CPU
+
+            @inbounds for r_idx = 1:rsize
+                for b_idx = 1:blocksize
+                    ix = 1 + mod(div(b_idx-1, bi.blocks_s[1]), bi.blocks[1]) +
+                             mod(div(r_idx-1, bi.blocknumbers_s[1]), bi.blocknumbers[1]) * bi.blocks[1]
+                    iy = 1 + mod(div(b_idx-1, bi.blocks_s[2]), bi.blocks[2]) +
+                             mod(div(r_idx-1, bi.blocknumbers_s[2]), bi.blocknumbers[2]) * bi.blocks[2]
+                    iz = 1 + mod(div(b_idx-1, bi.blocks_s[3]), bi.blocks[3]) +
+                             mod(div(r_idx-1, bi.blocknumbers_s[3]), bi.blocknumbers[3]) * bi.blocks[3]
+                    it = 1 + mod(div(b_idx-1, bi.blocks_s[4]), bi.blocks[4]) +
+                             mod(div(r_idx-1, bi.blocknumbers_s[4]), bi.blocknumbers[4]) * bi.blocks[4]
+                    bx = (ix-1)÷r+1; by = (iy-1)÷r+1; bz = (iz-1)÷r+1; bt = (it-1)÷r+1
+                    block_id = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
+                    grad_W[block_id, k] += site_ip_cpu[b_idx, r_idx]
+                end
+            end
+        end
+    else
+        # CPU: blockize
+        for k in 1:n
+            z_blocks = blockize(z[k], layer.r)
+            d_blocks = blockize(d[k], layer.r)
+            for i in 1:nblocks
+                grad_W[i, k] = inner_product(z_blocks[i], d_blocks[i])
+            end
+        end
+    end
+
+    return grad_W
+end
+
+function DeltaRule(layer::BlockScalar_Layer, ::Identity,
+                   z::Vector{WF3x1}, d::Vector{T}) where T<:WF3x1
+    n = length(d)
+    nblocks = size(layer.W, 1)
+    result = Vector{WF3x1}(undef, n)
+
+    if d[1] isa WF3x1GPU
+        # GPU: broadcast
+        for k in 1:n
+            result[k] = deepcopy(d[k])
+            w_gpu = _build_block_weight_gpu(conj.(view(layer.W, :, k)), layer.r, d[k])
+            result[k].f .= w_gpu .* d[k].f
+            if layer.residual
+                axpby!(1, d[k], 1, result[k])
+            end
+        end
+    else
+        # CPU: blockize
+        for k in 1:n
+            d_blocks = blockize(d[k], layer.r)
+            for i in 1:nblocks
+                axpby!(conj(layer.W[i, k]), d_blocks[i], 0, d_blocks[i])
+            end
+            result[k] = unblockize(d_blocks)
+            if layer.residual
+                axpby!(1, d[k], 1, result[k])
+            end
+        end
+    end
+    return result
+end
+
+function DeltaRule!(layer::BlockScalar_Layer, ::Identity,
+                    z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
+    n = length(d)
+    nblocks = size(layer.W, 1)
+
+    if d[1] isa WF3x1GPU
+        # GPU: broadcast
+        for k in 1:n
+            w_gpu = _build_block_weight_gpu(conj.(view(layer.W, :, k)), layer.r, d[k])
+            delta[k].f .= w_gpu .* d[k].f
+            if layer.residual
+                axpby!(1, d[k], 1, delta[k])
+            end
+        end
+    else
+        # CPU: blockize
+        for k in 1:n
+            d_blocks = blockize(d[k], layer.r)
+            for i in 1:nblocks
+                axpby!(conj(layer.W[i, k]), d_blocks[i], 0, d_blocks[i])
+            end
+            copyto!(delta[k].f, unblockize(d_blocks).f)
+            if layer.residual
+                axpby!(1, d[k], 1, delta[k])
+            end
+        end
+    end
+end
 
 
 end # module activation

@@ -11,7 +11,7 @@ import ..elementry_base: Hopping_operator, Spin_matrix, inner_product,g2vector_g
 import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minmax,spincolortrace
 import ..Optimizer: Opt, update!, Adam
 import ..activation:  gradient, DeltaRule,DeltaRule!
-import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU
+import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu
 import ..Layer_types: DenseLinearLayer, PTLayer,fermionfield_Layer,GramSchmidt_Layer
 import ..Layer_types: BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
@@ -930,46 +930,36 @@ end
 # end
 
 
-function (layer::DenseLinearLayer)(x::Vector{WF3x1GPU}) 
-    Out = layer.Out
-    W   = layer.W
-
-    @assert length(W) == length(x)*Out "W의 길이는 Out이어야 합니다."
-    result = Vector{WF3x1}(undef, Out)
-    yi = deepcopy(x[1])
-    substitute_fermion!(yi, x[1])
-
-    for k in 1:length(x)
-        @inbounds for i in 1:Out
-                # yi용 버퍼 1개 생성
-            mul!(yi, W[i+(k-1)*Out], x[k])            # yi = W[i]*x 를 "할당 없이" 계산
-            result[i] += layer.activation(yi)  # activation이 새로 만들면 여기서 또 alloc
-        end
-    end 
-    return result
-end
-
-
 function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     Out = layer.Out
     W   = layer.W
 
     @assert length(W) == length(x)*Out "W의 길이는 Out이어야 합니다."
-    result = Vector{WF3x1}(undef, Out)
-    for i in 1:Out
-        result[i] = deepcopy(x[1])
-        zero_wf!(result[i])
+
+    # 캐시 버퍼 초기화 (최초 1회만)
+    if !layer._dl_init || length(layer._result) != Out
+        layer._result = Vector{WF3x1}(undef, Out)
+        for i in 1:Out
+            layer._result[i] = deepcopy(x[1])
+        end
+        layer._yi = [deepcopy(x[1])]
+        layer._dl_init = true
     end
-    yi = deepcopy(x[1])
+
+    result = layer._result
+    yi = layer._yi[1]
+
+    @inbounds for j in 1:Out
+        zero_wf!(result[j])
+    end
 
     for k in 1:length(x)
         @inbounds for i in 1:Out
             mul!(yi, W[i+(k-1)*Out], x[k])
-            result[i] += layer.activation(yi)
+            axpby!(1, yi, 1, result[i])
         end
     end 
     return result
-    
 end
 
 
@@ -1134,12 +1124,18 @@ _refresh_layer!(layer::Layer, D_new, U_new) = nothing
 
 
 
-function (layer::NormLayer)(x::Vector{WF3x1})
-
-    result = Vector{WF3x1}(undef, length(x))
-    for i in 1:length(x)
-        result[i] = layer.alpha*(x[i]/sqrt(norm2(x[i])))
-    end 
+function (layer::NormLayer)(x::AbstractVector{<:WF3x1})
+    n = length(x)
+    # 캠시 존재하면 재사용
+    if !layer._norm_init || length(layer._result) != n
+        layer._result = [deepcopy(x[i]) for i in 1:n]
+        layer._norm_init = true
+    end
+    result = layer._result
+    @inbounds for i in 1:n
+        s = layer.alpha / sqrt(norm2(x[i]))
+        axpby!(s, x[i], 0, result[i])   # result[i] = s * x[i]
+    end
 
     return result
 end
@@ -1190,7 +1186,7 @@ function (layer::RayleighQuotient_Layer)(D::Dirac_operator)
 end
 
 
-function (layer::PtcRayleighQuotient_Layer)(x::Vector{WF3x1})
+function (layer::PtcRayleighQuotient_Layer)(x::AbstractVector{<:WF3x1})
 
     D=layer.D
     rq=0.0
@@ -1302,7 +1298,7 @@ end
 
 
 
-function (layer::Orthogonal_Layer)(x::Vector{WF3x1})
+function (layer::Orthogonal_Layer)(x::AbstractVector{<:WF3x1})
 
     l=length(x)
     cl=(l-1)*l/2
@@ -1322,23 +1318,27 @@ function (layer::Orthogonal_Layer)(x::Vector{WF3x1})
 end 
 
 
-function (layer::GramSchmidt_Layer)(x::Vector{WF3x1})
-    V = layer.x                 # V[j] 들은 서로 직교라고 가정
+function (layer::GramSchmidt_Layer)(x::AbstractVector{<:WF3x1})
     l = length(x)
 
-    result = Vector{WF3x1}(undef, l)
+    # 버퍼 초기화 (최초 1회 또는 크기 변경 시)
+    if length(layer.x) != l
+        layer.x = [deepcopy(x[i]) for i in 1:l]
+    end
+    q = layer.x
 
-    @inbounds for i in 1:l
-        y = deepcopy(x[i])      # y = x_i
-        for j in 1:length(V)
-            denom = inner_product(V[j], V[j])
-            coeff = inner_product(V[j], y) / denom
-            axpby!(-coeff, V[j], 1, y)   # y -= coeff * V[j]
+    # Modified Gram-Schmidt: 입력 벡터들을 서로 직교화
+    copyto!(q[1].f, x[1].f)
+    @inbounds for i in 2:l
+        copyto!(q[i].f, x[i].f)
+        for j in 1:i-1
+            denom = inner_product(q[j], q[j])
+            coeff = inner_product(q[j], q[i]) / denom
+            axpby!(-coeff, q[j], 1, q[i])   # q[i] -= proj_{q[j]}(q[i])
         end
-        result[i] = y
     end
 
-    return result
+    return q
 end
 
 
@@ -1355,7 +1355,7 @@ end
 # end
 
 
-function (L::LossSumLayer)(x::Vector{WF3x1})
+function (L::LossSumLayer)(x::AbstractVector{<:WF3x1})
     return L.w1 * L.l1(x) + L.w2 * L.l2(x)
 end
 
@@ -1374,28 +1374,33 @@ function (layers::Vector{T})(x::Any) where T<:Layer
 end
 
 
-function (layer::BlockScalar_Layer)(x::Vector{WF3x1})
-    return [_blockscalar_forward(layer, xi) for xi in x]
-end
+function (layer::BlockScalar_Layer)(x::AbstractVector{<:WF3x1})
+    n = length(x)
+    nblocks = size(layer.W, 1)
+    result = Vector{WF3x1}(undef, n)
 
-function (layer::BlockScalar_Layer)(x::WF3x1)
-    return _blockscalar_forward(layer, x)
-end
-
-function _blockscalar_forward(layer::BlockScalar_Layer, x::WF3x1)
-    blocks = blockize(x, layer.r)
-    @assert length(blocks) == length(layer.W) "블록 수($(length(blocks)))와 가중치 수($(length(layer.W)))가 일치해야 합니다."
-
-    for i in eachindex(blocks)
-        axpby!(layer.W[i], blocks[i], 0, blocks[i])   # blocks[i] = W[i] * blocks[i]
-    end
-
-    result = unblockize(blocks)
-
-    result = layer.activation(result)
-
-    if layer.residual
-        axpby!(1, x, 1, result)   # result += x
+    if x[1] isa WF3x1GPU
+        # GPU: broadcast 곱셈 (.f 직접 조작)
+        for k in 1:n
+            result[k] = deepcopy(x[k])
+            w_gpu = _build_block_weight_gpu(view(layer.W, :, k), layer.r, x[k])
+            result[k].f .= w_gpu .* x[k].f
+            if layer.residual
+                axpby!(1, x[k], 1, result[k])
+            end
+        end
+    else
+        # CPU: blockize/unblockize
+        for k in 1:n
+            blocks = blockize(x[k], layer.r)
+            for i in 1:nblocks
+                axpby!(layer.W[i, k], blocks[i], 0, blocks[i])
+            end
+            result[k] = unblockize(blocks)
+            if layer.residual
+                axpby!(1, x[k], 1, result[k])
+            end
+        end
     end
 
     return result
@@ -1527,9 +1532,18 @@ using PyPlot
 
 
 
-function train(opt::Opt, layers::Vector{T}, input::WF3x1, target::WF3x1 , Dirac_operator ; epochs=100, batch=1,precond=nothing , def=false) where {T<:Layer}
+function train(opt::Opt, layers::Vector{T}, input::WF3x1, target::WF3x1 , Dirac_operator ; epochs=100, batch=1,precond=nothing , def=false, logfile=nothing) where {T<:Layer}
     depth = length(layers)
     loss_history = Float64[]  # 손실 값 저장할 벡터
+
+    # 로그 파일 설정 (logfile 미지정 시 자동 생성)
+    if logfile === nothing
+        logfile = "train_log_$(Libc.strftime("%Y-%m-%d_%H%M%S", time())).txt"
+    end
+    log_io = open(logfile, "a")
+    println(log_io, "=== Training started: $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
+    println(log_io, "epochs=$epochs, batch=$batch, depth=$depth")
+    flush(log_io)
 
     # Jupyter에서 그래프를 실시간으로 업데이트하기 위한 설정
     fig, ax = plt.subplots()
@@ -1669,10 +1683,14 @@ function train(opt::Opt, layers::Vector{T}, input::WF3x1, target::WF3x1 , Dirac_
         # 기존 그래프를 지우고 다시 그리기
         
         println("Epoch: $epoch, Loss: $current_loss")  # 로그 출력
+        println(log_io, "Epoch: $epoch, Loss: $current_loss")
+        flush(log_io)
 
 
 
     end
+    println(log_io, "=== Training finished: $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
+    close(log_io)
     line.set_xdata(1:length(loss_history))
     line.set_ydata(loss_history)
     ax.relim()
@@ -1689,11 +1707,31 @@ end
 
 
 
-function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=1 ) where {T<:Layer}
+function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=1, logfile=nothing, test_config=nothing, test_interval=10 ) where {T<:Layer}
 
     depth = length(layers)
 
     loss_history = Float64[]  # 손실 값 저장할 벡터
+
+    # 로그 파일 설정 (logfile 미지정 시 자동 생성)
+    if logfile === nothing
+        logfile = "train_log_$(Libc.strftime("%Y-%m-%d_%H%M%S", time())).txt"
+    end
+    log_io = open(logfile, "a")
+    println(log_io, "=== Training started: $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
+    println(log_io, "epochs=$epochs, batch=$batch, depth=$depth, configs=$(length(config))")
+    flush(log_io)
+
+    # test config용 Dirac operator 미리 생성
+    test_Ds = nothing
+    test_loss_history = Float64[]
+    if test_config !== nothing
+        test_Ds = Vector{Any}(undef, length(test_config))
+        x_test = Initialize_pseudofermion_fields(test_config[1][1], "Wilson")
+        for k in 1:length(test_config)
+            test_Ds[k] = Dirac_operator(test_config[k], x_test, params)
+        end
+    end
 
 
         fig, ax = plt.subplots()
@@ -1701,6 +1739,12 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     line, = ax.plot([], [], "b-", linewidth=2)  # 초기 그래프
+    test_line = nothing
+    if test_config !== nothing
+        test_line, = ax.plot([], [], "r--", linewidth=2, label="test")
+        line.set_label("train")
+        ax.legend()
+    end
     γ=Clifford()
 
     x = Initialize_pseudofermion_fields(config[1][1],"Wilson")
@@ -1781,8 +1825,73 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
         # 기존 그래프를 지우고 다시 그리기
 
         println("Epoch: $(epoch), Loss: $current_loss")  # 로그 출력
+        println(log_io, "Epoch: $(epoch), Loss: $current_loss")
+        flush(log_io)
+
+        # Test loss 평가
+        if test_config !== nothing && mod(epoch, test_interval) == 0
+            test_loss = 0.0
+            for tc in 1:length(test_config)
+                D_test = test_Ds[tc]
+                # test용 config를 layer에 설정
+                for i in 1:depth
+                    if layers[i] isa PTLayer
+                        layers[i].U = test_config[tc]
+                    end
+                end
+                if layers[end] isa PtcRayleighQuotient_Layer
+                    layers[end].D = D_test
+                elseif layers[end] isa LossSumLayer
+                    if layers[end].l1 isa PtcRayleighQuotient_Layer
+                        layers[end].l1.D = D_test
+                    end
+                    if layers[end].l2 isa PtcRayleighQuotient_Layer
+                        layers[end].l2.D = D_test
+                    end
+                end
+                if layers[end] isa Ritz_Layer
+                    layers[end].D = D_test
+                end
+                for b in 1:batch
+                    test_loss += real(forward_propagation!(layers, D_test, D_test, u))
+                end
+            end
+            test_loss /= length(test_config)
+            push!(test_loss_history, real(test_loss))
+            println("  [Test] Epoch: $(epoch), Test Loss: $test_loss")
+            println(log_io, "  [Test] Epoch: $(epoch), Test Loss: $test_loss")
+            flush(log_io)
+
+            # test 그래프 업데이트
+            test_line.set_xdata(test_interval:test_interval:(test_interval*length(test_loss_history)))
+            test_line.set_ydata(test_loss_history)
+
+            # train config으로 복원
+            k_restore = mod(epoch-1, length(config)) + 1
+            for i in 1:depth
+                if layers[i] isa PTLayer
+                    layers[i].U = config[k_restore]
+                end
+            end
+            D_restore = Ds[k_restore]
+            if layers[end] isa PtcRayleighQuotient_Layer
+                layers[end].D = D_restore
+            elseif layers[end] isa LossSumLayer
+                if layers[end].l1 isa PtcRayleighQuotient_Layer
+                    layers[end].l1.D = D_restore
+                end
+                if layers[end].l2 isa PtcRayleighQuotient_Layer
+                    layers[end].l2.D = D_restore
+                end
+            end
+            if layers[end] isa Ritz_Layer
+                layers[end].D = D_restore
+            end
+        end
     end
 
+    println(log_io, "=== Training finished: $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
+    close(log_io)
 
     line.set_xdata(1:length(loss_history))
     line.set_ydata(loss_history)

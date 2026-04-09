@@ -75,35 +75,43 @@ function complexProcess(param::T, opt:: Adam , grad ) where {T<:AbstractSpinMatr
     m = opt.m[key]
     v = opt.v[key]
 
-    g_re = real(grad.sm)
-    g_im = imag(grad.sm)
+    β1 = opt.β1
+    β2 = opt.β2
+    α  = opt.α
+    ε  = opt.ε
+    t  = opt.t
+    bias1 = 1 / (1 - β1^t)
+    bias2 = 1 / (1 - β2^t)
 
-    m_re = real(m.sm)
-    m_im = imag(m.sm)
+    sm_g = grad.sm
+    sm_m = m.sm
+    sm_v = v.sm
+    sm_p = param.sm
 
-    v_re = real(v.sm)
-    v_im = imag(v.sm)
+    @inbounds for j in axes(sm_g, 2), i in axes(sm_g, 1)
+        g_re = real(sm_g[i,j])
+        g_im = imag(sm_g[i,j])
 
-    m_re .= opt.β1 .* m_re .+ (1 - opt.β1) .* g_re
-    v_re .= opt.β2 .* v_re .+ (1 - opt.β2) .* (g_re .^ 2)
+        mr = real(sm_m[i,j])
+        mi = imag(sm_m[i,j])
+        vr = real(sm_v[i,j])
+        vi = imag(sm_v[i,j])
 
-    m_im .= opt.β1 .* m_im .+ (1 - opt.β1) .* g_im
-    v_im .= opt.β2 .* v_im .+ (1 - opt.β2) .* (g_im .^ 2)
+        # EMA update
+        mr = β1 * mr + (1 - β1) * g_re
+        vr = β2 * vr + (1 - β2) * g_re^2
+        mi = β1 * mi + (1 - β1) * g_im
+        vi = β2 * vi + (1 - β2) * g_im^2
 
-    m.sm .= complex.(m_re, m_im)
-    v.sm .= complex.(v_re, v_im)
+        sm_m[i,j] = complex(mr, mi)
+        sm_v[i,j] = complex(vr, vi)
 
-    m_hat_re = m_re ./ (1 - opt.β1^opt.t)
-    v_hat_re = v_re ./ (1 - opt.β2^opt.t)
+        # bias-corrected update
+        upd_re = α * (mr * bias1) / (sqrt(vr * bias2) + ε)
+        upd_im = α * (mi * bias1) / (sqrt(vi * bias2) + ε)
 
-    m_hat_im = m_im ./ (1 - opt.β1^opt.t)
-    v_hat_im = v_im ./ (1 - opt.β2^opt.t)
-
-    update_real = opt.α .* m_hat_re ./ (sqrt.(v_hat_re) .+ opt.ε)
-    update_imag = opt.α .* m_hat_im ./ (sqrt.(v_hat_im) .+ opt.ε)
-
-    param.sm .-= update_real .- im .* update_imag
-
+        sm_p[i,j] -= complex(upd_re, -upd_im)
+    end
 
 end   
 
@@ -121,15 +129,34 @@ function realProcess(param::T, opt:: Adam , grad ) where {T<:AbstractSpinMatrix}
     m = opt.m[key]
     v = opt.v[key]
 
-    g = real(grad.sm)  # 실수영자 계산
+    β1 = opt.β1
+    β2 = opt.β2
+    α  = opt.α
+    ε  = opt.ε
+    t  = opt.t
+    bias1 = 1 / (1 - β1^t)
+    bias2 = 1 / (1 - β2^t)
 
-    m.sm .= opt.β1 .* m.sm .+ (1 - opt.β1) .* g
-    v.sm .= opt.β2 .* v.sm .+ (1 - opt.β2) .* (g .^ 2)
+    sm_g = grad.sm
+    sm_m = m.sm
+    sm_v = v.sm
+    sm_p = param.sm
 
-    m_hat = m.sm ./ (1 - opt.β1^opt.t)
-    v_hat = v.sm ./ (1 - opt.β2^opt.t)
+    @inbounds for j in axes(sm_g, 2), i in axes(sm_g, 1)
+        g = real(sm_g[i,j])
 
-    param.sm .-= opt.α .* m_hat ./ (sqrt.(v_hat) .+ opt.ε)
+        mr = real(sm_m[i,j])
+        vr = real(sm_v[i,j])
+
+        mr = β1 * mr + (1 - β1) * g
+        vr = β2 * vr + (1 - β2) * g^2
+
+        sm_m[i,j] = complex(mr, 0.0)
+        sm_v[i,j] = complex(vr, 0.0)
+
+        upd = α * (mr * bias1) / (sqrt(vr * bias2) + ε)
+        sm_p[i,j] -= upd
+    end
 end
 
 
@@ -642,15 +669,15 @@ function wf_adam_step!(param::WF3x1GPU, opt::Adam, grad::WF3x1GPU)
 end
 
 
-function update!(layer::BlockScalar_Layer, opt::Adam, grad::Vector{ComplexF64})
+function update!(layer::BlockScalar_Layer, opt::Adam, grad::Matrix{ComplexF64})
     opt.t += 1
-    for i in eachindex(layer.W)
+    for idx in eachindex(layer.W)
         # real part
-        re_key = objectid(layer) + UInt(2i - 1)
+        re_key = objectid(layer) + UInt(2idx - 1)
         st_re = get!(opt.scalar_state, re_key) do
             AdamState{Float64}(0.0, 0.0)
         end
-        g_re = real(grad[i])
+        g_re = real(grad[idx])
         st_re.m = opt.β1 * st_re.m + (1 - opt.β1) * g_re
         st_re.v = opt.β2 * st_re.v + (1 - opt.β2) * g_re^2
         m_hat_re = st_re.m / (1 - opt.β1^opt.t)
@@ -658,18 +685,18 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad::Vector{ComplexF64})
         Δ_re = opt.α * m_hat_re / (sqrt(v_hat_re) + opt.ε)
 
         # imag part
-        im_key = objectid(layer) + UInt(2i)
+        im_key = objectid(layer) + UInt(2idx)
         st_im = get!(opt.scalar_state, im_key) do
             AdamState{Float64}(0.0, 0.0)
         end
-        g_im = imag(grad[i])
+        g_im = imag(grad[idx])
         st_im.m = opt.β1 * st_im.m + (1 - opt.β1) * g_im
         st_im.v = opt.β2 * st_im.v + (1 - opt.β2) * g_im^2
         m_hat_im = st_im.m / (1 - opt.β1^opt.t)
         v_hat_im = st_im.v / (1 - opt.β2^opt.t)
         Δ_im = opt.α * m_hat_im / (sqrt(v_hat_im) + opt.ε)
 
-        layer.W[i] -= complex(Δ_re, Δ_im)
+        layer.W[idx] -= complex(Δ_re, Δ_im)
     end
 end
 

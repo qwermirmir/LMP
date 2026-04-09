@@ -271,7 +271,12 @@ mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
     Out::Int
     cuda::Bool
     activation::ActivationFunction
-
+    # --- 캐시 버퍼 ---
+    _result::Vector{WF3x1}
+    _yi::Vector{WF3x1}          # yi 버퍼 (1-element)
+    _dl_init::Bool
+    _conj_buf::Vector{WF3x1}   # conj 작업용 버퍼 (DeltaRule!에서 재사용)
+    _delta_init_dl::Bool
 
     function DenseLinearLayer(In::Int, Out::Int, cuda::Bool, activation::ActivationFunction=Identity() )
         if cuda == true
@@ -285,11 +290,7 @@ mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
                 W[i] = Random_SpinM("complex")
             end
         end
-        # W = Vector{Spin_matrix}(undef, Out)
-        # for i in 1:Out
-        #     W[i] = Random_SpinM("complex")
-        # end
-        return new{eltype(W)}(W, In, Out, cuda, activation)  # ← 핵심
+        return new{eltype(W)}(W, In, Out, cuda, activation, WF3x1[], WF3x1[], false, WF3x1[], false)
     end
 end
 
@@ -443,10 +444,10 @@ end
 
 
 mutable struct GramSchmidt_Layer <: Layer
-    x::Vector{WF3x1}
+    x::Vector{WF3x1}           # forward에서 직교화 결과 캐시 (backward에서 재사용)
     activation::ActivationFunction
-    function GramSchmidt_Layer(x::Any, activation::ActivationFunction= Identity())
-        new(x, activation)
+    function GramSchmidt_Layer(activation::ActivationFunction= Identity())
+        new(WF3x1[], activation)
     end 
 end
 
@@ -565,9 +566,12 @@ end
 mutable struct NormLayer <: Layer
     activation::ActivationFunction
     alpha::Float64
+    _result::Vector{WF3x1}
+    _norm_init::Bool
+    _conj_buf::Vector{WF3x1}   # conj 작업용 버퍼 (DeltaRule!에서 재사용)
 
     function NormLayer(activation::ActivationFunction= Identity(),alpha::Float64=1.0)
-        new(activation,alpha)
+        new(activation,alpha, WF3x1[], false, WF3x1[])
     end
 
 end 
@@ -638,15 +642,16 @@ blockize로 블록화된 벡터 각각에 스칼라(복소수) 가중치를 곱�
 - `activation::ActivationFunction` — 활성화 함수
 """
 mutable struct BlockScalar_Layer <: Layer
-    W::Vector{ComplexF64}
+    W::Matrix{ComplexF64}   # (nblocks, n) — 블록별 × 벡터별 스칼라 가중치
     r::Int
     residual::Bool
     activation::ActivationFunction
 
-    function BlockScalar_Layer(nblocks::Int, r::Int,
+    function BlockScalar_Layer(x::WF3x1, n::Int, r::Int,
                                residual::Bool=false,
                                activation::ActivationFunction=Identity())
-        W = ones(ComplexF64, nblocks)
+        nblocks = (x.NX ÷ r) * (x.NY ÷ r) * (x.NZ ÷ r) * (x.NT ÷ r)
+        W = ones(ComplexF64, nblocks, n)
         new(W, r, residual, activation)
     end
 end
