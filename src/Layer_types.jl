@@ -271,7 +271,12 @@ mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
     Out::Int
     cuda::Bool
     activation::ActivationFunction
-
+    # --- 캐시 버퍼 ---
+    _result::Vector{WF3x1}
+    _yi::Vector{WF3x1}          # yi 버퍼 (1-element)
+    _dl_init::Bool
+    _conj_buf::Vector{WF3x1}   # conj 작업용 버퍼 (DeltaRule!에서 재사용)
+    _delta_init_dl::Bool
 
     function DenseLinearLayer(In::Int, Out::Int, cuda::Bool, activation::ActivationFunction=Identity() )
         if cuda == true
@@ -285,11 +290,7 @@ mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
                 W[i] = Random_SpinM("complex")
             end
         end
-        # W = Vector{Spin_matrix}(undef, Out)
-        # for i in 1:Out
-        #     W[i] = Random_SpinM("complex")
-        # end
-        return new{eltype(W)}(W, In, Out, cuda, activation)  # ← 핵심
+        return new{eltype(W)}(W, In, Out, cuda, activation, WF3x1[], WF3x1[], false, WF3x1[], false)
     end
 end
 
@@ -565,9 +566,12 @@ end
 mutable struct NormLayer <: Layer
     activation::ActivationFunction
     alpha::Float64
+    _result::Vector{WF3x1}
+    _norm_init::Bool
+    _conj_buf::Vector{WF3x1}   # conj 작업용 버퍼 (DeltaRule!에서 재사용)
 
     function NormLayer(activation::ActivationFunction= Identity(),alpha::Float64=1.0)
-        new(activation,alpha)
+        new(activation,alpha, WF3x1[], false, WF3x1[])
     end
 
 end 

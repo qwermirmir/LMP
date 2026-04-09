@@ -2789,22 +2789,26 @@ end
 function DeltaRule!(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{WF3x1}, delta::Vector{WF3x1}) where T<:WF3x1
 
     W=layer.W
-    # result=Vector{WF3x1}(undef,length(z))
-    y=similar(z[1])
-    # for i in 1:length(z)
-    #     delta[i]=deepcopy(y)
-    # end
+
+    # conj 버퍼 초기화 (1회만, deepcopy/similar 방지)
+    if !layer._delta_init_dl || typeof(layer._conj_buf[1]) != typeof(z[1])
+        layer._conj_buf = [deepcopy(z[1]), deepcopy(z[1])]  # [conj_d, conj_y]
+        layer._delta_init_dl = true
+    end
+    conj_d = layer._conj_buf[1]
+    conj_y = layer._conj_buf[2]
+    y = layer._yi[1]  # forward에서 이미 초기화된 버퍼 재사용
+
     zero_wf!(delta)
     for k in 1:length(z)
 
         for i in 1:length(d)
 
-            # addmul!(result,adjoint(W[i]),(conj(d[i])))
+            conj!(conj_d, d[i])
+            mul!(y,adjoint(W[i+(k-1)*length(d)]),conj_d)
 
-            mul!(y,adjoint(W[i+(k-1)*length(d)]),(conj(d[i])))
-
-            axpby!(1,conj(y),1,delta[k])
-            # result=result+y
+            conj!(conj_y, y)
+            axpby!(1,conj_y,1,delta[k])
         end 
     end 
     return nothing
@@ -2921,13 +2925,22 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
     end
     invpaths = layer._invpaths
 
-    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 매번 갱신)
+    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 in-place 갱신)
     if length(layer._Wadj) != NW
         layer._Wadj = Vector{typeof(W[1])}(undef, NW)
+        @inbounds for k in 1:NW
+            layer._Wadj[k] = adjoint(W[k])
+        end
     end
     Wadj = layer._Wadj
     @inbounds for k in 1:NW
-        Wadj[k] = adjoint(W[k])
+        wsm = W[k].sm
+        wadj_sm = Wadj[k].sm
+        for j in 1:4
+            for i in 1:4
+                wadj_sm[i,j] = conj(wsm[j,i])
+            end
+        end
     end
 
     # ④ invhops + hop 출력 버퍼 캐시
@@ -3017,20 +3030,30 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
     end
     invpaths = layer._invpaths
 
-    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 매번 갱신)
+    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 in-place 갱신)
     if length(layer._Wadj) != NW
         layer._Wadj = Vector{typeof(W[1])}(undef, NW)
+        @inbounds for k in 1:NW
+            layer._Wadj[k] = adjoint(W[k])
+        end
     end
     Wadj = layer._Wadj
     @inbounds for k in 1:NW
-        Wadj[k] = adjoint(W[k])
+        wsm = W[k].sm
+        wadj_sm = Wadj[k].sm
+        for j in 1:4
+            for i in 1:4
+                wadj_sm[i,j] = conj(wsm[j,i])
+            end
+        end
     end
 
     # ④ invhops + hop 출력 버퍼 캐시 (공유 금지)
     nt = nthreads()
     if isempty(layer._invhops) || length(layer._invhops) != nt
         layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
-        layer._hop_out = [Vector{WF3x1}([deepcopy(z[1])]) for _ in 1:nt]
+        TF = typeof(z[1])
+        layer._hop_out = [Vector{TF}([deepcopy(z[1])]) for _ in 1:nt]
     else
         @inbounds for t in 1:nt
             layer._invhops[t].Gauge = layer.U
@@ -3057,7 +3080,8 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             conj!(delta[i], hop_out[tid][1])
         end
     else
-        ci = deepcopy(z[1])
+        ci = layer._ci_buffers[1]     # GPU: 캐시된 버퍼 재사용 (deepcopy 방지)
+        hop_buf_gpu = Vector{typeof(z[1])}([hop_out[1][1]])  # concrete 타입 벡터로 래핑
 
         for i in 1:Nz
             zero_wf!(ci)
@@ -3067,8 +3091,8 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             end
             invhop = invhops[1]
             invhop.P = invpaths[i]
-            hopped_ci = invhop(ci)[1]
-            conj!(delta[i], hopped_ci)
+            invhop(ci, hop_buf_gpu)          # preallocated 버전 사용 (WF3x1GPU 할당 방지)
+            conj!(delta[i], hop_buf_gpu[1])
         end
     end
 
@@ -3169,23 +3193,27 @@ end
 
 function DeltaRule!(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
 
-
-
-    # result = Vector{WF3x1}(undef, length(z))
-
-
     α = layer.alpha
 
+    # conj 버퍼 초기화 (1회만, deepcopy 방지)
+    if isempty(layer._conj_buf) || typeof(layer._conj_buf[1]) != typeof(z[1])
+        layer._conj_buf = [deepcopy(z[1])]
+    end
+    cj_buf = layer._conj_buf[1]
 
     @inbounds for i in 1:length(z)
-        cz=conj(z[i])
-        norm = sqrt(norm2(z[i]))
-        eta1 = inner_product(cz, d[i])/2                  # z† d
-        eta2 = inner_product(z[i], conj(d[i]))/2            # zᵗ d*
+        nrm = sqrt(norm2(z[i]))
+        inv_n = 1.0 / nrm
+        inv_n3 = inv_n^3
 
-        delta[i] = d[i] / norm
-        delta[i] -= (eta1 * cz) / norm^3
-        delta[i] -= (eta2 * cz) / norm^3
+        conj!(cj_buf, z[i])                       # cj_buf = conj(z[i])  (재사용)
+        eta1 = inner_product(cj_buf, d[i]) / 2
+        # eta2 = conj(eta1) なので eta1+eta2 = 2*real(eta1)
+        coeff = -2 * real(eta1) * inv_n3
+
+        # delta[i] = d[i]/norm + coeff * conj(z[i])
+        axpby!(inv_n, d[i], 0, delta[i])           # delta[i] = d[i] / norm
+        axpby!(coeff, cj_buf, 1, delta[i])          # delta[i] += coeff * conj(z[i])
     end
 
 
