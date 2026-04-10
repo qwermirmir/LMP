@@ -15,7 +15,7 @@ import ..Layer_types: CPTC_Layer, PTC_Layer, Layer,ActivationFunction,Identity ,
 import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,ModRelu,RayleighQuotient_Layer,PtcRayleighQuotient_Layer
 import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer,BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
-import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,_build_block_weight_gpu
+import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!
 
 export gradient, DeltaRule,DeltaRule!
 export Identity, ReLU, Sigmoid, Tanh
@@ -2632,10 +2632,6 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
         end
     end
 
-    # for i in 1:l
-    #     axpby!(0,delta[i], 1/batch, delta[i])  # batch로 나누기
-    # end
-
 
 
 end
@@ -3377,43 +3373,39 @@ function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{WF3x1}, d::Vec
     grad_W = zeros(ComplexF64, nblocks, n)
 
     if z[1] isa WF3x1GPU
-        # GPU: .f broadcast로 사이트별 내적 → 블록별 합산
-        r = layer.r
-        bi = z[1].blockinfo
-        NX, NY, NZ, NT = z[1].NX, z[1].NY, z[1].NZ, z[1].NT
-        NBX = NX÷r; NBY = NY÷r; NBZ = NZ÷r; NBT = NT÷r
-        blocksize = bi.blocksize
-        rsize = bi.rsize
+        # GPU: 캐시된 block_map으로 사이트별 내적 → 블록별 합산
+        bmap = layer._gpu_block_map
+        nblocks_total = length(bmap)
 
         for k in 1:n
-            # 사이트별 내적: sum over color & spinor → (blocksize, rsize) on GPU
-            prod_gpu = conj.(z[k].f) .* d[k].f
+            prod_gpu = d[k].f .* z[k].f
             site_ip = dropdims(sum(prod_gpu, dims=(1,2)), dims=(1,2))
-            site_ip_cpu = Array(site_ip)  # (blocksize, rsize) → CPU
+            site_ip_cpu = Array(site_ip)
 
-            @inbounds for r_idx = 1:rsize
-                for b_idx = 1:blocksize
-                    ix = 1 + mod(div(b_idx-1, bi.blocks_s[1]), bi.blocks[1]) +
-                             mod(div(r_idx-1, bi.blocknumbers_s[1]), bi.blocknumbers[1]) * bi.blocks[1]
-                    iy = 1 + mod(div(b_idx-1, bi.blocks_s[2]), bi.blocks[2]) +
-                             mod(div(r_idx-1, bi.blocknumbers_s[2]), bi.blocknumbers[2]) * bi.blocks[2]
-                    iz = 1 + mod(div(b_idx-1, bi.blocks_s[3]), bi.blocks[3]) +
-                             mod(div(r_idx-1, bi.blocknumbers_s[3]), bi.blocknumbers[3]) * bi.blocks[3]
-                    it = 1 + mod(div(b_idx-1, bi.blocks_s[4]), bi.blocks[4]) +
-                             mod(div(r_idx-1, bi.blocknumbers_s[4]), bi.blocknumbers[4]) * bi.blocks[4]
-                    bx = (ix-1)÷r+1; by = (iy-1)÷r+1; bz = (iz-1)÷r+1; bt = (it-1)÷r+1
-                    block_id = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
-                    grad_W[block_id, k] += site_ip_cpu[b_idx, r_idx]
-                end
+            @inbounds for i in 1:nblocks_total
+                grad_W[bmap[i], k] += conj(site_ip_cpu[i])
             end
         end
     else
-        # CPU: blockize
+        # CPU: block_map으로 직접 내적 (blockize 제거)
+        NC, NG = z[1].NC, z[1].NG
+        NX, NY, NZ, NT = z[1].NX, z[1].NY, z[1].NZ, z[1].NT
+        bmap = layer._block_map
+
         for k in 1:n
-            z_blocks = blockize(z[k], layer.r)
-            d_blocks = blockize(d[k], layer.r)
-            for i in 1:nblocks
-                grad_W[i, k] = inner_product(z_blocks[i], d_blocks[i])
+            zk = z[k]; dk = d[k]
+            site = 0
+            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                site += 1
+                bid = bmap[site]
+                s = zero(ComplexF64)
+                for ig in 1:NG
+                    @simd for ic in 1:NC
+                        # inner_product(conj(d), z) = Σ d*z, then conj → ∂L/∂W*
+                        s += dk[ic, ix, iy, iz, it, ig] * zk[ic, ix, iy, iz, it, ig]
+                    end
+                end
+                grad_W[bid, k] += conj(s)
             end
         end
     end
@@ -3425,28 +3417,63 @@ function DeltaRule(layer::BlockScalar_Layer, ::Identity,
                    z::Vector{WF3x1}, d::Vector{T}) where T<:WF3x1
     n = length(d)
     nblocks = size(layer.W, 1)
-    result = Vector{WF3x1}(undef, n)
+    r = layer.r
+
+    # 출력 버퍼 캐시 (deepcopy 1회만, 또는 GPU↔CPU 전환 시 재초기화)
+    if !layer._initialized || length(layer._result) != n || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(d[1]))
+        layer._result = Vector{WF3x1}(undef, n)
+        for k in 1:n
+            layer._result[k] = deepcopy(d[k])
+        end
+        if d[1] isa WF3x1GPU
+            _init_gpu_block_cache!(layer, d[1])
+        elseif isempty(layer._block_map)
+            NX, NY, NZ, NT = d[1].NX, d[1].NY, d[1].NZ, d[1].NT
+            NBX = NX÷r; NBY = NY÷r; NBZ = NZ÷r; NBT = NT÷r
+            nsites = NX * NY * NZ * NT
+            layer._block_map = Vector{Int}(undef, nsites)
+            idx = 0
+            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                idx += 1
+                bx = (ix-1)÷r + 1; by = (iy-1)÷r + 1
+                bz = (iz-1)÷r + 1; bt = (it-1)÷r + 1
+                layer._block_map[idx] = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
+            end
+        end
+        layer._initialized = true
+    end
+    result = layer._result
 
     if d[1] isa WF3x1GPU
-        # GPU: broadcast
         for k in 1:n
-            result[k] = deepcopy(d[k])
-            w_gpu = _build_block_weight_gpu(conj.(view(layer.W, :, k)), layer.r, d[k])
+            w_gpu = _update_block_weight_gpu!(layer, view(layer.W, :, k))
             result[k].f .= w_gpu .* d[k].f
             if layer.residual
                 axpby!(1, d[k], 1, result[k])
             end
         end
     else
-        # CPU: blockize
+        # CPU: block_map으로 직접 스칼라 곱 (blockize/unblockize 제거)
+        NC, NG = d[1].NC, d[1].NG
+        NX, NY, NZ, NT = d[1].NX, d[1].NY, d[1].NZ, d[1].NT
+        bmap = layer._block_map
+        W = layer.W
+
         for k in 1:n
-            d_blocks = blockize(d[k], layer.r)
-            for i in 1:nblocks
-                axpby!(conj(layer.W[i, k]), d_blocks[i], 0, d_blocks[i])
+            rk = result[k]
+            dk = d[k]
+            site = 0
+            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                site += 1
+                w = W[bmap[site], k]
+                for ig in 1:NG
+                    @simd for ic in 1:NC
+                        rk[ic, ix, iy, iz, it, ig] = w * dk[ic, ix, iy, iz, it, ig]
+                    end
+                end
             end
-            result[k] = unblockize(d_blocks)
             if layer.residual
-                axpby!(1, d[k], 1, result[k])
+                axpby!(1, dk, 1, rk)
             end
         end
     end
@@ -3457,26 +3484,38 @@ function DeltaRule!(layer::BlockScalar_Layer, ::Identity,
                     z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
     n = length(d)
     nblocks = size(layer.W, 1)
+    r = layer.r
 
     if d[1] isa WF3x1GPU
-        # GPU: broadcast
         for k in 1:n
-            w_gpu = _build_block_weight_gpu(conj.(view(layer.W, :, k)), layer.r, d[k])
+            w_gpu = _update_block_weight_gpu!(layer, view(layer.W, :, k))
             delta[k].f .= w_gpu .* d[k].f
             if layer.residual
                 axpby!(1, d[k], 1, delta[k])
             end
         end
     else
-        # CPU: blockize
+        # CPU: block_map으로 직접 스칼라 곱 (blockize/unblockize 제거)
+        NC, NG = d[1].NC, d[1].NG
+        NX, NY, NZ, NT = d[1].NX, d[1].NY, d[1].NZ, d[1].NT
+        bmap = layer._block_map
+        W = layer.W
+
         for k in 1:n
-            d_blocks = blockize(d[k], layer.r)
-            for i in 1:nblocks
-                axpby!(conj(layer.W[i, k]), d_blocks[i], 0, d_blocks[i])
+            dk_out = delta[k]
+            dk = d[k]
+            site = 0
+            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                site += 1
+                w = W[bmap[site], k]
+                for ig in 1:NG
+                    @simd for ic in 1:NC
+                        dk_out[ic, ix, iy, iz, it, ig] = w * dk[ic, ix, iy, iz, it, ig]
+                    end
+                end
             end
-            copyto!(delta[k].f, unblockize(d_blocks).f)
             if layer.residual
-                axpby!(1, d[k], 1, delta[k])
+                axpby!(1, dk, 1, dk_out)
             end
         end
     end
