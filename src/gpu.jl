@@ -839,7 +839,59 @@ function _build_block_weight_gpu(W_col::AbstractVector{<:Number}, r::Int, x::WF3
     return CuArray(reshape(w_cpu, 1, 1, blocksize, rsize))
 end
 
-export _build_block_weight_gpu
+"""
+    _init_gpu_block_cache!(layer, x)
+
+GPU용 block 인덱스 맵 + 버퍼를 1회만 초기화.
+`layer._gpu_block_map[linear_idx]` = block_id 로, W 값만 갱신하면 됨.
+"""
+function _init_gpu_block_cache!(layer, x::WF3x1GPU)
+    bi = x.blockinfo
+    r = layer.r
+    NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
+    NBX = NX÷r; NBY = NY÷r; NBZ = NZ÷r; NBT = NT÷r
+    blocksize = bi.blocksize
+    rsize = bi.rsize
+
+    bmap = Vector{Int}(undef, blocksize * rsize)
+    idx = 0
+    @inbounds for r_idx = 1:rsize
+        for b_idx = 1:blocksize
+            idx += 1
+            ix = 1 + mod(div(b_idx-1, bi.blocks_s[1]), bi.blocks[1]) +
+                     mod(div(r_idx-1, bi.blocknumbers_s[1]), bi.blocknumbers[1]) * bi.blocks[1]
+            iy = 1 + mod(div(b_idx-1, bi.blocks_s[2]), bi.blocks[2]) +
+                     mod(div(r_idx-1, bi.blocknumbers_s[2]), bi.blocknumbers[2]) * bi.blocks[2]
+            iz = 1 + mod(div(b_idx-1, bi.blocks_s[3]), bi.blocks[3]) +
+                     mod(div(r_idx-1, bi.blocknumbers_s[3]), bi.blocknumbers[3]) * bi.blocks[3]
+            it = 1 + mod(div(b_idx-1, bi.blocks_s[4]), bi.blocks[4]) +
+                     mod(div(r_idx-1, bi.blocknumbers_s[4]), bi.blocknumbers[4]) * bi.blocks[4]
+            bx = (ix-1)÷r + 1; by = (iy-1)÷r + 1
+            bz = (iz-1)÷r + 1; bt = (it-1)÷r + 1
+            bmap[idx] = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
+        end
+    end
+    layer._gpu_block_map = bmap
+    layer._gpu_w_cpu = zeros(ComplexF64, blocksize, rsize)
+    layer._gpu_w_buf = CUDA.zeros(ComplexF64, 1, 1, blocksize, rsize)
+end
+
+"""
+    _update_block_weight_gpu!(layer, W_col)
+
+캐시된 맵으로 CPU 배열 갱신 → CuArray에 copyto! (할당 0)
+"""
+function _update_block_weight_gpu!(layer, W_col::AbstractVector{<:Number})
+    bmap = layer._gpu_block_map
+    w_cpu = layer._gpu_w_cpu
+    @inbounds for i in eachindex(bmap)
+        w_cpu[i] = W_col[bmap[i]]
+    end
+    copyto!(layer._gpu_w_buf, reshape(w_cpu, 1, 1, size(w_cpu)...))
+    return layer._gpu_w_buf
+end
+
+export _build_block_weight_gpu, _init_gpu_block_cache!, _update_block_weight_gpu!
 
 
 end # module gpu

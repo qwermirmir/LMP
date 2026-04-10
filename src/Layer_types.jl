@@ -646,13 +646,23 @@ mutable struct BlockScalar_Layer <: Layer
     r::Int
     residual::Bool
     activation::ActivationFunction
+    # --- 캐시 버퍼 (매 호출 deepcopy/blockize 방지) ---
+    _result::Vector{WF3x1}      # forward/DeltaRule 출력 버퍼
+    _blocks::Vector{Vector{WF3x1}}  # 벡터별 blockize 결과 캐시 (CPU)
+    _block_map::Vector{Int}     # site→block_id 인덱스 맵 (CPU, 전체 사이트 수)
+    _gpu_block_map::Vector{Int} # (b_idx, r_idx) → block_id 맵 (GPU용, blocksize*rsize)
+    _gpu_w_buf::Any             # CuArray{ComplexF64,4} 재사용 버퍼 (1,1,blocksize,rsize)
+    _gpu_w_cpu::Matrix{ComplexF64}  # CPU 작업 배열 (blocksize, rsize)
+    _initialized::Bool
 
     function BlockScalar_Layer(x::WF3x1, n::Int, r::Int,
                                residual::Bool=false,
                                activation::ActivationFunction=Identity())
         nblocks = (x.NX ÷ r) * (x.NY ÷ r) * (x.NZ ÷ r) * (x.NT ÷ r)
         W = ones(ComplexF64, nblocks, n)
-        new(W, r, residual, activation)
+        new(W, r, residual, activation,
+            WF3x1[], Vector{WF3x1}[], Int[], Int[], nothing,
+            Matrix{ComplexF64}(undef, 0, 0), false)
     end
 end
 

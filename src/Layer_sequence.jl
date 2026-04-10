@@ -11,7 +11,7 @@ import ..elementry_base: Hopping_operator, Spin_matrix, inner_product,g2vector_g
 import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minmax,spincolortrace
 import ..Optimizer: Opt, update!, Adam
 import ..activation:  gradient, DeltaRule,DeltaRule!
-import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu
+import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!
 import ..Layer_types: DenseLinearLayer, PTLayer,fermionfield_Layer,GramSchmidt_Layer
 import ..Layer_types: BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
@@ -174,6 +174,16 @@ end
 
 # --- 기본: GPU 성분이 없는 Layer ---
 _to_cpu(layer::Layer) = layer
+
+# --- BlockScalar_Layer: GPU 캐시 클리어 ---
+function _to_cpu(layer::BlockScalar_Layer)
+    layer._gpu_w_buf = nothing
+    layer._gpu_w_cpu = Matrix{ComplexF64}(undef, 0, 0)
+    layer._gpu_block_map = Int[]
+    layer._result = WF3x1[]
+    layer._initialized = false
+    return layer
+end
 
 # --- PTC_Layer ---
 function _to_cpu(layer::PTC_Layer)
@@ -374,6 +384,17 @@ end
 
 # --- 기본: CPU 전용 성분만 있는 Layer ---
 _to_gpu(layer::Layer) = layer
+
+# --- BlockScalar_Layer: 캐시 리셋 (GPU 초기화는 forward에서 자동) ---
+function _to_gpu(layer::BlockScalar_Layer)
+    layer._gpu_w_buf = nothing
+    layer._gpu_w_cpu = Matrix{ComplexF64}(undef, 0, 0)
+    layer._gpu_block_map = Int[]
+    layer._result = WF3x1[]
+    layer._block_map = Int[]
+    layer._initialized = false
+    return layer
+end
 
 # --- PTC_Layer ---
 function _to_gpu(layer::PTC_Layer)
@@ -1126,8 +1147,8 @@ _refresh_layer!(layer::Layer, D_new, U_new) = nothing
 
 function (layer::NormLayer)(x::AbstractVector{<:WF3x1})
     n = length(x)
-    # 캠시 존재하면 재사용
-    if !layer._norm_init || length(layer._result) != n
+    # 캐시 존재하면 재사용 (GPU↔CPU 전환 시 재초기화)
+    if !layer._norm_init || length(layer._result) != n || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(x[1]))
         layer._result = [deepcopy(x[i]) for i in 1:n]
         layer._norm_init = true
     end
@@ -1377,28 +1398,66 @@ end
 function (layer::BlockScalar_Layer)(x::AbstractVector{<:WF3x1})
     n = length(x)
     nblocks = size(layer.W, 1)
-    result = Vector{WF3x1}(undef, n)
+    r = layer.r
+
+    # ── 캐시 초기화 (1회만, 또는 GPU↔CPU 전환 시 재초기화) ──
+    if !layer._initialized || length(layer._result) != n || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(x[1]))
+        layer._result = Vector{WF3x1}(undef, n)
+        for k in 1:n
+            layer._result[k] = deepcopy(x[k])
+        end
+        if x[1] isa WF3x1GPU
+            # GPU용 block map + CuArray 버퍼 캐시
+            _init_gpu_block_cache!(layer, x[1])
+        else
+            # CPU용 block_map: 사이트 좌표 → block_id 매핑 (1회 계산)
+            NX, NY, NZ, NT = x[1].NX, x[1].NY, x[1].NZ, x[1].NT
+            NBX = NX÷r; NBY = NY÷r; NBZ = NZ÷r; NBT = NT÷r
+            nsites = NX * NY * NZ * NT
+            layer._block_map = Vector{Int}(undef, nsites)
+            idx = 0
+            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                idx += 1
+                bx = (ix-1)÷r + 1; by = (iy-1)÷r + 1
+                bz = (iz-1)÷r + 1; bt = (it-1)÷r + 1
+                layer._block_map[idx] = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
+            end
+        end
+        layer._initialized = true
+    end
+
+    result = layer._result
 
     if x[1] isa WF3x1GPU
-        # GPU: broadcast 곱셈 (.f 직접 조작)
         for k in 1:n
-            result[k] = deepcopy(x[k])
-            w_gpu = _build_block_weight_gpu(view(layer.W, :, k), layer.r, x[k])
+            w_gpu = _update_block_weight_gpu!(layer, view(layer.W, :, k))
             result[k].f .= w_gpu .* x[k].f
             if layer.residual
                 axpby!(1, x[k], 1, result[k])
             end
         end
     else
-        # CPU: blockize/unblockize
+        # CPU: block_map으로 직접 스칼라 곱 (blockize/unblockize 제거)
+        NC, NG = x[1].NC, x[1].NG
+        NX, NY, NZ, NT = x[1].NX, x[1].NY, x[1].NZ, x[1].NT
+        bmap = layer._block_map
+        W = layer.W
+
         for k in 1:n
-            blocks = blockize(x[k], layer.r)
-            for i in 1:nblocks
-                axpby!(layer.W[i, k], blocks[i], 0, blocks[i])
+            rk = result[k]
+            xk = x[k]
+            site = 0
+            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                site += 1
+                w = W[bmap[site], k]
+                for ig in 1:NG
+                    @simd for ic in 1:NC
+                        rk[ic, ix, iy, iz, it, ig] = w * xk[ic, ix, iy, iz, it, ig]
+                    end
+                end
             end
-            result[k] = unblockize(blocks)
             if layer.residual
-                axpby!(1, x[k], 1, result[k])
+                axpby!(1, xk, 1, rk)
             end
         end
     end
@@ -1895,6 +1954,7 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
 
     line.set_xdata(1:length(loss_history))
     line.set_ydata(loss_history)
+    ax.set_yscale("log")  # 손실이 크게 변할 수 있으므로 로그 스케일로 설정
     ax.relim()
     ax.autoscale_view()
     fig.canvas.draw()
