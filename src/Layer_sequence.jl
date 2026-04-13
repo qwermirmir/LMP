@@ -12,7 +12,7 @@ import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minma
 import ..Optimizer: Opt, update!, Adam
 import ..activation:  gradient, DeltaRule,DeltaRule!
 import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,Matmul_batch!
-import ..gpu: sync_W_to_gpu!,pack_fermions!,unpack_fermions!,batched_forward!,fused_hopping_gpu!,fused_wilson_mul_gpu!,batched_hopping_steps_gpu!
+import ..gpu: sync_W_to_gpu!,pack_fermions!,unpack_fermions!,batched_forward!,fused_hopping_gpu!,fused_wilson_mul_gpu!,batched_hopping_steps_gpu!,get_shared_buf!
 import ..Layer_types: DenseLinearLayer, PTLayer,fermionfield_Layer,GramSchmidt_Layer
 import ..Layer_types: BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
@@ -1107,12 +1107,16 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     @assert length(W) == Out * npaths "W의 길이는 Out*paths이어야 합니다."
 
     # 1) 캐시 버퍼를 한 번만 할당, 이후 재사용
-    if !layer._initialized || length(layer._hopped) != npaths || length(layer._result) != Out
-        layer._hopped = Vector{WF3x1}(undef, npaths)
-        layer._result = Vector{WF3x1}(undef, Out)
-        for i in 1:npaths
-            layer._hopped[i] = deepcopy(x[1])
+    _is_gpu_pt = x[1] isa WF3x1GPU
+    if !layer._initialized || length(layer._result) != Out
+        if !_is_gpu_pt
+            # CPU path에서만 _hopped 필요
+            layer._hopped = Vector{WF3x1}(undef, npaths)
+            for i in 1:npaths
+                layer._hopped[i] = deepcopy(x[1])
+            end
         end
+        layer._result = Vector{WF3x1}(undef, Out)
         for j in 1:Out
             layer._result[j] = deepcopy(x[1])
         end
@@ -1158,9 +1162,11 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             layer._W_gpu      = CUDA.zeros(ComplexF64, NG, NG, NW)
             layer._Wadj_gpu   = CUDA.zeros(ComplexF64, NG, NG, NW)
             layer._hopped_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, npaths)
-            layer._result_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Out)
             sync_W_to_gpu!(layer._W_gpu, W)
         end
+        # 공유 임시 버퍼 (layers 간 재사용 — forward 직후 unpack되므로 안전)
+        _result_buf = get_shared_buf!(:result_all, NC, NG, blocksize, rsize, Out)
+        _hop_temp   = get_shared_buf!(:hop_temp, NC, NG, blocksize, rsize, npaths)
 
         # lazy init batched hop tables
         if layer._hop_dirs_gpu === nothing
@@ -1192,24 +1198,23 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             end
             layer._hop_dirs_gpu   = CuArray(dirs_cpu)
             layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
-            layer._hop_temp_5d    = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, npaths)
         end
 
         # Batched hop: pack x → hopped_all, then max_steps batched kernels
         if layer._hop_max_steps > 0
             batched_hopping_steps_gpu!(
-                layer._hopped_all, layer._hop_temp_5d, x,
+                layer._hopped_all, _hop_temp, x,
                 layer.U, layer._hop_dirs_gpu, layer._hop_nsteps_gpu,
                 layer._hop_max_steps, npaths, blocksize, rsize)
         else
             pack_fermions!(layer._hopped_all, x)
         end
 
-        # 1회 batched forward kernel
-        batched_forward!(layer._result_all, layer._W_gpu, layer._hopped_all, blocksize, rsize, npaths, Out)
+        # 1회 batched forward kernel (공유 버퍼 사용)
+        batched_forward!(_result_buf, layer._W_gpu, layer._hopped_all, blocksize, rsize, npaths, Out)
 
         # unpack result_all → result
-        unpack_fermions!(result, layer._result_all)
+        unpack_fermions!(result, _result_buf)
     end
 
     return result
