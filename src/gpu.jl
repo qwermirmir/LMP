@@ -1346,6 +1346,30 @@ export fused_hopping_gpu!
 export fused_wilson_mul_gpu!
 export batched_hopping_steps_gpu!
 export batched_inv_hopping_gpu!
+export get_shared_buf!
+
+# ============================================================
+#  Shared GPU buffer pool — layers 간 임시 버퍼 공유
+#  (result_all, d_buf, ci_all, hop_temp 등 forward/backward 직후
+#   unpack되어 재사용 가능한 버퍼를 공유하여 GPU 메모리 절약)
+# ============================================================
+const _shared_gpu_pool = Dict{Tuple{Symbol,Int}, CuArray{ComplexF64,5}}()
+
+"""
+    get_shared_buf!(key, NC, NG, bs, rs, n) → CuArray{ComplexF64,5}
+
+Shared 5D GPU buffer. 동일 (key, n) 조합은 동일 CuArray를 반환.
+PTLayer 인스턴스 간 임시 버퍼를 공유하여 GPU 메모리를 절약.
+"""
+function get_shared_buf!(key::Symbol, NC::Int, NG::Int, bs::Int, rs::Int, n::Int)
+    k = (key, n)
+    buf = get(_shared_gpu_pool, k, nothing)
+    if buf === nothing || size(buf, 3) != bs || size(buf, 4) != rs
+        buf = CUDA.zeros(ComplexF64, NC, NG, bs, rs, n)
+        _shared_gpu_pool[k] = buf
+    end
+    return buf
+end
 
 # ============================================================
 #  Fused Wilson Dirac kernel — replaces external mul!(y, D, x)

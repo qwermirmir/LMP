@@ -17,7 +17,7 @@ import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttenti
 import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer,BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
 import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,Matmul_batch!,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!
-import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!
+import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!,get_shared_buf!
 
 export gradient, DeltaRule,DeltaRule!
 export Identity, ReLU, Sigmoid, Tanh
@@ -2785,7 +2785,7 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
     @assert length(W) == npaths*Out "The length of W must be equal to length(paths)*Out."
 
     # forward에서 캐싱된 hopped 결과 재사용 (hop 재계산 방지)
-    if layer._initialized && length(layer._hopped) == npaths
+    if layer._initialized && (layer._hopped_all !== nothing || length(layer._hopped) == npaths)
         if d[1] isa WF3x1GPU && layer._hopped_all !== nothing
             # GPU batched: 625개 kernel → 1회 launch, GPU→CPU 전송 없음
             blocksize = d[1].blockinfo.blocksize
@@ -2867,18 +2867,24 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
         zero_wf!(result[i])
     end
 
-    # ① d_conj 버퍼 캐시
-    if !layer._delta_init || length(layer._d_conj_buf) != Nd
-        layer._d_conj_buf = Vector{WF3x1}(undef, Nd)
-        for i in 1:Nd
-            layer._d_conj_buf[i] = deepcopy(d[1])
+    # ① d_conj 버퍼 캐시 — CPU path에서만 필요
+    is_gpu = z[1] isa WF3x1GPU && layer._W_gpu !== nothing
+
+    if !is_gpu
+        if !layer._delta_init || length(layer._d_conj_buf) != Nd
+            layer._d_conj_buf = Vector{WF3x1}(undef, Nd)
+            for i in 1:Nd
+                layer._d_conj_buf[i] = deepcopy(d[1])
+            end
+            layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
+            layer._delta_init = true
         end
-        layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
+        d_conj = layer._d_conj_buf
+        @inbounds for j in 1:Nd
+            conj!(d_conj[j], d[j])
+        end
+    elseif !layer._delta_init
         layer._delta_init = true
-    end
-    d_conj = layer._d_conj_buf
-    @inbounds for j in 1:Nd
-        conj!(d_conj[j], d[j])
     end
 
     # ② 역경로 캐시 (paths 불변이므로 1회만 계산)
@@ -2890,40 +2896,44 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
     end
     invpaths = layer._invpaths
 
-    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 in-place 갱신)
-    if length(layer._Wadj) != NW
-        layer._Wadj = Vector{typeof(W[1])}(undef, NW)
-        @inbounds for k in 1:NW
-            layer._Wadj[k] = adjoint(W[k])
+    # ③ Wadj 캐시 — CPU path에서만 필요
+    if !is_gpu
+        if length(layer._Wadj) != NW
+            layer._Wadj = Vector{typeof(W[1])}(undef, NW)
+            @inbounds for k in 1:NW
+                layer._Wadj[k] = adjoint(W[k])
+            end
         end
-    end
-    Wadj = layer._Wadj
-    @inbounds for k in 1:NW
-        wsm = W[k].sm
-        wadj_sm = Wadj[k].sm
-        for j in 1:4
-            for i in 1:4
-                wadj_sm[i,j] = conj(wsm[j,i])
+        Wadj = layer._Wadj
+        @inbounds for k in 1:NW
+            wsm = W[k].sm
+            wadj_sm = Wadj[k].sm
+            for j in 1:4
+                for i in 1:4
+                    wadj_sm[i,j] = conj(wsm[j,i])
+                end
             end
         end
     end
 
-    # ④ invhops + hop 출력 버퍼 캐시
-    nt = nthreads()
-    if isempty(layer._invhops) || length(layer._invhops) != nt
-        layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
-        layer._hop_out = [Vector{WF3x1}([deepcopy(z[1])]) for _ in 1:nt]
-    else
-        @inbounds for t in 1:nt
-            layer._invhops[t].Gauge = layer.U
+    # ④ invhops + hop 출력 버퍼 캐시 (CPU path에서만 필요)
+    if !is_gpu
+        nt = nthreads()
+        if isempty(layer._invhops) || length(layer._invhops) != nt
+            layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
+            layer._hop_out = [Vector{WF3x1}([deepcopy(z[1])]) for _ in 1:nt]
+        else
+            @inbounds for t in 1:nt
+                layer._invhops[t].Gauge = layer.U
+            end
         end
     end
-    invhops = layer._invhops
-    hop_out = layer._hop_out
 
     # ⑤ 최적화: 먼저 c_i = Σ_j Wadj_{ij} * d_conj[j] 계산 후, hop 1회만 수행
     if z[1] isa WF3x1CPU
         ci_buffers = layer._ci_buffers
+        invhops = layer._invhops
+        hop_out = layer._hop_out
 
         @threads for i in 1:Nz
             tid = threadid()
@@ -2952,7 +2962,7 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
         else
             Wadj_cpu = Array{ComplexF64}(undef, NG, NG, NW)
             @inbounds for k in 1:NW
-                sm = Wadj[k].sm
+                sm = layer._Wadj[k].sm
                 for jj in 1:4, ii in 1:4
                     Wadj_cpu[ii, jj, k] = sm[ii, jj]
                 end
@@ -2960,16 +2970,14 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
             copyto!(layer._Wadj_gpu, Wadj_cpu)
         end
 
-        if layer._d_buf === nothing || size(layer._d_buf, 5) != Nd
-            layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nd)
-        end
-        pack_fermions!(layer._d_buf, d)
+        # d_buf, ci_all: 공유 임시 버퍼 사용 (layers 간 재사용)
+        _d_buf = get_shared_buf!(:d_buf, NC, NG, blocksize, rsize, Nd)
+        pack_fermions!(_d_buf, d)
 
-        if layer._ci_all === nothing || size(layer._ci_all, 5) != Nz
-            layer._ci_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nz)
-        end
+        _ci_buf = get_shared_buf!(:ci_all, NC, NG, blocksize, rsize, Nz)
 
-        batched_delta!(layer._ci_all, layer._Wadj_gpu, layer._d_buf, blocksize, rsize, Nd, Nz)
+        # 1회 batched kernel: ci_all = Σ_j Wadj * conj(d)
+        batched_delta!(_ci_buf, layer._Wadj_gpu, _d_buf, blocksize, rsize, Nd, Nz)
 
         # lazy init inverse direction table (forward init이 안 된 경우 여기서 수행)
         if layer._inv_hop_dirs_gpu === nothing
@@ -2998,9 +3006,6 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
                 end
                 layer._hop_dirs_gpu   = CuArray(dirs_cpu)
                 layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
-                if layer._hop_temp_5d === nothing
-                    layer._hop_temp_5d = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nz)
-                end
             end
 
             max_steps = layer._hop_max_steps
@@ -3015,18 +3020,23 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
             layer._inv_hop_dirs_gpu = CuArray(inv_dirs_cpu)
         end
 
+        # batched inverse hop: ci_buf ↔ shared hop_temp
         max_steps = layer._hop_max_steps
         if max_steps > 0
+            _hop_temp = get_shared_buf!(:hop_temp, NC, NG, blocksize, rsize, Nz)
             bi = z[1].blockinfo
             NXl = z[1].NX; NYl = z[1].NY; NZl = z[1].NZ; NTl = z[1].NT
             batched_inv_hopping_gpu!(
-                layer._ci_all, layer._hop_temp_5d, layer.U,
+                _ci_buf, _hop_temp, layer.U,
                 layer._inv_hop_dirs_gpu, layer._hop_nsteps_gpu,
                 max_steps, Nz, blocksize, rsize, bi, NXl, NYl, NZl, NTl)
         end
 
-        layer._ci_all .= conj.(layer._ci_all)
-        unpack_fermions!(result, layer._ci_all)
+        # batch conj
+        _ci_buf .= conj.(_ci_buf)
+
+        # unpack → result
+        unpack_fermions!(result, _ci_buf)
     end
 
     return result
@@ -3064,8 +3074,7 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             conj!(d_conj[i], d[i])
         end
     elseif !layer._delta_init
-        # GPU path에서도 ci_buffers는 필요 (ci unpack 용)
-        layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
+        # GPU path: ci_buffers, invhops, hop_out 불필요 (batched 처리)
         layer._delta_init = true
     end
 
@@ -3098,23 +3107,25 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
         end
     end
 
-    # ④ invhops + hop 출력 버퍼 캐시 (공유 금지)
-    nt = nthreads()
-    if isempty(layer._invhops) || length(layer._invhops) != nt
-        layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
-        TF = typeof(z[1])
-        layer._hop_out = [Vector{TF}([deepcopy(z[1])]) for _ in 1:nt]
-    else
-        @inbounds for t in 1:nt
-            layer._invhops[t].Gauge = layer.U
+    # ④ invhops + hop 출력 버퍼 캐시 (CPU path에서만 필요)
+    if !is_gpu
+        nt = nthreads()
+        if isempty(layer._invhops) || length(layer._invhops) != nt
+            layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
+            TF = typeof(z[1])
+            layer._hop_out = [Vector{TF}([deepcopy(z[1])]) for _ in 1:nt]
+        else
+            @inbounds for t in 1:nt
+                layer._invhops[t].Gauge = layer.U
+            end
         end
     end
-    invhops = layer._invhops
-    hop_out = layer._hop_out
 
     # ⑤ 최적화: 먼저 c_i = Σ_j Wadj_{ij} * d_conj[j] 계산 후, hop 1회만 수행
     if z[1] isa WF3x1CPU
         ci_buffers = layer._ci_buffers
+        invhops = layer._invhops
+        hop_out = layer._hop_out
 
         @threads for i in 1:Nz
             tid = threadid()
@@ -3153,19 +3164,14 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             copyto!(layer._Wadj_gpu, Wadj_cpu)
         end
 
-        # d_buf: d를 pack (conj는 커널 내부에서 수행)
-        if layer._d_buf === nothing || size(layer._d_buf, 5) != Nd
-            layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nd)
-        end
-        pack_fermions!(layer._d_buf, d)
+        # d_buf, ci_all: 공유 임시 버퍼 사용 (layers 간 재사용)
+        _d_buf = get_shared_buf!(:d_buf, NC, NG, blocksize, rsize, Nd)
+        pack_fermions!(_d_buf, d)
 
-        # ci_all: batched 결과 버퍼
-        if layer._ci_all === nothing || size(layer._ci_all, 5) != Nz
-            layer._ci_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nz)
-        end
+        _ci_buf = get_shared_buf!(:ci_all, NC, NG, blocksize, rsize, Nz)
 
         # 1회 batched kernel: ci_all = Σ_j Wadj * conj(d)
-        batched_delta!(layer._ci_all, layer._Wadj_gpu, layer._d_buf, blocksize, rsize, Nd, Nz)
+        batched_delta!(_ci_buf, layer._Wadj_gpu, _d_buf, blocksize, rsize, Nd, Nz)
 
         # lazy init inverse direction table for batched backward hop
         if layer._inv_hop_dirs_gpu === nothing
@@ -3200,9 +3206,6 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
                 end
                 layer._hop_dirs_gpu   = CuArray(dirs_cpu)
                 layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
-                if layer._hop_temp_5d === nothing
-                    layer._hop_temp_5d = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nz)
-                end
             end
 
             max_steps = layer._hop_max_steps
@@ -3222,22 +3225,23 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             layer._inv_hop_dirs_gpu = CuArray(inv_dirs_cpu)
         end
 
-        # batched inverse hop: ci_all ↔ _hop_temp_5d
+        # batched inverse hop: ci_buf ↔ shared hop_temp
         max_steps = layer._hop_max_steps
         if max_steps > 0
+            _hop_temp = get_shared_buf!(:hop_temp, NC, NG, blocksize, rsize, Nz)
             bi = z[1].blockinfo
             NX = z[1].NX; NY = z[1].NY; NZ_ = z[1].NZ; NT = z[1].NT
             batched_inv_hopping_gpu!(
-                layer._ci_all, layer._hop_temp_5d, layer.U,
+                _ci_buf, _hop_temp, layer.U,
                 layer._inv_hop_dirs_gpu, layer._hop_nsteps_gpu,
                 max_steps, Nz, blocksize, rsize, bi, NX, NY, NZ_, NT)
         end
 
-        # batch conj: ci_all .= conj.(ci_all)
-        layer._ci_all .= conj.(layer._ci_all)
+        # batch conj
+        _ci_buf .= conj.(_ci_buf)
 
         # unpack → delta
-        unpack_fermions!(delta, layer._ci_all)
+        unpack_fermions!(delta, _ci_buf)
     end
 
     return nothing
