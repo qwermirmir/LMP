@@ -11,7 +11,8 @@ import ..elementry_base: Hopping_operator, Spin_matrix, inner_product,g2vector_g
 import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minmax,spincolortrace
 import ..Optimizer: Opt, update!, Adam
 import ..activation:  gradient, DeltaRule,DeltaRule!
-import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!
+import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,Matmul_batch!
+import ..gpu: sync_W_to_gpu!,pack_fermions!,unpack_fermions!,batched_forward!,fused_hopping_gpu!,fused_wilson_mul_gpu!,batched_hopping_steps_gpu!
 import ..Layer_types: DenseLinearLayer, PTLayer,fermionfield_Layer,GramSchmidt_Layer
 import ..Layer_types: BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
@@ -50,17 +51,61 @@ export _to_cpu, _to_gpu,_to_cpu_gauge
 function substitute_Layer!(layers::Vector{<:Layer})
     # 첫 번째 layer의 GPU/CPU 여부를 판별하여 반대 방향으로 변환
     if _is_gpu_layer(layers)
-        # GPU → CPU
+        # GPU → CPU 전 blocks 정보 추출 (CPU→GPU 재변환 시 필요)
+        _gpu_blocks = _extract_gpu_blocks(layers)
         for i in eachindex(layers)
             layers[i] = _to_cpu(layers[i])
         end
+        # blocks 정보를 _saved_blocks에 저장
+        if _gpu_blocks !== nothing
+            _saved_blocks[] = _gpu_blocks
+        end
     else
-        # CPU → GPU
+        # CPU → GPU: 이전에 저장한 blocks 정보 사용
+        blks = _saved_blocks[]
         for i in eachindex(layers)
-            layers[i] = _to_gpu(layers[i])
+            layers[i] = _to_gpu(layers[i], blks)
         end
     end
     return layers
+end
+
+# 모듈 레벨에서 blocks 정보 저장
+const _saved_blocks = Ref{Any}(nothing)
+
+# GPU gauge에서 blocks 정보 추출
+function _extract_gpu_blocks(layers::Vector{<:Layer})
+    for layer in layers
+        blks = _get_blocks(layer)
+        if blks !== nothing
+            return blks
+        end
+    end
+    return nothing
+end
+
+_get_blocks(::Layer) = nothing
+function _get_blocks(layer::PTLayer)
+    if eltype(layer.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+        bi = layer.U[1].blockinfo
+        return bi.blocks
+    end
+    return nothing
+end
+function _get_blocks(layer::Ritz_Layer)
+    try
+        U = layer.D.U
+        if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+            return U[1].blockinfo.blocks
+        end
+    catch; end
+    return nothing
+end
+function _get_blocks(layer::HoppingRayleighQuotient_Layer)
+    if eltype(layer.hop.Gauge) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+        return layer.hop.Gauge[1].blockinfo.blocks
+    end
+    return nothing
 end
 
 # --- Layer 벡터가 GPU인지 판별 ---
@@ -301,6 +346,12 @@ end
 # --- Ritz_Layer ---
 function _to_cpu(layer::Ritz_Layer)
     layer.D = _to_cpu_dirac(layer.D)
+    # GPU↔CPU 전환 시 캐시 무효화
+    layer._ritz_init = false
+    layer._Dz = Any[]
+    layer._DdagDz = Any[]
+    layer._VD = Any[]
+    layer._work = Any[]
     return layer
 end
 
@@ -316,20 +367,24 @@ end
 # ============================================================
 
 # --- CPU→GPU gauge field 변환 ---
-function _to_gpu_gauge(U::Vector{G}) where {G<:AbstractGaugefields}
+function _to_gpu_gauge(U::Vector{G}; blocks=nothing) where {G<:AbstractGaugefields}
     if G <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
         return U  # 이미 GPU
     end
     NC = U[1].NC
     NX = U[1].NX; NY = U[1].NY; NZ = U[1].NZ; NT = U[1].NT
-    Ugpu = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true)
+    if blocks !== nothing
+        Ugpu = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true, blocks=blocks)
+    else
+        Ugpu = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true)
+    end
     substitute_U!(Ugpu, U)
     return Ugpu
 end
 
 # --- CPU→GPU Hopping_operator 변환 ---
-function _to_gpu_hop(hop::Hopping_operator)
-    Ugpu = _to_gpu_gauge(hop.Gauge)
+function _to_gpu_hop(hop::Hopping_operator; blocks=nothing)
+    Ugpu = _to_gpu_gauge(hop.Gauge; blocks=blocks)
     if Ugpu === hop.Gauge
         return hop
     end
@@ -341,23 +396,31 @@ _to_gpu_W(W::Vector{Spin_matrix_GPU}) = W
 _to_gpu_W(W::Vector{Spin_matrix}) = [Spin_matrix_GPU(w) for w in W]
 
 # --- CPU→GPU fermion field 변환 ---
-function _to_gpu_fermion(x::WF3x1CPU)
+function _to_gpu_fermion(x::WF3x1CPU; blocks=nothing)
     NC = x.NC
     NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT
-    Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true)
+    if blocks !== nothing
+        Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true, blocks=blocks)
+    else
+        Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true)
+    end
     xgpu = Initialize_pseudofermion_fields(Utmp[1], "Wilson", nowing=true)
     substitute_fermion!(xgpu, x)
     return xgpu
 end
-_to_gpu_fermion(x::WF3x1GPU) = x
+_to_gpu_fermion(x::WF3x1GPU; blocks=nothing) = x
 
-function _to_gpu_fermions(xs::Vector{<:WF3x1})
+function _to_gpu_fermions(xs::Vector{<:WF3x1}; blocks=nothing)
     if isempty(xs) || xs[1] isa WF3x1GPU
         return xs
     end
     NC = xs[1].NC
     NX = xs[1].NX; NY = xs[1].NY; NZ = xs[1].NZ; NT = xs[1].NT
-    Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true)
+    if blocks !== nothing
+        Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true, blocks=blocks)
+    else
+        Utmp = Initialize_Gaugefields(NC, 0, NX, NY, NZ, NT, condition="cold", cuda=true)
+    end
     result = Vector{WF3x1GPU}(undef, length(xs))
     for i in eachindex(xs)
         result[i] = Initialize_pseudofermion_fields(Utmp[1], "Wilson", nowing=true)
@@ -367,12 +430,12 @@ function _to_gpu_fermions(xs::Vector{<:WF3x1})
 end
 
 # --- Dirac operator CPU→GPU 변환 ---
-function _to_gpu_dirac(D)
+function _to_gpu_dirac(D; blocks=nothing)
     U = D.U
     if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
         return D  # 이미 GPU
     end
-    Ugpu = _to_gpu_gauge(U)
+    Ugpu = _to_gpu_gauge(U; blocks=blocks)
     xgpu = Initialize_pseudofermion_fields(Ugpu[1], "Wilson", nowing=true)
     params = Dict{String,Any}()
     params["Dirac_operator"] = "Wilson"
@@ -383,10 +446,10 @@ function _to_gpu_dirac(D)
 end
 
 # --- 기본: CPU 전용 성분만 있는 Layer ---
-_to_gpu(layer::Layer) = layer
+_to_gpu(layer::Layer, blocks=nothing) = layer
 
 # --- BlockScalar_Layer: 캐시 리셋 (GPU 초기화는 forward에서 자동) ---
-function _to_gpu(layer::BlockScalar_Layer)
+function _to_gpu(layer::BlockScalar_Layer, blocks=nothing)
     layer._gpu_w_buf = nothing
     layer._gpu_w_cpu = Matrix{ComplexF64}(undef, 0, 0)
     layer._gpu_block_map = Int[]
@@ -397,56 +460,56 @@ function _to_gpu(layer::BlockScalar_Layer)
 end
 
 # --- PTC_Layer ---
-function _to_gpu(layer::PTC_Layer)
-    hop_gpu = _to_gpu_hop(layer.hop)
+function _to_gpu(layer::PTC_Layer, blocks=nothing)
+    hop_gpu = _to_gpu_hop(layer.hop; blocks=blocks)
     W_gpu = _to_gpu_W(layer.W)
     return PTC_Layer(hop_gpu, W_gpu, layer.residual, layer.activation)
 end
 
 # --- CPTC_Layer ---
-function _to_gpu(layer::CPTC_Layer)
-    hop_gpu = _to_gpu_hop(layer.hop)
+function _to_gpu(layer::CPTC_Layer, blocks=nothing)
+    hop_gpu = _to_gpu_hop(layer.hop; blocks=blocks)
     W_gpu = _to_gpu_W(layer.W)
     return CPTC_Layer(hop_gpu, W_gpu, layer.residual, layer.activation)
 end
 
 # --- Attention_Layer ---
-function _to_gpu(layer::Attention_Layer)
-    return Attention_Layer(_to_gpu(layer.Q), _to_gpu(layer.K), _to_gpu(layer.V),
+function _to_gpu(layer::Attention_Layer, blocks=nothing)
+    return Attention_Layer(_to_gpu(layer.Q, blocks), _to_gpu(layer.K, blocks), _to_gpu(layer.V, blocks),
                            layer.nominator, layer.activation, layer.residual)
 end
 
 # --- test_Layer ---
-function _to_gpu(layer::test_Layer)
-    layer.Q = _to_gpu(layer.Q)
-    layer.K = _to_gpu(layer.K)
-    layer.V = _to_gpu(layer.V)
+function _to_gpu(layer::test_Layer, blocks=nothing)
+    layer.Q = _to_gpu(layer.Q, blocks)
+    layer.K = _to_gpu(layer.K, blocks)
+    layer.V = _to_gpu(layer.V, blocks)
     if layer.test isa WF3x1CPU
-        layer.test = _to_gpu_fermion(layer.test)
+        layer.test = _to_gpu_fermion(layer.test; blocks=blocks)
     end
     return layer
 end
 
 # --- FullPTCAttention_Layer ---
-function _to_gpu(layer::FullPTCAttention_Layer)
-    return FullPTCAttention_Layer(_to_gpu(layer.Q), _to_gpu(layer.K), _to_gpu(layer.V),
+function _to_gpu(layer::FullPTCAttention_Layer, blocks=nothing)
+    return FullPTCAttention_Layer(_to_gpu(layer.Q, blocks), _to_gpu(layer.K, blocks), _to_gpu(layer.V, blocks),
                                   layer.nominator, layer.activation, layer.residual)
 end
 
 # --- PrallelTransportAttention_Layer ---
-function _to_gpu(layer::PrallelTransportAttention_Layer)
-    return PrallelTransportAttention_Layer(_to_gpu(layer.Q), _to_gpu(layer.K), _to_gpu(layer.V),
+function _to_gpu(layer::PrallelTransportAttention_Layer, blocks=nothing)
+    return PrallelTransportAttention_Layer(_to_gpu(layer.Q, blocks), _to_gpu(layer.K, blocks), _to_gpu(layer.V, blocks),
                                             layer.nominator, layer.activation, layer.residual, layer.bias)
 end
 
 # --- siteweight_Layer ---
-function _to_gpu(layer::siteweight_Layer)
-    return siteweight_Layer(_to_gpu(layer.Q), _to_gpu(layer.K), _to_gpu(layer.V),
+function _to_gpu(layer::siteweight_Layer, blocks=nothing)
+    return siteweight_Layer(_to_gpu(layer.Q, blocks), _to_gpu(layer.K, blocks), _to_gpu(layer.V, blocks),
                             layer.nominator, layer.activation, layer.residual)
 end
 
 # --- DenseLinearLayer ---
-function _to_gpu(layer::DenseLinearLayer{Spin_matrix})
+function _to_gpu(layer::DenseLinearLayer{Spin_matrix}, blocks=nothing)
     new_layer = DenseLinearLayer(layer.In, layer.Out, true, layer.activation)
     W_gpu = [Spin_matrix_GPU(w) for w in layer.W]
     for j in eachindex(W_gpu)
@@ -456,8 +519,8 @@ function _to_gpu(layer::DenseLinearLayer{Spin_matrix})
 end
 
 # --- PTLayer ---
-function _to_gpu(layer::PTLayer)
-    U_gpu = _to_gpu_gauge(layer.U)
+function _to_gpu(layer::PTLayer, blocks=nothing)
+    U_gpu = _to_gpu_gauge(layer.U; blocks=blocks)
     new_layer = PTLayer(layer.paths, U_gpu, layer.Out, layer.activation)
     W_gpu = _to_gpu_W(layer.W)
     new_layer.W = W_gpu
@@ -465,42 +528,48 @@ function _to_gpu(layer::PTLayer)
 end
 
 # --- fermionfield_Layer ---
-function _to_gpu(layer::fermionfield_Layer)
-    layer.x = _to_gpu_fermions(layer.x)
+function _to_gpu(layer::fermionfield_Layer, blocks=nothing)
+    layer.x = _to_gpu_fermions(layer.x; blocks=blocks)
     return layer
 end
 
 # --- GramSchmidt_Layer ---
-function _to_gpu(layer::GramSchmidt_Layer)
-    layer.x = _to_gpu_fermions(layer.x)
+function _to_gpu(layer::GramSchmidt_Layer, blocks=nothing)
+    layer.x = _to_gpu_fermions(layer.x; blocks=blocks)
     return layer
 end
 
 # --- HoppingRayleighQuotient_Layer ---
-function _to_gpu(layer::HoppingRayleighQuotient_Layer)
-    layer.hop = _to_gpu_hop(layer.hop)
+function _to_gpu(layer::HoppingRayleighQuotient_Layer, blocks=nothing)
+    layer.hop = _to_gpu_hop(layer.hop; blocks=blocks)
     if layer.x isa WF3x1CPU
-        layer.x = _to_gpu_fermion(layer.x)
+        layer.x = _to_gpu_fermion(layer.x; blocks=blocks)
     end
     return layer
 end
 
 # --- Ritz_Layer ---
-function _to_gpu(layer::Ritz_Layer)
-    layer.D = _to_gpu_dirac(layer.D)
+function _to_gpu(layer::Ritz_Layer, blocks=nothing)
+    layer.D = _to_gpu_dirac(layer.D; blocks=blocks)
+    # GPU↔CPU 전환 시 캐시 무효화
+    layer._ritz_init = false
+    layer._Dz = Any[]
+    layer._DdagDz = Any[]
+    layer._VD = Any[]
+    layer._work = Any[]
     return layer
 end
 
 # --- PtcRayleighQuotient_Layer ---
-function _to_gpu(layer::PtcRayleighQuotient_Layer)
-    layer.D = _to_gpu_dirac(layer.D)
+function _to_gpu(layer::PtcRayleighQuotient_Layer, blocks=nothing)
+    layer.D = _to_gpu_dirac(layer.D; blocks=blocks)
     return layer
 end
 
 # --- LossSumLayer ---
-function _to_gpu(layer::LossSumLayer)
-    l1_gpu = _to_gpu(layer.l1)
-    l2_gpu = _to_gpu(layer.l2)
+function _to_gpu(layer::LossSumLayer, blocks=nothing)
+    l1_gpu = _to_gpu(layer.l1, blocks)
+    l2_gpu = _to_gpu(layer.l2, blocks)
     return LossSumLayer(l1_gpu, l2_gpu, layer.w1, layer.w2, layer.activation)
 end
 
@@ -953,9 +1022,11 @@ end
 
 function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     Out = layer.Out
+    In  = layer.In
     W   = layer.W
+    NW  = length(W)
 
-    @assert length(W) == length(x)*Out "W의 길이는 Out이어야 합니다."
+    @assert NW == In*Out "W의 길이는 In*Out이어야 합니다."
 
     # 캐시 버퍼 초기화 (최초 1회만)
     if !layer._dl_init || length(layer._result) != Out
@@ -968,18 +1039,36 @@ function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     end
 
     result = layer._result
-    yi = layer._yi[1]
 
-    @inbounds for j in 1:Out
-        zero_wf!(result[j])
-    end
+    if x[1] isa WF3x1GPU
+        # GPU batched: 50 kernel launches → 1
+        NC = 3; NG = 4
+        blocksize = x[1].blockinfo.blocksize
+        rsize     = x[1].blockinfo.rsize
 
-    for k in 1:length(x)
-        @inbounds for i in 1:Out
-            mul!(yi, W[i+(k-1)*Out], x[k])
-            axpby!(1, yi, 1, result[i])
+        if layer._W_gpu === nothing
+            layer._W_gpu      = CUDA.zeros(ComplexF64, NG, NG, NW)
+            layer._input_all  = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, In)
+            layer._result_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Out)
+            sync_W_to_gpu!(layer._W_gpu, W)
         end
-    end 
+
+        pack_fermions!(layer._input_all, x)
+        batched_forward!(layer._result_all, layer._W_gpu, layer._input_all, blocksize, rsize, In, Out)
+        unpack_fermions!(result, layer._result_all)
+    else
+        # CPU path
+        yi = layer._yi[1]
+        @inbounds for j in 1:Out
+            zero_wf!(result[j])
+        end
+        for k in 1:In
+            @inbounds for i in 1:Out
+                mul!(yi, W[i+(k-1)*Out], x[k])
+                axpby!(1, yi, 1, result[i])
+            end
+        end
+    end
     return result
 end
 
@@ -1047,18 +1136,8 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             hop_buf[1] = hopped[i]
             hop(x[i], hop_buf)
         end
-    else
-        hop = Hopping_operator(layer.U, paths[1])
-        hop_buf = WF3x1GPU[hopped[1]]  # GPU도 preallocated 버전 사용
-        @inbounds for i in 1:npaths
-            hop.P = paths[i]
-            hop_buf[1] = hopped[i]
-            hop(x[i], hop_buf)
-        end
-    end
 
-    # 3) Out 방향으로 병렬화
-    if x[1] isa WF3x1CPU
+        # 3) CPU: Out 방향 선형결합
         @threads for j in 1:Out
             rj = result[j]
             @inbounds for i in 1:npaths
@@ -1068,13 +1147,69 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             result[j] = rj
         end
     else
-        for j in 1:Out
-            rj = result[j]
-            @inbounds for i in 1:npaths
-                gpuaddmul!(rj, W[(i-1)*Out + j], hopped[i])
-            end
-            result[j] = rj
+        # GPU batched hop: 57 kernels → max_steps kernels
+        NC = 3; NG = 4
+        blocksize = x[1].blockinfo.blocksize
+        rsize     = x[1].blockinfo.rsize
+
+        # lazy init GPU buffers (W, hopped_all, etc.)
+        NW = npaths * Out
+        if layer._W_gpu === nothing
+            layer._W_gpu      = CUDA.zeros(ComplexF64, NG, NG, NW)
+            layer._Wadj_gpu   = CUDA.zeros(ComplexF64, NG, NG, NW)
+            layer._hopped_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, npaths)
+            layer._result_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Out)
+            sync_W_to_gpu!(layer._W_gpu, W)
         end
+
+        # lazy init batched hop tables
+        if layer._hop_dirs_gpu === nothing
+            max_steps = 0
+            for i in 1:npaths
+                steps_i = paths[i].various[1].steps
+                ns = length(steps_i)
+                # identity path (single step with direction 0) → 0 effective steps
+                if ns == 1 && steps_i[1].f == 0
+                    ns = 0
+                end
+                max_steps = max(max_steps, ns)
+            end
+            layer._hop_max_steps = max_steps
+
+            dirs_cpu = zeros(Int8, max_steps, npaths)
+            nsteps_cpu = zeros(Int32, npaths)
+            for i in 1:npaths
+                steps_i = paths[i].various[1].steps
+                ns = length(steps_i)
+                if ns == 1 && steps_i[1].f == 0
+                    nsteps_cpu[i] = Int32(0)
+                else
+                    nsteps_cpu[i] = Int32(ns)
+                    for s in 1:ns
+                        dirs_cpu[s, i] = Int8(steps_i[s].f)
+                    end
+                end
+            end
+            layer._hop_dirs_gpu   = CuArray(dirs_cpu)
+            layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
+            layer._hop_temp_5d    = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, npaths)
+        end
+
+        # Batched hop: pack x → hopped_all, then max_steps batched kernels
+        if layer._hop_max_steps > 0
+            batched_hopping_steps_gpu!(
+                layer._hopped_all, layer._hop_temp_5d, x,
+                layer.U, layer._hop_dirs_gpu, layer._hop_nsteps_gpu,
+                layer._hop_max_steps, npaths, blocksize, rsize)
+        else
+            pack_fermions!(layer._hopped_all, x)
+        end
+
+        # 1회 batched forward kernel
+        batched_forward!(layer._result_all, layer._W_gpu, layer._hopped_all, blocksize, rsize, npaths, Out)
+
+        # unpack result_all → result
+        unpack_fermions!(result, layer._result_all)
     end
 
     return result
@@ -1274,30 +1409,48 @@ function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
     end
     if need_reinit
         layer._Dz = Vector{Any}(undef, l)
+        layer._DdagDz = Vector{Any}(undef, l)
         for i in 1:l
             layer._Dz[i] = deepcopy(x[1])
+            layer._DdagDz[i] = deepcopy(x[1])
         end
         layer._ritz_init = true
     end
 
     Dx = layer._Dz
-    @inbounds for i in 1:l
-        mul!(Dx[i], layer.D, x[i])   # mul! overwrites Dx[i]
+    DdagDx = layer._DdagDz
+
+    # GPU fused path: zero-alloc Wilson kernel
+    _is_gpu_ritz = x[1] isa WF3x1GPU
+    if _is_gpu_ritz
+        _κ = layer.D.κ
+        _U = layer.D.U
+        @inbounds for i in 1:l
+            fused_wilson_mul_gpu!(Dx[i], x[i], _U, _κ, false)       # Dx = D * x
+            fused_wilson_mul_gpu!(DdagDx[i], Dx[i], _U, _κ, true)   # DdagDx = D† D x
+        end
+    else
+        @inbounds for i in 1:l
+            mul!(Dx[i], layer.D, x[i])       # Dx = D * x
+            mul!(DdagDx[i], layer.D', Dx[i])  # DdagDx = D† D x
+        end
     end
 
     # 2) Gram matrices: A_ij=<Dx_i, Dx_j>, B_ij=<x_i, x_j>
-    A = Matrix{ComplexF64}(undef, l, l)
-    B = Matrix{ComplexF64}(undef, l, l)
+    if size(layer._A) != (l, l)
+        layer._A = Matrix{ComplexF64}(undef, l, l)
+        layer._B = Matrix{ComplexF64}(undef, l, l)
+        layer._m = Vector{ComplexF64}(undef, l)
+    end
+    A = layer._A
+    B = layer._B
 
-    # CPU면 threads로 outer i를 병렬화 가능 (GPU x일 때는 inner_product가 sync를 많이 걸 수 있어 비추)
     @inbounds for i in 1:l
-        # diagonal
         bii = inner_product(x[i],  x[i])
         aii = inner_product(Dx[i], Dx[i])
         B[i,i] = bii
         A[i,i] = aii
 
-        # upper triangle만 계산하고 Hermitian으로 채우기
         for j in i+1:l
             bij = inner_product(x[i],  x[j])
             aij = inner_product(Dx[i], Dx[j])
@@ -1310,8 +1463,20 @@ function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
         end
     end
 
-    # 3) generalized eigen (Hermitian으로 감싸면 내부 알고리즘이 더 맞고 조금 더 빠름)
+    # 3) generalized eigen + 캐시 (DeltaRule!에서 재사용)
     F = eigen(Hermitian(A), Hermitian(B))
+    layer._evals = F.values
+    layer._evecs = F.vectors
+
+    # m_k = u_k† B u_k 미리 계산 (DeltaRule!에서 재사용)
+    m = layer._m
+    @inbounds for k in 1:l
+        s = zero(ComplexF64)
+        for i in 1:l, j in 1:l
+            s += conj(F.vectors[i,k]) * B[i,j] * F.vectors[j,k]
+        end
+        m[k] = s
+    end
 
     return real(sum(F.values))
 end
@@ -1820,6 +1985,9 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
     delta=deepcopy(dummy[2:end])  # delta는 레이어 수보다 하나 적음에 주의
     u = dummy  # u 버퍼 재사용 (매 epoch 재할당 방지)
 
+    temp=Vector{ComplexF64}(undef, batch)
+    d=Vector{Any}(undef, depth)
+
     for epoch in 1:epochs
         k=mod(epoch-1,length(config))+1
         D = Ds[k]
@@ -1841,8 +2009,6 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
         if layers[end] isa Ritz_Layer
             layers[end].D=D
         end
-        temp=Vector{ComplexF64}(undef, batch)
-        d=Vector{Any}(undef, depth)
         fill!(d, nothing)
         for b in 1:batch
              f = forward_propagation!(layers, D , D, u)

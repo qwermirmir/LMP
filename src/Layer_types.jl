@@ -277,6 +277,16 @@ mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
     _dl_init::Bool
     _conj_buf::Vector{WF3x1}   # conj 작업용 버퍼 (DeltaRule!에서 재사용)
     _delta_init_dl::Bool
+    # --- GPU batched 버퍼 ---
+    _W_gpu::Any           # CuArray{ComplexF64,3} (NG,NG,NW)
+    _Wadj_gpu::Any        # CuArray{ComplexF64,3}
+    _input_all::Any       # CuArray{ComplexF64,5} (NC,NG,bs,rs,In)
+    _result_all::Any      # CuArray{ComplexF64,5} (NC,NG,bs,rs,Out)
+    _d_buf::Any           # CuArray{ComplexF64,5} (NC,NG,bs,rs,Out)
+    _ci_all::Any          # CuArray{ComplexF64,5} (NC,NG,bs,rs,In)
+    _grad_gpu::Any        # CuArray{ComplexF64,3} (NG,NG,NW)
+    _adam_m_gpu::Any
+    _adam_v_gpu::Any
 
     function DenseLinearLayer(In::Int, Out::Int, cuda::Bool, activation::ActivationFunction=Identity() )
         if cuda == true
@@ -290,7 +300,8 @@ mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
                 W[i] = Random_SpinM("complex")
             end
         end
-        return new{eltype(W)}(W, In, Out, cuda, activation, WF3x1[], WF3x1[], false, WF3x1[], false)
+        return new{eltype(W)}(W, In, Out, cuda, activation, WF3x1[], WF3x1[], false, WF3x1[], false,
+                              nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
     end
 end
 
@@ -314,6 +325,28 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
     _Wadj::Vector{T}             # adjoint(W) 캐시 벡터
     _invhops::Vector{Any}        # 스레드별 Hopping_operator 캐시
     _hop_out::Vector{Vector{WF3x1}} # 스레드별 hop 출력 버퍼 (1-element)
+    # --- gradient 캐시 버퍼 ---
+    _grad_M_all::Any            # CuArray for Matmul_batch
+    _grad_M_cpu::Array{ComplexF64,3}  # CPU buffer for Matmul_batch
+    _grad_result::Vector{Any}   # Spin_matrix result
+    _grad_Qs::Vector{Any}       # Qs reference vector
+    _grad_Ks::Vector{Any}       # Ks reference vector
+    # --- GPU-resident batched buffers ---
+    _W_gpu::Any                 # CuArray{ComplexF64,3} (4,4,NW)
+    _Wadj_gpu::Any              # CuArray{ComplexF64,3} (4,4,NW) adjoint(W)
+    _hopped_all::Any            # CuArray{ComplexF64,5} (NC,NG,bs,rs,npaths)
+    _result_all::Any            # CuArray{ComplexF64,5} (NC,NG,bs,rs,Out)
+    _d_buf::Any                 # CuArray{ComplexF64,5} (NC,NG,bs,rs,Out) d packing
+    _ci_all::Any                # CuArray{ComplexF64,5} (NC,NG,bs,rs,npaths) DeltaRule intermediate
+    _grad_gpu::Any              # CuArray{ComplexF64,3} (4,4,NW) gradient on GPU
+    _adam_m_gpu::Any             # CuArray{ComplexF64,3} Adam 1st moment
+    _adam_v_gpu::Any             # CuArray{ComplexF64,3} Adam 2nd moment
+    # --- Batched hopping cache ---
+    _hop_temp_5d::Any            # CuArray{ComplexF64,5} double-buffer for batched hop
+    _hop_dirs_gpu::Any           # CuArray{Int8,2} (max_steps, npaths) direction table
+    _hop_nsteps_gpu::Any         # CuArray{Int32,1} (npaths,) step counts
+    _hop_max_steps::Int          # max steps across all paths
+    _inv_hop_dirs_gpu::Any       # CuArray{Int8,2} (max_steps, npaths) inverse direction table
 
     function PTLayer(paths::Vector{Paths}, U::Vector{G}, Out::Int,
                      activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields}
@@ -326,7 +359,10 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
             return new{G, Spin_matrix_GPU}(paths, U, Out, W, activation,
                        WF3x1[], WF3x1[], false,
                        Paths[], WF3x1[], WF3x1[], false,
-                       Spin_matrix_GPU[], Any[], Vector{WF3x1}[])
+                       Spin_matrix_GPU[], Any[], Vector{WF3x1}[],
+                       nothing, Array{ComplexF64}(undef,0,0,0), Any[], Any[], Any[],
+                       nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
+                       nothing, nothing, nothing, 0, nothing)
         else
             W = Vector{Spin_matrix}(undef, length(paths)*Out)
             for i in eachindex(W)
@@ -335,7 +371,10 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
             return new{G, Spin_matrix}(paths, U, Out, W, activation,
                        WF3x1[], WF3x1[], false,
                        Paths[], WF3x1[], WF3x1[], false,
-                       Spin_matrix[], Any[], Vector{WF3x1}[])
+                       Spin_matrix[], Any[], Vector{WF3x1}[],
+                       nothing, Array{ComplexF64}(undef,0,0,0), Any[], Any[], Any[],
+                       nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
+                       nothing, nothing, nothing, 0, nothing)
         end
     end
 end
@@ -434,11 +473,21 @@ mutable struct Ritz_Layer <: Layer
     Out::Int
     # --- 캐시 버퍼 (Dirac 재계산 방지) ---
     _Dz::Vector{Any}        # forward에서 D*z 캐시 → DeltaRule!에서 재사용
+    _DdagDz::Vector{Any}    # D†Dz 캐시 (DeltaRule!에서 Dirac ops 절반)
     _VD::Vector{Any}         # DeltaRule! VD 버퍼
     _work::Vector{Any}       # DeltaRule! workspace [y, f, ψ, r]
     _ritz_init::Bool
+    # Gram matrix + eigen 캐시 (forward→DeltaRule! 재사용)
+    _A::Matrix{ComplexF64}
+    _B::Matrix{ComplexF64}
+    _evals::Vector{Float64}
+    _evecs::Matrix{ComplexF64}
+    _m::Vector{ComplexF64}
     function Ritz_Layer(D::Any, activation::ActivationFunction= Identity(),Out =1)
-        new(D, activation , Out, Any[], Any[], Any[], false)
+        new(D, activation, Out,
+            Any[], Any[], Any[], Any[], false,
+            Matrix{ComplexF64}(undef,0,0), Matrix{ComplexF64}(undef,0,0),
+            Float64[], Matrix{ComplexF64}(undef,0,0), ComplexF64[])
     end
 end 
 
@@ -654,6 +703,9 @@ mutable struct BlockScalar_Layer <: Layer
     _gpu_w_buf::Any             # CuArray{ComplexF64,4} 재사용 버퍼 (1,1,blocksize,rsize)
     _gpu_w_cpu::Matrix{ComplexF64}  # CPU 작업 배열 (blocksize, rsize)
     _initialized::Bool
+    _grad_prod_buf::Any             # CuArray{ComplexF64,4} for gradient elementwise product
+    _grad_site_buf::Any             # CuArray for site-level sum result
+    _grad_site_cpu::Vector{ComplexF64}  # CPU buffer for site inner products
 
     function BlockScalar_Layer(x::WF3x1, n::Int, r::Int,
                                residual::Bool=false,
@@ -662,7 +714,8 @@ mutable struct BlockScalar_Layer <: Layer
         W = ones(ComplexF64, nblocks, n)
         new(W, r, residual, activation,
             WF3x1[], Vector{WF3x1}[], Int[], Int[], nothing,
-            Matrix{ComplexF64}(undef, 0, 0), false)
+            Matrix{ComplexF64}(undef, 0, 0), false,
+            nothing, nothing, ComplexF64[])
     end
 end
 
