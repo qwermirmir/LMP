@@ -810,7 +810,164 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
 end
 
 
-# Preallocated 버퍼를 받는 버전 - 메모리 할당 최소화
+# ============================================================
+# Zero-allocation hop step 함수들
+# shift_fermion/shift_U의 래퍼 구조체 할당을 완전히 제거
+# ============================================================
+
+const _bc_default = Int8[1, 1, 1, -1]
+
+# shifted_fermion! 인라인 버전: copyx.f → copyx.fshifted (BC 적용)
+function _shifted_fermion_inplace!(F::WF3x1CPU, shift::NTuple{4,Int})
+    bc = _bc_default
+    NX = F.NX; NY = F.NY; NZ = F.NZ; NT = F.NT
+    sf = F.f; fsh = F.fshifted
+
+    @inbounds for ig = 1:4
+        for it = 1:NT
+            it_s = it + shift[4]
+            inside_up = it_s > NT; inside_down = it_s < 1
+            factor_t = ifelse(inside_up || inside_down, Int(bc[4]), 1)
+            it_s += ifelse(inside_up, -NT, 0)
+            it_s += ifelse(inside_down, NT, 0)
+            for iz = 1:NZ
+                iz_s = iz + shift[3]
+                inside_up = iz_s > NZ; inside_down = iz_s < 1
+                factor_z = ifelse(inside_up || inside_down, Int(bc[3]), 1)
+                iz_s += ifelse(inside_up, -NZ, 0)
+                iz_s += ifelse(inside_down, NZ, 0)
+                for iy = 1:NY
+                    iy_s = iy + shift[2]
+                    inside_up = iy_s > NY; inside_down = iy_s < 1
+                    factor_y = ifelse(inside_up || inside_down, Int(bc[2]), 1)
+                    iy_s += ifelse(inside_up, -NY, 0)
+                    iy_s += ifelse(inside_down, NY, 0)
+                    for ix = 1:NX
+                        ix_s = ix + shift[1]
+                        inside_up = ix_s > NX; inside_down = ix_s < 1
+                        factor_x = ifelse(inside_up || inside_down, Int(bc[1]), 1)
+                        ix_s += ifelse(inside_up, -NX, 0)
+                        ix_s += ifelse(inside_down, NX, 0)
+                        factor = factor_x * factor_y * factor_z * factor_t
+                        @simd for ic = 1:3
+                            fsh[ic, ix, iy, iz, it, ig] = factor * sf[ic, ix_s, iy_s, iz_s, it_s, ig]
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+# Forward step: copyx[site] = U†(site-μ̂) * copyx_old(site-μ̂)
+# shift_U 제거: 게이지도 같은 shifted 인덱스에서 직접 읽음
+function _hop_step_forward!(copyx::WF3x1CPU, U_mu, mu::Int)
+    bc = _bc_default
+    NX = copyx.NX; NY = copyx.NY; NZ = copyx.NZ; NT = copyx.NT
+    sf = copyx.f; fsh = copyx.fshifted
+    Ug = U_mu.U
+
+    shift1 = (mu == 1) ? -1 : 0
+    shift2 = (mu == 2) ? -1 : 0
+    shift3 = (mu == 3) ? -1 : 0
+    shift4 = (mu == 4) ? -1 : 0
+
+    @inbounds for ig = 1:4
+        for it = 1:NT
+            it_s = it + shift4
+            inside_up = it_s > NT; inside_down = it_s < 1
+            factor_t = ifelse(inside_up || inside_down, Int(bc[4]), 1)
+            it_s += ifelse(inside_up, -NT, 0)
+            it_s += ifelse(inside_down, NT, 0)
+            for iz = 1:NZ
+                iz_s = iz + shift3
+                inside_up = iz_s > NZ; inside_down = iz_s < 1
+                factor_z = ifelse(inside_up || inside_down, Int(bc[3]), 1)
+                iz_s += ifelse(inside_up, -NZ, 0)
+                iz_s += ifelse(inside_down, NZ, 0)
+                for iy = 1:NY
+                    iy_s = iy + shift2
+                    inside_up = iy_s > NY; inside_down = iy_s < 1
+                    factor_y = ifelse(inside_up || inside_down, Int(bc[2]), 1)
+                    iy_s += ifelse(inside_up, -NY, 0)
+                    iy_s += ifelse(inside_down, NY, 0)
+                    for ix = 1:NX
+                        ix_s = ix + shift1
+                        inside_up = ix_s > NX; inside_down = ix_s < 1
+                        factor_x = ifelse(inside_up || inside_down, Int(bc[1]), 1)
+                        ix_s += ifelse(inside_up, -NX, 0)
+                        ix_s += ifelse(inside_down, NX, 0)
+
+                        factor = factor_x * factor_y * factor_z * factor_t
+
+                        # Read shifted fermion
+                        x1 = factor * sf[1, ix_s, iy_s, iz_s, it_s, ig]
+                        x2 = factor * sf[2, ix_s, iy_s, iz_s, it_s, ig]
+                        x3 = factor * sf[3, ix_s, iy_s, iz_s, it_s, ig]
+
+                        # Read gauge at shifted index (no shift_U needed)
+                        # Compute U†*x: (U†)[i,j] = conj(U[j,i])
+                        fsh[1, ix, iy, iz, it, ig] =
+                            conj(Ug[1,1,ix_s,iy_s,iz_s,it_s])*x1 +
+                            conj(Ug[2,1,ix_s,iy_s,iz_s,it_s])*x2 +
+                            conj(Ug[3,1,ix_s,iy_s,iz_s,it_s])*x3
+                        fsh[2, ix, iy, iz, it, ig] =
+                            conj(Ug[1,2,ix_s,iy_s,iz_s,it_s])*x1 +
+                            conj(Ug[2,2,ix_s,iy_s,iz_s,it_s])*x2 +
+                            conj(Ug[3,2,ix_s,iy_s,iz_s,it_s])*x3
+                        fsh[3, ix, iy, iz, it, ig] =
+                            conj(Ug[1,3,ix_s,iy_s,iz_s,it_s])*x1 +
+                            conj(Ug[2,3,ix_s,iy_s,iz_s,it_s])*x2 +
+                            conj(Ug[3,3,ix_s,iy_s,iz_s,it_s])*x3
+                    end
+                end
+            end
+        end
+    end
+    # fshifted → f 복사
+    copyto!(sf, fsh)
+    return nothing
+end
+
+# Backward step: copyx[site] = U_μ(site) * copyx_old(site+μ̂)
+# 게이지는 shift 불필요 (현재 site에서 읽음)
+function _hop_step_backward!(copyx::WF3x1CPU, U_mu, mu::Int)
+    # fermion만 shift: copyx.f → copyx.fshifted
+    shift = ntuple(i -> (i == mu) ? 1 : 0, 4)
+    _shifted_fermion_inplace!(copyx, shift)
+
+    # fshifted에서 읽고 U*fshifted 결과를 f에 씀
+    fsh = copyx.fshifted
+    Ug = U_mu.U
+    df = copyx.f
+    NX = copyx.NX; NY = copyx.NY; NZ = copyx.NZ; NT = copyx.NT
+
+    @inbounds for ig = 1:4
+        for it = 1:NT
+            for iz = 1:NZ
+                for iy = 1:NY
+                    for ix = 1:NX
+                        x1 = fsh[1, ix, iy, iz, it, ig]
+                        x2 = fsh[2, ix, iy, iz, it, ig]
+                        x3 = fsh[3, ix, iy, iz, it, ig]
+
+                        df[1, ix, iy, iz, it, ig] =
+                            Ug[1,1,ix,iy,iz,it]*x1 + Ug[1,2,ix,iy,iz,it]*x2 + Ug[1,3,ix,iy,iz,it]*x3
+                        df[2, ix, iy, iz, it, ig] =
+                            Ug[2,1,ix,iy,iz,it]*x1 + Ug[2,2,ix,iy,iz,it]*x2 + Ug[2,3,ix,iy,iz,it]*x3
+                        df[3, ix, iy, iz, it, ig] =
+                            Ug[3,1,ix,iy,iz,it]*x1 + Ug[3,2,ix,iy,iz,it]*x2 + Ug[3,3,ix,iy,iz,it]*x3
+                    end
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+
+# Preallocated 버퍼를 받는 버전 - 메모리 할당 완전 제거
 function (hop::Hopping_operator)(x::WF3x1CPU, V::AbstractVector{T}) where {T<:WF3x1CPU}
     @assert length(V) == length(hop.P.various) "V의 길이는 paths의 개수와 같아야 합니다."
     
@@ -825,14 +982,10 @@ function (hop::Hopping_operator)(x::WF3x1CPU, V::AbstractVector{T}) where {T<:WF
         for step in hop.P.various[k].steps
             a = step.f
             if a > 0
-                shift_x = shift_fermion(copyx, -a)
-                Uminus = shift_U(U[a], -a)
-                mul!(copyx, Uminus', shift_x)
+                _hop_step_forward!(copyx, U[a], a)
 
             elseif a < 0
-                aa = -a
-                shift_x = shift_fermion(copyx, aa)
-                mul!(copyx, U[aa], shift_x)
+                _hop_step_backward!(copyx, U[-a], -a)
             
             else
                 # a == 0: copyx를 x로 재설정

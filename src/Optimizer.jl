@@ -10,6 +10,8 @@ import ..Layer_types: PrallelTransportAttention_Layer,siteweight_Layer,Dirac_Lay
 import ..Layer_types: fermionfield_Layer
 import ..Layer_types: BlockScalar_Layer
 
+import ..gpu: gpu_adam_update!, sync_W_from_gpu!, sync_W_to_gpu!
+
 const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
 const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
 
@@ -439,31 +441,52 @@ end
 function update!(layer::DenseLinearLayer, opt::Adam, grad)
     opt.t += 1
 
-    param = layer.W
-    if length(param) ==1
-        complexProcess(param, opt , grad[1] )
-    
-    else 
-        for i in 1:length(param)
-            complexProcess(param[i], opt , grad[i] )
+    # GPU batched path: grad[1]이 CuArray이면 GPU Adam
+    if grad[1] isa CuArray
+        NW = length(layer.W)
+        NG = 4
+        if layer._adam_m_gpu === nothing || size(layer._adam_m_gpu, 3) != NW
+            layer._adam_m_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+            layer._adam_v_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+        end
+        gpu_adam_update!(layer._W_gpu, layer._adam_m_gpu, layer._adam_v_gpu, grad[1],
+                         opt.α, opt.β1, opt.β2, opt.ε, opt.t)
+        sync_W_from_gpu!(layer.W, layer._W_gpu)
+    else
+        param = layer.W
+        if length(param) == 1
+            complexProcess(param, opt, grad[1])
+        else
+            for i in 1:length(param)
+                complexProcess(param[i], opt, grad[i])
+            end
         end
     end
-
 end
 
 function update!(layer::PTLayer, opt::Adam, grad)
     opt.t += 1
 
-    param = layer.W
-    if length(param) ==1
-        complexProcess(param[1], opt , grad[1][1] )
-    
-    else 
+    # GPU batched path: grad[1]이 CuArray이면 GPU Adam
+    if grad[1] isa CuArray
+        NW = length(layer.W)
+        NG = 4
+        # lazy init Adam states on GPU
+        if layer._adam_m_gpu === nothing || size(layer._adam_m_gpu, 3) != NW
+            layer._adam_m_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+            layer._adam_v_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+        end
+        gpu_adam_update!(layer._W_gpu, layer._adam_m_gpu, layer._adam_v_gpu, grad[1],
+                         opt.α, opt.β1, opt.β2, opt.ε, opt.t)
+        # W_gpu → W (CPU) 동기화 (저장/로깅용)
+        sync_W_from_gpu!(layer.W, layer._W_gpu)
+    else
+        # CPU fallback
+        param = layer.W
         for i in 1:length(param)
-            complexProcess(param[i], opt , grad[1][i] )
+            complexProcess(param[i], opt, grad[1][i])
         end
     end
-
 end
 
 

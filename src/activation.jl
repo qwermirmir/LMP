@@ -7,6 +7,7 @@ using LatticeDiracOperators
 using LinearAlgebra
 using CUDA
 using Base.Threads
+using StaticArrays
   # 활성화 함수 추상 타입
 
 
@@ -15,7 +16,8 @@ import ..Layer_types: CPTC_Layer, PTC_Layer, Layer,ActivationFunction,Identity ,
 import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,ModRelu,RayleighQuotient_Layer,PtcRayleighQuotient_Layer
 import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer,BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
-import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!
+import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,Matmul_batch!,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!
+import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!
 
 export gradient, DeltaRule,DeltaRule!
 export Identity, ReLU, Sigmoid, Tanh
@@ -2447,46 +2449,12 @@ end
 function DeltaRule(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, batch::Int)
 
     l = length(z)
-    D = layer.D
 
-
-    A = Matrix{ComplexF64}(undef, l, l)
-    B = Matrix{ComplexF64}(undef, l, l)
-    T = typeof(z[1])
-    Dz = Vector{T}(undef, l)
-    # Dz 버퍼 한 번만 할당 (similar 대신 deepcopy)
-    @inbounds for i in 1:l
-        Dz[i] = deepcopy(z[1])
-        mul!(Dz[i], D, z[i])   # mul! overwrites Dz[i]
-    end
-    @inbounds for i in 1:l
-        # diagonal
-        bii = inner_product(z[i],  z[i])
-        aii = inner_product(Dz[i], Dz[i])
-        B[i,i] = bii
-        A[i,i] = aii
-
-        # upper triangle만 계산하고 Hermitian으로 채우기
-        for j in i+1:l
-            bij = inner_product(z[i],  z[j])
-            aij = inner_product(Dz[i], Dz[j])
-
-            B[i,j] = bij
-            B[j,i] = conj(bij)
-
-            A[i,j] = aij
-            A[j,i] = conj(aij)
-        end
-    end
-    
-    evals, evecs = eigen(A, B)
-    @assert length(evals) == l "Eigenvalue decomposition failed in Ritz_Layer."
-
-
-    m = Vector{ComplexF64}(undef, l)
-    for k in 1:l
-        m[k] = dot(evecs[:,k], B*evecs[:,k])  # u_k^† B u_k
-    end
+    # forward에서 캐싱된 결과 재사용
+    evals  = layer._evals
+    evecs  = layer._evecs
+    m      = layer._m
+    DdagDz = layer._DdagDz
 
     # result 버퍼 한 번만 할당
     result = Vector{WF3x1}(undef, l)
@@ -2501,30 +2469,21 @@ function DeltaRule(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, batch::Int)
         VD[i] = deepcopy(z[1])
     end
     
-    # 재사용 버퍼들 - 각 한 번만 할당
-    y = deepcopy(z[1])
-    f = deepcopy(z[1])
     ψ = deepcopy(z[1])
     r = deepcopy(z[1])
     
-    # 모드 k마다 ψ_k 만들고, r_k = D†D ψ_k - λ_k ψ_k 만든다
+    # D†D ψ_k = Σ_j u_{jk} D†D z_j (Dirac ops 0회)
     for k in 1:l
         zero_wf!(ψ)
+        zero_wf!(r)
         for j in 1:l
-            axpby!(evecs[j,k],z[j], 1, ψ)   # ψ = Σ u_{jk} x_j
+            axpby!(evecs[j,k], z[j], 1, ψ)
+            axpby!(evecs[j,k], DdagDz[j], 1, r)
         end
-
-        mul!(y,D,ψ)                    # y = D ψ_k
-        mul!(f,D',y)                   # f = D† D ψ_k
-        # r = ψ로 초기화 (inplace copy)
-        conj!(r, ψ)
-        conj!(r, r)                    # r = ψ (double conj = identity)
-        axpby!(1,f,-evals[k],r)        # r = f - λ_k ψ = D†D ψ_k - λ_k ψ_k
-        # 네가 "왼쪽작용이 없어 오른쪽으로 하고 다시 conj"라 했으니 그 스타일 유지
-        conj!(VD[k], r)
+        axpby!(1, r, -evals[k], ψ)
+        conj!(VD[k], ψ)
     end
 
-    # ∂/∂V 를 반환하려면 계수는 evecs[i,k] (conj 없음)
     for i in 1:l
         for k in 1:l
             axpby!(evecs[i,k]/m[k],VD[k], 1, result[i])
@@ -2544,52 +2503,13 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
         zero_wf!(delta[i])  
     end
 
+    # forward에서 캐싱된 eigen 결과 재사용 (Gram matrix + inner_product 6회 + eigen 재계산 제거)
+    evals = layer._evals
+    evecs = layer._evecs
+    m     = layer._m
+    DdagDz = layer._DdagDz   # D†D z[j] — forward에서 캐시됨
 
-    A = Matrix{ComplexF64}(undef, l, l)
-    B = Matrix{ComplexF64}(undef, l, l)
-
-    # forward에서 캐싱된 Dz 재사용 (Dirac 연산 2회 절약)
-    if layer._ritz_init && length(layer._Dz) == l
-        Dz = layer._Dz
-    else
-        T = typeof(z[1])
-        Dz = Vector{T}(undef, l)
-        @inbounds for i in 1:l
-            Dz[i] = deepcopy(z[1])
-            mul!(Dz[i], D, z[i])
-        end
-    end
-
-    @inbounds for i in 1:l
-        # diagonal
-        bii = inner_product(z[i],  z[i])
-        aii = inner_product(Dz[i], Dz[i])
-        B[i,i] = bii
-        A[i,i] = aii
-
-        # upper triangle만 계산하고 Hermitian으로 채우기
-        for j in i+1:l
-            bij = inner_product(z[i],  z[j])
-            aij = inner_product(Dz[i], Dz[j])
-
-            B[i,j] = bij
-            B[j,i] = conj(bij)
-
-            A[i,j] = aij
-            A[j,i] = conj(aij)
-        end
-    end
-    
-    evals, evecs = eigen(A, B)
-    @assert length(evals) == l "Eigenvalue decomposition failed in Ritz_Layer."
-
-
-    m = Vector{ComplexF64}(undef, l)
-    for k in 1:l
-        m[k] = dot(evecs[:,k], B*evecs[:,k])  # u_k^† B u_k
-    end
-
-    # VD, y, f, ψ, r 버퍼 캐시 (매 epoch deepcopy 방지)
+    # VD, ψ, r 버퍼 캐시 (매 epoch deepcopy 방지)
     need_vd_reinit = isempty(layer._VD) || length(layer._VD) != l
     if !need_vd_reinit
         need_vd_reinit = typeof(layer._VD[1]) != typeof(z[1])
@@ -2599,30 +2519,25 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
         for i in 1:l
             layer._VD[i] = deepcopy(z[1])
         end
-        layer._work = Any[deepcopy(z[1]), deepcopy(z[1]), deepcopy(z[1]), deepcopy(z[1])]
+        layer._work = Any[deepcopy(z[1]), deepcopy(z[1])]  # [ψ, r] only (y, f 불필요)
     end
 
     VD = layer._VD
-    y  = layer._work[1]
-    f  = layer._work[2]
-    ψ  = layer._work[3]
-    r  = layer._work[4]
+    ψ  = layer._work[1]
+    r  = layer._work[2]
     
-    # 모드 k마다 ψ_k 만들고, r_k = D†D ψ_k - λ_k ψ_k 만든다
+    # D†D ψ_k = Σ_j u_{jk} D†D z_j (Dirac ops 0회 — DdagDz 캐시 재사용)
     for k in 1:l
         zero_wf!(ψ)
+        zero_wf!(r)
         for j in 1:l
-            axpby!(evecs[j,k],z[j], 1, ψ)   # ψ = Σ u_{jk} x_j
+            axpby!(evecs[j,k], z[j], 1, ψ)         # ψ = Σ u_{jk} z_j
+            axpby!(evecs[j,k], DdagDz[j], 1, r)     # r = Σ u_{jk} D†D z_j = D†D ψ_k
         end
-
-        mul!(y,D,ψ)                    # y = D ψ_k
-        mul!(f,D',y)                   # f = D† D ψ_k
-        # r = ψ로 초기화 (inplace copy)
-        conj!(r, ψ)
-        conj!(r, r)                    # r = ψ (double conj = identity)
-        axpby!(1,f,-evals[k],r)        # r = f - λ_k ψ = D†D ψ_k - λ_k ψ_k
-        # 네가 "왼쪽작용이 없어 오른쪽으로 하고 다시 conj"라 했으니 그 스타일 유지
-        conj!(VD[k], r)
+        # r = D†D ψ_k - λ_k ψ_k
+        axpby!(1, r, -evals[k], ψ)    # ψ = r - λ_k ψ → but we want r = D†Dψ - λψ
+        # 위에서 axpby!(1,r,-λ,ψ) → ψ = 1*r + (-λ)*ψ = D†Dψ - λψ. 맞음
+        conj!(VD[k], ψ)
     end
 
     # ∂/∂V 를 반환하려면 계수는 evecs[i,k] (conj 없음)
@@ -2731,29 +2646,42 @@ function gradient(layer::DenseLinearLayer, ::Identity,
     
     n = length(layer.W)
     nd = length(d)
-    grad=Vector{typeof(layer.W[1])}(undef, n)
+    nz = length(z)
 
-    if d[1] isa WF3x1GPU
-        # GPU: batched Matmul
-        Qs = Vector{WF3x1GPU}(undef, n)
-        Ks = Vector{WF3x1GPU}(undef, n)
-        @inbounds for idx in 1:n
-            i = ((idx-1) % nd) + 1
-            k = ((idx-1) ÷ nd) + 1
-            Qs[idx] = d[i]
-            Ks[idx] = z[k]
+    if d[1] isa WF3x1GPU && layer._W_gpu !== nothing
+        # GPU batched gradient: 1회 커널
+        NC = 3; NG = 4
+        blocksize = d[1].blockinfo.blocksize
+        rsize     = d[1].blockinfo.rsize
+
+        if layer._grad_gpu === nothing
+            layer._grad_gpu = CUDA.zeros(ComplexF64, NG, NG, n)
         end
-        grad .= Matmul_batch(Qs, Ks)
+        # d_buf, input_all should already be packed from forward/backward
+        # but repack to be safe (d may differ from backward's d)
+        if layer._d_buf === nothing || size(layer._d_buf, 5) != nd
+            layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, nd)
+        end
+        pack_fermions!(layer._d_buf, d)
+
+        if layer._input_all === nothing || size(layer._input_all, 5) != nz
+            layer._input_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, nz)
+        end
+        pack_fermions!(layer._input_all, z)
+
+        batched_gradient!(layer._grad_gpu, layer._d_buf, layer._input_all,
+                          blocksize, rsize, nd, nz)
+
+        return [layer._grad_gpu]
     else
+        grad = Vector{typeof(layer.W[1])}(undef, n)
         @threads for idx in 1:n
             i = ((idx-1) % nd) + 1
             k = ((idx-1) ÷ nd) + 1
-            grad[idx]=Matmul!(d[i],z[k])
+            grad[idx] = Matmul!(d[i], z[k])
         end
-    end 
-
-
-    return grad
+        return grad
+    end
 end
 
 function DeltaRule(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{WF3x1} ) where T<:WF3x1
@@ -2784,29 +2712,57 @@ end
 
 function DeltaRule!(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{WF3x1}, delta::Vector{WF3x1}) where T<:WF3x1
 
-    W=layer.W
+    W   = layer.W
+    In  = layer.In
+    Out = layer.Out
+    NW  = length(W)
 
-    # conj 버퍼 초기화 (1회만, deepcopy/similar 방지)
-    if !layer._delta_init_dl || typeof(layer._conj_buf[1]) != typeof(z[1])
-        layer._conj_buf = [deepcopy(z[1]), deepcopy(z[1])]  # [conj_d, conj_y]
-        layer._delta_init_dl = true
+    if z[1] isa WF3x1GPU && layer._W_gpu !== nothing
+        # GPU batched: Wadj * conj(d) → delta, 1회 커널
+        NC = 3; NG = 4
+        blocksize = z[1].blockinfo.blocksize
+        rsize     = z[1].blockinfo.rsize
+
+        if layer._Wadj_gpu === nothing
+            layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+        end
+        sync_Wadj_gpu!(layer._Wadj_gpu, layer._W_gpu)
+
+        if layer._d_buf === nothing || size(layer._d_buf, 5) != Out
+            layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Out)
+        end
+        pack_fermions!(layer._d_buf, d)
+
+        if layer._ci_all === nothing || size(layer._ci_all, 5) != In
+            layer._ci_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, In)
+        end
+
+        batched_delta!(layer._ci_all, layer._Wadj_gpu, layer._d_buf, blocksize, rsize, Out, In)
+        unpack_fermions!(delta, layer._ci_all)
+        # batched_delta!는 Wadj*conj(d)만 계산 — CPU 경로의 conj(W†*conj(d))와 맞추려면 outer conj 필요
+        for k in 1:In
+            conj!(delta[k], delta[k])
+        end
+    else
+        # CPU path
+        if !layer._delta_init_dl || typeof(layer._conj_buf[1]) != typeof(z[1])
+            layer._conj_buf = [deepcopy(z[1]), deepcopy(z[1])]  # [conj_d, conj_y]
+            layer._delta_init_dl = true
+        end
+        conj_d = layer._conj_buf[1]
+        conj_y = layer._conj_buf[2]
+        y = layer._yi[1]
+
+        zero_wf!(delta)
+        for k in 1:In
+            for i in 1:Out
+                conj!(conj_d, d[i])
+                mul!(y, adjoint(W[i+(k-1)*Out]), conj_d)
+                conj!(conj_y, y)
+                axpby!(1, conj_y, 1, delta[k])
+            end
+        end
     end
-    conj_d = layer._conj_buf[1]
-    conj_y = layer._conj_buf[2]
-    y = layer._yi[1]  # forward에서 이미 초기화된 버퍼 재사용
-
-    zero_wf!(delta)
-    for k in 1:length(z)
-
-        for i in 1:length(d)
-
-            conj!(conj_d, d[i])
-            mul!(y,adjoint(W[i+(k-1)*length(d)]),conj_d)
-
-            conj!(conj_y, y)
-            axpby!(1,conj_y,1,delta[k])
-        end 
-    end 
     return nothing
 end
 
@@ -2822,37 +2778,51 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
     paths=layer.paths
 
     n=length(layer.W)
+    npaths = length(paths)
 
-    @assert length(z) == length(paths) "PTLayer gradient: z의 길이는 paths 길이와 같아야 합니다. length(z)=$(length(z)), length(paths)=$(length(paths))"
+    @assert length(z) == npaths "PTLayer gradient: z의 길이는 paths 길이와 같아야 합니다. length(z)=$(length(z)), length(paths)=$(npaths)"
     @assert length(d) == Out "PTLayer gradient: d의 길이는 Out과 같아야 합니다. length(d)=$(length(d)), Out=$Out"
-    @assert length(W) == length(paths)*Out "The length of W must be equal to length(paths)*Out."
-
-    grad=Vector{typeof(W[1])}(undef, n)
+    @assert length(W) == npaths*Out "The length of W must be equal to length(paths)*Out."
 
     # forward에서 캐싱된 hopped 결과 재사용 (hop 재계산 방지)
-    if layer._initialized && length(layer._hopped) == length(paths)
-        if d[1] isa WF3x1GPU
-            # GPU: batched Matmul로 sync 1회만
-            Qs = Vector{WF3x1GPU}(undef, n)
-            Ks = Vector{WF3x1GPU}(undef, n)
-            @inbounds for idx in 1:n
-                j = ((idx-1) % Out) + 1
-                i = ((idx-1) ÷ Out) + 1
-                Qs[idx] = d[j]
-                Ks[idx] = layer._hopped[i]
+    if layer._initialized && length(layer._hopped) == npaths
+        if d[1] isa WF3x1GPU && layer._hopped_all !== nothing
+            # GPU batched: 625개 kernel → 1회 launch, GPU→CPU 전송 없음
+            blocksize = d[1].blockinfo.blocksize
+            rsize     = d[1].blockinfo.rsize
+            NC = 3; NG = 4
+
+            # lazy init d_buf, grad_gpu
+            if layer._d_buf === nothing || size(layer._d_buf, 5) != Out
+                layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Out)
             end
-            grad .= Matmul_batch(Qs, Ks)
+            if layer._grad_gpu === nothing || size(layer._grad_gpu, 3) != n
+                layer._grad_gpu = CUDA.zeros(ComplexF64, NG, NG, n)
+            end
+
+            # pack d → d_buf  (hopped_all는 forward에서 이미 packed)
+            pack_fermions!(layer._d_buf, d)
+
+            # 1회 batched gradient kernel
+            batched_gradient!(layer._grad_gpu, layer._d_buf, layer._hopped_all,
+                              blocksize, rsize, Out, npaths)
+
+            # grad_gpu를 그대로 반환 (optimizer가 GPU에서 처리)
+            return [layer._grad_gpu]
         else
             # CPU: @threads 병렬화
+            grad = Vector{typeof(W[1])}(undef, n)
             @threads for idx in 1:n
                 j = ((idx-1) % Out) + 1
                 i = ((idx-1) ÷ Out) + 1
                 grad[idx]=Matmul!(d[j], layer._hopped[i])
             end
+            return [grad]
         end
     else
+        grad = Vector{typeof(W[1])}(undef, n)
         hop=Hopping_operator(layer.U,paths[1])
-        for i in 1:length(paths)
+        for i in 1:npaths
             hop.P=paths[i]
             u = hop(z[i])
             if d[1] isa WF3x1GPU
@@ -2872,9 +2842,8 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
                 end
             end
         end
+        return [grad]
     end
-
-    return [grad]
 
 end 
 
@@ -2970,19 +2939,94 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
             conj!(result[i], hop_out[tid][1])
         end
     else
-        ci = deepcopy(z[1])
+        # GPU batched: Wadj*conj(d) 를 1회 커널로
+        NC = 3; NG = 4
+        blocksize = z[1].blockinfo.blocksize
+        rsize     = z[1].blockinfo.rsize
 
-        for i in 1:Nz
-            zero_wf!(ci)
-            base = (i-1) * Out
-            @inbounds for j in 1:Out
-                gpuaddmul!(ci, Wadj[base + j], d_conj[j])
-            end
-            invhop = invhops[1]
-            invhop.P = invpaths[i]
-            hopped_ci = invhop(ci)[1]
-            conj!(result[i], hopped_ci)
+        if layer._Wadj_gpu === nothing || size(layer._Wadj_gpu, 3) != NW
+            layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
         end
+        if layer._W_gpu !== nothing
+            sync_Wadj_gpu!(layer._Wadj_gpu, layer._W_gpu)
+        else
+            Wadj_cpu = Array{ComplexF64}(undef, NG, NG, NW)
+            @inbounds for k in 1:NW
+                sm = Wadj[k].sm
+                for jj in 1:4, ii in 1:4
+                    Wadj_cpu[ii, jj, k] = sm[ii, jj]
+                end
+            end
+            copyto!(layer._Wadj_gpu, Wadj_cpu)
+        end
+
+        if layer._d_buf === nothing || size(layer._d_buf, 5) != Nd
+            layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nd)
+        end
+        pack_fermions!(layer._d_buf, d)
+
+        if layer._ci_all === nothing || size(layer._ci_all, 5) != Nz
+            layer._ci_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nz)
+        end
+
+        batched_delta!(layer._ci_all, layer._Wadj_gpu, layer._d_buf, blocksize, rsize, Nd, Nz)
+
+        # lazy init inverse direction table (forward init이 안 된 경우 여기서 수행)
+        if layer._inv_hop_dirs_gpu === nothing
+            max_steps = layer._hop_max_steps
+            if max_steps == 0 && layer._hop_dirs_gpu === nothing
+                max_steps = 0
+                for i in 1:Nz
+                    steps_i = paths[i].various[1].steps
+                    ns = length(steps_i)
+                    if ns == 1 && steps_i[1].f == 0; ns = 0; end
+                    max_steps = max(max_steps, ns)
+                end
+                layer._hop_max_steps = max_steps
+
+                dirs_cpu = zeros(Int8, max_steps, Nz)
+                nsteps_cpu = zeros(Int32, Nz)
+                for i in 1:Nz
+                    steps_i = paths[i].various[1].steps
+                    ns = length(steps_i)
+                    if ns == 1 && steps_i[1].f == 0
+                        nsteps_cpu[i] = Int32(0)
+                    else
+                        nsteps_cpu[i] = Int32(ns)
+                        for s in 1:ns; dirs_cpu[s, i] = Int8(steps_i[s].f); end
+                    end
+                end
+                layer._hop_dirs_gpu   = CuArray(dirs_cpu)
+                layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
+                if layer._hop_temp_5d === nothing
+                    layer._hop_temp_5d = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nz)
+                end
+            end
+
+            max_steps = layer._hop_max_steps
+            inv_dirs_cpu = zeros(Int8, max_steps, Nz)
+            for i in 1:Nz
+                inv_steps = invpaths[i].various[1].steps
+                ns = length(inv_steps)
+                if !(ns == 1 && inv_steps[1].f == 0)
+                    for s in 1:ns; inv_dirs_cpu[s, i] = Int8(inv_steps[s].f); end
+                end
+            end
+            layer._inv_hop_dirs_gpu = CuArray(inv_dirs_cpu)
+        end
+
+        max_steps = layer._hop_max_steps
+        if max_steps > 0
+            bi = z[1].blockinfo
+            NXl = z[1].NX; NYl = z[1].NY; NZl = z[1].NZ; NTl = z[1].NT
+            batched_inv_hopping_gpu!(
+                layer._ci_all, layer._hop_temp_5d, layer.U,
+                layer._inv_hop_dirs_gpu, layer._hop_nsteps_gpu,
+                max_steps, Nz, blocksize, rsize, bi, NXl, NYl, NZl, NTl)
+        end
+
+        layer._ci_all .= conj.(layer._ci_all)
+        unpack_fermions!(result, layer._ci_all)
     end
 
     return result
@@ -3003,18 +3047,26 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
     Nd = length(d)
     NW = length(W)
 
-    # ① d_conj 버퍼 캐시 (매 호출 deepcopy 방지)
-    if !layer._delta_init || length(layer._d_conj_buf) != Nd
-        layer._d_conj_buf = Vector{WF3x1}(undef, Nd)
-        for i in 1:Nd
-            layer._d_conj_buf[i] = deepcopy(d[1])
+    # ① d_conj 버퍼 캐시 — CPU path에서만 필요
+    is_gpu = z[1] isa WF3x1GPU && layer._W_gpu !== nothing
+
+    if !is_gpu
+        if !layer._delta_init || length(layer._d_conj_buf) != Nd
+            layer._d_conj_buf = Vector{WF3x1}(undef, Nd)
+            for i in 1:Nd
+                layer._d_conj_buf[i] = deepcopy(d[1])
+            end
+            layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
+            layer._delta_init = true
         end
+        d_conj = layer._d_conj_buf
+        @inbounds for i in 1:Nd
+            conj!(d_conj[i], d[i])
+        end
+    elseif !layer._delta_init
+        # GPU path에서도 ci_buffers는 필요 (ci unpack 용)
         layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
         layer._delta_init = true
-    end
-    d_conj = layer._d_conj_buf
-    @inbounds for i in 1:Nd
-        conj!(d_conj[i], d[i])
     end
 
     # ② 역경로 캐시 (paths 불변이므로 1회만 계산)
@@ -3026,20 +3078,22 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
     end
     invpaths = layer._invpaths
 
-    # ③ Wadj 캐시 (벡터만 1회 할당, 값은 in-place 갱신)
-    if length(layer._Wadj) != NW
-        layer._Wadj = Vector{typeof(W[1])}(undef, NW)
-        @inbounds for k in 1:NW
-            layer._Wadj[k] = adjoint(W[k])
+    # ③ Wadj 캐시 — CPU path에서만 필요
+    if !is_gpu
+        if length(layer._Wadj) != NW
+            layer._Wadj = Vector{typeof(W[1])}(undef, NW)
+            @inbounds for k in 1:NW
+                layer._Wadj[k] = adjoint(W[k])
+            end
         end
-    end
-    Wadj = layer._Wadj
-    @inbounds for k in 1:NW
-        wsm = W[k].sm
-        wadj_sm = Wadj[k].sm
-        for j in 1:4
-            for i in 1:4
-                wadj_sm[i,j] = conj(wsm[j,i])
+        Wadj = layer._Wadj
+        @inbounds for k in 1:NW
+            wsm = W[k].sm
+            wadj_sm = Wadj[k].sm
+            for j in 1:4
+                for i in 1:4
+                    wadj_sm[i,j] = conj(wsm[j,i])
+                end
             end
         end
     end
@@ -3076,20 +3130,114 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             conj!(delta[i], hop_out[tid][1])
         end
     else
-        ci = layer._ci_buffers[1]     # GPU: 캐시된 버퍼 재사용 (deepcopy 방지)
-        hop_buf_gpu = Vector{typeof(z[1])}([hop_out[1][1]])  # concrete 타입 벡터로 래핑
+        # GPU batched: Wadj*conj(d) 를 1회 커널로 전부 계산
+        NC = 3; NG = 4
+        blocksize = z[1].blockinfo.blocksize
+        rsize     = z[1].blockinfo.rsize
 
-        for i in 1:Nz
-            zero_wf!(ci)
-            base = (i-1) * Out
-            @inbounds for j in 1:Out
-                gpuaddmul!(ci, Wadj[base + j], d_conj[j])
-            end
-            invhop = invhops[1]
-            invhop.P = invpaths[i]
-            invhop(ci, hop_buf_gpu)          # preallocated 버전 사용 (WF3x1GPU 할당 방지)
-            conj!(delta[i], hop_buf_gpu[1])
+        # Wadj_gpu 동기화 (W_gpu가 있으면 GPU에서 직접, 없으면 CPU→GPU)
+        if layer._Wadj_gpu === nothing || size(layer._Wadj_gpu, 3) != NW
+            layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
         end
+        if layer._W_gpu !== nothing
+            sync_Wadj_gpu!(layer._Wadj_gpu, layer._W_gpu)
+        else
+            # fallback: CPU Wadj → GPU
+            Wadj_cpu = Array{ComplexF64}(undef, NG, NG, NW)
+            @inbounds for k in 1:NW
+                sm = Wadj[k].sm
+                for jj in 1:4, ii in 1:4
+                    Wadj_cpu[ii, jj, k] = sm[ii, jj]
+                end
+            end
+            copyto!(layer._Wadj_gpu, Wadj_cpu)
+        end
+
+        # d_buf: d를 pack (conj는 커널 내부에서 수행)
+        if layer._d_buf === nothing || size(layer._d_buf, 5) != Nd
+            layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nd)
+        end
+        pack_fermions!(layer._d_buf, d)
+
+        # ci_all: batched 결과 버퍼
+        if layer._ci_all === nothing || size(layer._ci_all, 5) != Nz
+            layer._ci_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nz)
+        end
+
+        # 1회 batched kernel: ci_all = Σ_j Wadj * conj(d)
+        batched_delta!(layer._ci_all, layer._Wadj_gpu, layer._d_buf, blocksize, rsize, Nd, Nz)
+
+        # lazy init inverse direction table for batched backward hop
+        if layer._inv_hop_dirs_gpu === nothing
+            max_steps = layer._hop_max_steps
+            if max_steps == 0 && layer._hop_dirs_gpu === nothing
+                # forward batched hop이 아직 init되지 않은 경우 — 여기서 직접 계산
+                max_steps = 0
+                for i in 1:Nz
+                    steps_i = paths[i].various[1].steps
+                    ns = length(steps_i)
+                    if ns == 1 && steps_i[1].f == 0
+                        ns = 0
+                    end
+                    max_steps = max(max_steps, ns)
+                end
+                layer._hop_max_steps = max_steps
+
+                # forward dirs + nsteps (forward에서 아직 init 안된 경우)
+                dirs_cpu = zeros(Int8, max_steps, Nz)
+                nsteps_cpu = zeros(Int32, Nz)
+                for i in 1:Nz
+                    steps_i = paths[i].various[1].steps
+                    ns = length(steps_i)
+                    if ns == 1 && steps_i[1].f == 0
+                        nsteps_cpu[i] = Int32(0)
+                    else
+                        nsteps_cpu[i] = Int32(ns)
+                        for s in 1:ns
+                            dirs_cpu[s, i] = Int8(steps_i[s].f)
+                        end
+                    end
+                end
+                layer._hop_dirs_gpu   = CuArray(dirs_cpu)
+                layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
+                if layer._hop_temp_5d === nothing
+                    layer._hop_temp_5d = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Nz)
+                end
+            end
+
+            max_steps = layer._hop_max_steps
+            # inverse dirs: reverse order & negate
+            inv_dirs_cpu = zeros(Int8, max_steps, Nz)
+            for i in 1:Nz
+                inv_steps = invpaths[i].various[1].steps
+                ns = length(inv_steps)
+                if ns == 1 && inv_steps[1].f == 0
+                    # identity — nsteps=0
+                else
+                    for s in 1:ns
+                        inv_dirs_cpu[s, i] = Int8(inv_steps[s].f)
+                    end
+                end
+            end
+            layer._inv_hop_dirs_gpu = CuArray(inv_dirs_cpu)
+        end
+
+        # batched inverse hop: ci_all ↔ _hop_temp_5d
+        max_steps = layer._hop_max_steps
+        if max_steps > 0
+            bi = z[1].blockinfo
+            NX = z[1].NX; NY = z[1].NY; NZ_ = z[1].NZ; NT = z[1].NT
+            batched_inv_hopping_gpu!(
+                layer._ci_all, layer._hop_temp_5d, layer.U,
+                layer._inv_hop_dirs_gpu, layer._hop_nsteps_gpu,
+                max_steps, Nz, blocksize, rsize, bi, NX, NY, NZ_, NT)
+        end
+
+        # batch conj: ci_all .= conj.(ci_all)
+        layer._ci_all .= conj.(layer._ci_all)
+
+        # unpack → delta
+        unpack_fermions!(delta, layer._ci_all)
     end
 
     return nothing
@@ -3373,17 +3521,27 @@ function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{WF3x1}, d::Vec
     grad_W = zeros(ComplexF64, nblocks, n)
 
     if z[1] isa WF3x1GPU
-        # GPU: 캐시된 block_map으로 사이트별 내적 → 블록별 합산
+        # GPU: preallocated buffers로 사이트별 내적 → 블록별 합산 (alloc 0)
         bmap = layer._gpu_block_map
         nblocks_total = length(bmap)
+        fref = d[1].f  # CuArray{ComplexF64,4} reference
+
+        # 1회만 버퍼 초기화
+        if layer._grad_prod_buf === nothing || size(layer._grad_prod_buf) != size(fref)
+            layer._grad_prod_buf = CUDA.zeros(ComplexF64, size(fref)...)
+            layer._grad_site_buf = CUDA.zeros(ComplexF64, 1, 1, size(fref,3), size(fref,4))
+            layer._grad_site_cpu = Vector{ComplexF64}(undef, nblocks_total)
+        end
+        prod_buf = layer._grad_prod_buf
+        site_buf = layer._grad_site_buf
 
         for k in 1:n
-            prod_gpu = d[k].f .* z[k].f
-            site_ip = dropdims(sum(prod_gpu, dims=(1,2)), dims=(1,2))
-            site_ip_cpu = Array(site_ip)
+            prod_buf .= d[k].f .* z[k].f
+            sum!(site_buf, prod_buf)
+            copyto!(layer._grad_site_cpu, vec(site_buf))
 
             @inbounds for i in 1:nblocks_total
-                grad_W[bmap[i], k] += conj(site_ip_cpu[i])
+                grad_W[bmap[i], k] += conj(layer._grad_site_cpu[i])
             end
         end
     else

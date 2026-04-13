@@ -546,12 +546,42 @@ function Matmul_batch(Qs::AbstractVector{<:WF3x1GPU}, Ks::AbstractVector{<:WF3x1
 
     result = Vector{Spin_matrix_GPU}(undef, n)
     @inbounds for idx in 1:n
-        result[idx] = Spin_matrix_GPU(MMatrix{4,4,ComplexF64}(M_cpu[:,:,idx]))
+        result[idx] = Spin_matrix_GPU(MMatrix{4,4,ComplexF64}(@view M_cpu[:,:,idx]))
     end
     return result
 end
 
-export Matmul_batch
+"""
+    Matmul_batch!(result, M_all, M_cpu, Qs, Ks) → result
+
+Preallocated version of Matmul_batch. Reuses M_all (CuArray), M_cpu (CPU Array), result (Vector{Spin_matrix_GPU}).
+"""
+function Matmul_batch!(result, M_all, M_cpu::Array{ComplexF64,3},
+                       Qs::AbstractVector, Ks::AbstractVector)
+    n = length(Qs)
+    NC, NG = Qs[1].NC, Qs[1].NG
+    blocksize = Qs[1].blockinfo.blocksize
+    rsize     = Qs[1].blockinfo.rsize
+
+    M_all .= 0
+
+    threads = 256
+    blocks  = NG * NG
+
+    for idx in 1:n
+        CUDA.@cuda threads=threads blocks=blocks kernel_matmul_batched!(
+            M_all, Qs[idx].f, Ks[idx].f, NC, NG, blocksize, rsize, idx)
+    end
+
+    copyto!(M_cpu, M_all)
+
+    @inbounds for idx in 1:n
+        result[idx].sm .= MMatrix{4,4,ComplexF64}(@view M_cpu[:,:,idx])
+    end
+    return result
+end
+
+export Matmul_batch, Matmul_batch!
 
 
 
@@ -892,6 +922,902 @@ function _update_block_weight_gpu!(layer, W_col::AbstractVector{<:Number})
 end
 
 export _build_block_weight_gpu, _init_gpu_block_cache!, _update_block_weight_gpu!
+
+
+# ============================================================
+#  Batched PTLayer kernels — GPU-resident W, 단일 커널 launch
+# ============================================================
+
+export sync_W_to_gpu!, sync_W_from_gpu!
+export pack_fermions!, unpack_fermions!
+export batched_forward!, batched_gradient!, batched_delta!
+export gpu_adam_update!
+
+# ---- W ↔ CuArray 동기화 ----
+
+"""CPU Vector{Spin_matrix_GPU} → GPU CuArray{ComplexF64, 3} (4,4,NW)"""
+function sync_W_to_gpu!(W_gpu::CuArray{ComplexF64, 3}, W::AbstractVector{<:AbstractSpinMatrix})
+    n = length(W)
+    W_cpu = Array{ComplexF64}(undef, 4, 4, n)
+    @inbounds for k in 1:n
+        sm = W[k].sm
+        for j in 1:4, i in 1:4
+            W_cpu[i, j, k] = sm[i, j]
+        end
+    end
+    copyto!(W_gpu, W_cpu)
+end
+
+"""GPU CuArray{ComplexF64, 3} → CPU Vector{Spin_matrix_GPU}"""
+function sync_W_from_gpu!(W::AbstractVector{<:AbstractSpinMatrix}, W_gpu::CuArray{ComplexF64, 3})
+    W_cpu = Array(W_gpu)
+    @inbounds for k in eachindex(W)
+        sm = W[k].sm
+        for j in 1:4, i in 1:4
+            sm[i, j] = W_cpu[i, j, k]
+        end
+    end
+end
+
+# ---- Pack / Unpack fermion fields ----
+
+"""Vector{WF3x1GPU} → CuArray{ComplexF64, 5} (NC,NG,bs,rs,n)"""
+function pack_fermions!(buf::CuArray{ComplexF64, 5}, fields::AbstractVector)
+    @inbounds for i in eachindex(fields)
+        copyto!(@view(buf[:,:,:,:,i]), fields[i].f)
+    end
+end
+
+"""CuArray{ComplexF64, 5} → Vector{WF3x1GPU}  (각 field의 .f에 복사)"""
+function unpack_fermions!(fields::AbstractVector, buf::CuArray{ComplexF64, 5})
+    @inbounds for j in eachindex(fields)
+        copyto!(fields[j].f, @view(buf[:,:,:,:,j]))
+    end
+end
+
+
+# ──── Batched forward kernel ────
+# result[c,g,b,r,j] = Σ_i Σ_g2  W[g,g2,(i-1)*Out+j] * hopped[c,g2,b,r,i]
+
+function _cudakernel_batched_forward!(
+    result_all::CuDeviceArray{ComplexF64, 5},
+    W_gpu     ::CuDeviceArray{ComplexF64, 3},
+    hopped_all::CuDeviceArray{ComplexF64, 5},
+    NC::Int, NG::Int, npaths::Int, Out::Int
+)
+    b = Int(threadIdx().x)
+    r = Int(blockIdx().x)
+
+    @inbounds for j in 1:Out
+        for c in 1:NC
+            a1 = zero(ComplexF64); a2 = zero(ComplexF64)
+            a3 = zero(ComplexF64); a4 = zero(ComplexF64)
+            for i in 1:npaths
+                widx = (i-1)*Out + j
+                x1 = hopped_all[c, 1, b, r, i]
+                x2 = hopped_all[c, 2, b, r, i]
+                x3 = hopped_all[c, 3, b, r, i]
+                x4 = hopped_all[c, 4, b, r, i]
+                a1 += W_gpu[1,1,widx]*x1 + W_gpu[1,2,widx]*x2 + W_gpu[1,3,widx]*x3 + W_gpu[1,4,widx]*x4
+                a2 += W_gpu[2,1,widx]*x1 + W_gpu[2,2,widx]*x2 + W_gpu[2,3,widx]*x3 + W_gpu[2,4,widx]*x4
+                a3 += W_gpu[3,1,widx]*x1 + W_gpu[3,2,widx]*x2 + W_gpu[3,3,widx]*x3 + W_gpu[3,4,widx]*x4
+                a4 += W_gpu[4,1,widx]*x1 + W_gpu[4,2,widx]*x2 + W_gpu[4,3,widx]*x3 + W_gpu[4,4,widx]*x4
+            end
+            result_all[c, 1, b, r, j] = a1
+            result_all[c, 2, b, r, j] = a2
+            result_all[c, 3, b, r, j] = a3
+            result_all[c, 4, b, r, j] = a4
+        end
+    end
+    return nothing
+end
+
+"""
+    batched_forward!(result_all, W_gpu, hopped_all, blocksize, rsize, npaths, Out)
+
+625개 gpuaddmul! 대신 1회 커널 launch.
+"""
+function batched_forward!(result_all, W_gpu, hopped_all, blocksize, rsize, npaths, Out)
+    NC = 3; NG = 4
+    CUDA.@cuda threads=blocksize blocks=rsize _cudakernel_batched_forward!(
+        result_all, W_gpu, hopped_all, NC, NG, npaths, Out)
+end
+
+
+# ──── Batched gradient kernel (inner-product reduction) ────
+# M_all[fg,xg,widx] = Σ_{c,b,r} d[c,fg,b,r,j] * hopped[c,xg,b,r,i]
+#  where  j = (widx-1)%Out + 1,  i = (widx-1)÷Out + 1
+
+function _cudakernel_batched_gradient!(
+    M_all     ::CuDeviceArray{ComplexF64, 3},
+    d_all     ::CuDeviceArray{ComplexF64, 5},
+    hopped_all::CuDeviceArray{ComplexF64, 5},
+    NC::Int, NG::Int, blocksize::Int, rsize::Int, Out::Int, npaths::Int
+)
+    tid = Int(threadIdx().x)
+    bid = Int(blockIdx().x)
+
+    NW = npaths * Out
+    fg  = ((bid - 1) % NG) + 1
+    rest = (bid - 1) ÷ NG
+    xg   = (rest % NG) + 1
+    widx = (rest ÷ NG) + 1
+    if widx > NW; return; end
+
+    j = ((widx - 1) % Out) + 1
+    i = ((widx - 1) ÷ Out) + 1
+
+    N = NC * blocksize * rsize
+    acc = zero(ComplexF64)
+    stride = blockDim().x
+    k = tid
+    while k <= N
+        k0 = k - 1
+        ic = (k0 % NC) + 1
+        t  = k0 ÷ NC
+        b  = (t % blocksize) + 1
+        r  = (t ÷ blocksize) + 1
+        @inbounds acc += d_all[ic, fg, b, r, j] * hopped_all[ic, xg, b, r, i]
+        k += stride
+    end
+
+    sh = CUDA.CuStaticSharedArray(ComplexF64, 256)
+    @inbounds sh[tid] = acc
+    CUDA.sync_threads()
+    offset = stride >>> 1
+    while offset >= 1
+        if tid <= offset
+            @inbounds sh[tid] += sh[tid + offset]
+        end
+        CUDA.sync_threads()
+        offset >>>= 1
+    end
+    if tid == 1
+        @inbounds M_all[fg, xg, widx] = sh[1]
+    end
+    return nothing
+end
+
+"""
+    batched_gradient!(grad_gpu, d_all, hopped_all, blocksize, rsize, Out, npaths)
+
+625개 kernel_matmul_batched! 대신 1회 launch.
+결과는 grad_gpu (CuArray 4×4×NW) 에 직접 기록 → GPU→CPU 전송 불필요.
+"""
+function batched_gradient!(grad_gpu, d_all, hopped_all, blocksize, rsize, Out, npaths)
+    NG = 4; NC = 3
+    NW = npaths * Out
+    threads = 256
+    nblocks = NG * NG * NW          # 16 * NW
+    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_batched_gradient!(
+        grad_gpu, d_all, hopped_all, NC, NG, blocksize, rsize, Out, npaths)
+end
+
+
+# ──── Batched DeltaRule kernel ────
+# ci[c,g,b,r,i] = Σ_j Σ_g2  Wadj[g,g2,(i-1)*Out+j] * conj(d[c,g2,b,r,j])
+
+function _cudakernel_batched_delta!(
+    ci_all   ::CuDeviceArray{ComplexF64, 5},
+    Wadj_gpu ::CuDeviceArray{ComplexF64, 3},
+    d_all    ::CuDeviceArray{ComplexF64, 5},
+    NC::Int, NG::Int, Out::Int, npaths::Int
+)
+    b = Int(threadIdx().x)
+    r = Int(blockIdx().x)
+
+    @inbounds for i in 1:npaths
+        for c in 1:NC
+            a1 = zero(ComplexF64); a2 = zero(ComplexF64)
+            a3 = zero(ComplexF64); a4 = zero(ComplexF64)
+            for j in 1:Out
+                widx = (i-1)*Out + j
+                x1 = conj(d_all[c, 1, b, r, j])
+                x2 = conj(d_all[c, 2, b, r, j])
+                x3 = conj(d_all[c, 3, b, r, j])
+                x4 = conj(d_all[c, 4, b, r, j])
+                a1 += Wadj_gpu[1,1,widx]*x1 + Wadj_gpu[1,2,widx]*x2 + Wadj_gpu[1,3,widx]*x3 + Wadj_gpu[1,4,widx]*x4
+                a2 += Wadj_gpu[2,1,widx]*x1 + Wadj_gpu[2,2,widx]*x2 + Wadj_gpu[2,3,widx]*x3 + Wadj_gpu[2,4,widx]*x4
+                a3 += Wadj_gpu[3,1,widx]*x1 + Wadj_gpu[3,2,widx]*x2 + Wadj_gpu[3,3,widx]*x3 + Wadj_gpu[3,4,widx]*x4
+                a4 += Wadj_gpu[4,1,widx]*x1 + Wadj_gpu[4,2,widx]*x2 + Wadj_gpu[4,3,widx]*x3 + Wadj_gpu[4,4,widx]*x4
+            end
+            ci_all[c, 1, b, r, i] = a1
+            ci_all[c, 2, b, r, i] = a2
+            ci_all[c, 3, b, r, i] = a3
+            ci_all[c, 4, b, r, i] = a4
+        end
+    end
+    return nothing
+end
+
+"""
+    batched_delta!(ci_all, Wadj_gpu, d_all, blocksize, rsize, Out, npaths)
+
+DeltaRule의 gpuaddmul! 625회 → 1회 커널.
+d_all은 원본 d (conj는 커널 내부에서 수행).
+"""
+function batched_delta!(ci_all, Wadj_gpu, d_all, blocksize, rsize, Out, npaths)
+    NC = 3; NG = 4
+    CUDA.@cuda threads=blocksize blocks=rsize _cudakernel_batched_delta!(
+        ci_all, Wadj_gpu, d_all, NC, NG, Out, npaths)
+end
+
+
+# ──── GPU-side Adam update ────
+
+function _cudakernel_adam_complex!(
+    W_gpu   ::CuDeviceArray{ComplexF64, 3},
+    m_gpu   ::CuDeviceArray{ComplexF64, 3},
+    v_gpu   ::CuDeviceArray{ComplexF64, 3},
+    grad_gpu::CuDeviceArray{ComplexF64, 3},
+    α::Float64, β1::Float64, β2::Float64, ε::Float64,
+    bias1::Float64, bias2::Float64
+)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    total = length(W_gpu)
+    if idx > total; return; end
+
+    @inbounds begin
+        g = grad_gpu[idx]
+        g_re = real(g); g_im = imag(g)
+
+        m = m_gpu[idx]
+        mr = β1 * real(m) + (1 - β1) * g_re
+        mi = β1 * imag(m) + (1 - β1) * g_im
+
+        v = v_gpu[idx]
+        vr = β2 * real(v) + (1 - β2) * g_re * g_re
+        vi = β2 * imag(v) + (1 - β2) * g_im * g_im
+
+        m_gpu[idx] = complex(mr, mi)
+        v_gpu[idx] = complex(vr, vi)
+
+        upd_re = α * (mr * bias1) / (sqrt(vr * bias2) + ε)
+        upd_im = α * (mi * bias1) / (sqrt(vi * bias2) + ε)
+
+        W_gpu[idx] -= complex(upd_re, -upd_im)
+    end
+    return nothing
+end
+
+"""
+    gpu_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu, opt)
+
+GPU 위에서 Adam update를 1회 커널로 수행. CPU 전송 0.
+"""
+function gpu_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
+                          α, β1, β2, ε, t)
+    bias1 = 1.0 / (1.0 - β1^t)
+    bias2 = 1.0 / (1.0 - β2^t)
+    total = length(W_gpu)
+    threads = min(256, total)
+    nblocks = cld(total, threads)
+    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adam_complex!(
+        W_gpu, m_gpu, v_gpu, grad_gpu, α, β1, β2, ε, bias1, bias2)
+end
+
+# ---- Wadj 동기화 커널 ----
+function _cudakernel_adjoint_W!(Wadj, W, n)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if idx > n; return; end
+    @inbounds for j in 1:4, i in 1:4
+        Wadj[i, j, idx] = conj(W[j, i, idx])
+    end
+    return nothing
+end
+
+"""W_gpu → Wadj_gpu (transpose-conjugate, GPU 위에서)"""
+function sync_Wadj_gpu!(Wadj_gpu, W_gpu)
+    n = size(W_gpu, 3)
+    threads = min(256, n)
+    nblocks = cld(n, threads)
+    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adjoint_W!(Wadj_gpu, W_gpu, n)
+end
+
+export sync_Wadj_gpu!
+
+
+# ============================================================
+#  Fused GPU hop kernels — 3 kernels per step → 1
+# ============================================================
+
+# Inline helper functions from Gaugefields blockinfo
+
+@inline _cvt_x(x, xd, xd_s) = mod(div(x - 1, xd_s), xd)
+
+@inline function _si_plus(b, r, blocks, blocks_s, blocknumbers, blocknumbers_s)
+    bs = b; rs = r
+    ic1 = mod(div(b - 1, blocks_s), blocks)
+    if ic1 == blocks - 1
+        bs = bs - (blocks - 1) * blocks_s
+        ic2 = mod(div(r - 1, blocknumbers_s), blocknumbers)
+        if ic2 == blocknumbers - 1
+            rs = rs - (blocknumbers - 1) * blocknumbers_s
+        else
+            rs += blocknumbers_s
+        end
+    else
+        bs += blocks_s
+    end
+    return bs, rs
+end
+
+@inline function _si_minus(b, r, blocks, blocks_s, blocknumbers, blocknumbers_s)
+    bs = b; rs = r
+    ic1 = mod(div(b - 1, blocks_s), blocks)
+    if ic1 == 0
+        bs = bs + (blocks - 1) * blocks_s
+        ic2 = mod(div(r - 1, blocknumbers_s), blocknumbers)
+        if ic2 == 0
+            rs = rs + (blocknumbers - 1) * blocknumbers_s
+        else
+            rs -= blocknumbers_s
+        end
+    else
+        bs -= blocks_s
+    end
+    return bs, rs
+end
+
+@inline function _shifted_idx(b, r, shift, blockinfo)
+    bs = b; rs = r
+    for idim = 1:4
+        blk   = blockinfo.blocks[idim]
+        blk_s = blockinfo.blocks_s[idim]
+        bn    = blockinfo.blocknumbers[idim]
+        bn_s  = blockinfo.blocknumbers_s[idim]
+        ns = abs(shift[idim])
+        if shift[idim] > 0
+            for _ = 1:ns
+                bs, rs = _si_plus(bs, rs, blk, blk_s, bn, bn_s)
+            end
+        else
+            for _ = 1:ns
+                bs, rs = _si_minus(bs, rs, blk, blk_s, bn, bn_s)
+            end
+        end
+    end
+    return bs, rs
+end
+
+@inline function _bc_factor(b, r, shift, blockinfo, bc, NX, NY, NZ, NT)
+    ix = 1 + _cvt_x(b, blockinfo.blocks[1], blockinfo.blocks_s[1]) +
+             _cvt_x(r, blockinfo.blocknumbers[1], blockinfo.blocknumbers_s[1]) * blockinfo.blocks[1]
+    iy = 1 + _cvt_x(b, blockinfo.blocks[2], blockinfo.blocks_s[2]) +
+             _cvt_x(r, blockinfo.blocknumbers[2], blockinfo.blocknumbers_s[2]) * blockinfo.blocks[2]
+    iz = 1 + _cvt_x(b, blockinfo.blocks[3], blockinfo.blocks_s[3]) +
+             _cvt_x(r, blockinfo.blocknumbers[3], blockinfo.blocknumbers_s[3]) * blockinfo.blocks[3]
+    it = 1 + _cvt_x(b, blockinfo.blocks[4], blockinfo.blocks_s[4]) +
+             _cvt_x(r, blockinfo.blocknumbers[4], blockinfo.blocknumbers_s[4]) * blockinfo.blocks[4]
+    f = ifelse(ix + shift[1] > NX || ix + shift[1] < 1, bc[1], Int8(1)) *
+        ifelse(iy + shift[2] > NY || iy + shift[2] < 1, bc[2], Int8(1)) *
+        ifelse(iz + shift[3] > NZ || iz + shift[3] < 1, bc[3], Int8(1)) *
+        ifelse(it + shift[4] > NT || it + shift[4] < 1, bc[4], Int8(1))
+    return f
+end
+
+# Fused kernel: positive direction (a > 0)
+# y(b,r) = U†_a(bs,rs) * x(bs,rs) * factor
+function _cudakernel_fused_hop_pos!(y, A, x, shift, blockinfo, bc, NX, NY, NZ, NT)
+    b = Int64(CUDA.threadIdx().x)
+    r = Int64(CUDA.blockIdx().x)
+    bs, rs = _shifted_idx(b, r, shift, blockinfo)
+    fac = _bc_factor(b, r, shift, blockinfo, bc, NX, NY, NZ, NT)
+    @inbounds for alpha = 1:4
+        x1 = x[1, alpha, bs, rs] * fac
+        x2 = x[2, alpha, bs, rs] * fac
+        x3 = x[3, alpha, bs, rs] * fac
+        y[1, alpha, b, r] = conj(A[1,1,bs,rs])*x1 + conj(A[2,1,bs,rs])*x2 + conj(A[3,1,bs,rs])*x3
+        y[2, alpha, b, r] = conj(A[1,2,bs,rs])*x1 + conj(A[2,2,bs,rs])*x2 + conj(A[3,2,bs,rs])*x3
+        y[3, alpha, b, r] = conj(A[1,3,bs,rs])*x1 + conj(A[2,3,bs,rs])*x2 + conj(A[3,3,bs,rs])*x3
+    end
+    return nothing
+end
+
+# Fused kernel: negative direction (a < 0, aa = -a)
+# y(b,r) = U_aa(b,r) * x(bs,rs) * factor
+function _cudakernel_fused_hop_neg!(y, A, x, shift, blockinfo, bc, NX, NY, NZ, NT)
+    b = Int64(CUDA.threadIdx().x)
+    r = Int64(CUDA.blockIdx().x)
+    bs, rs = _shifted_idx(b, r, shift, blockinfo)
+    fac = _bc_factor(b, r, shift, blockinfo, bc, NX, NY, NZ, NT)
+    @inbounds for alpha = 1:4
+        x1 = x[1, alpha, bs, rs] * fac
+        x2 = x[2, alpha, bs, rs] * fac
+        x3 = x[3, alpha, bs, rs] * fac
+        y[1, alpha, b, r] = A[1,1,b,r]*x1 + A[1,2,b,r]*x2 + A[1,3,b,r]*x3
+        y[2, alpha, b, r] = A[2,1,b,r]*x1 + A[2,2,b,r]*x2 + A[2,3,b,r]*x3
+        y[3, alpha, b, r] = A[3,1,b,r]*x1 + A[3,2,b,r]*x2 + A[3,3,b,r]*x3
+    end
+    return nothing
+end
+
+const _BC_DEFAULT = (Int8(1), Int8(1), Int8(1), Int8(-1))
+
+@inline function _dir_to_shift(a::Int)
+    s1 = Int8(ifelse(abs(a) == 1, sign(a), 0))
+    s2 = Int8(ifelse(abs(a) == 2, sign(a), 0))
+    s3 = Int8(ifelse(abs(a) == 3, sign(a), 0))
+    s4 = Int8(ifelse(abs(a) == 4, sign(a), 0))
+    return (s1, s2, s3, s4)
+end
+
+export fused_hopping_gpu!
+export fused_wilson_mul_gpu!
+export batched_hopping_steps_gpu!
+export batched_inv_hopping_gpu!
+
+# ============================================================
+#  Fused Wilson Dirac kernel — replaces external mul!(y, D, x)
+#  and mul!(y, D', x).  Zero allocations.
+# ============================================================
+#
+# Convention (from LatticeDiracOperators):
+#   D*x  = x - κ Σ_ν [ (r-γ_ν) U_ν(site) x(site+ν̂) +
+#                        (r+γ_ν) U†_ν(site-ν̂) x(site-ν̂) ]
+#   D†*x = x - κ Σ_ν [ (r+γ_ν) U_ν(site) x(site+ν̂) +
+#                        (r-γ_ν) U†_ν(site-ν̂) x(site-ν̂) ]
+#
+# Gamma matrices (Euclidean, Dirac rep):
+#   γ1: (1,4)=-i  (2,3)=-i  (3,2)=+i  (4,1)=+i
+#   γ2: (1,4)=-1  (2,3)=+1  (3,2)=+1  (4,1)=-1
+#   γ3: (1,3)=-i  (2,4)=+i  (3,1)=+i  (4,2)=-i
+#   γ4: (1,3)=-1  (2,4)=-1  (3,1)=-1  (4,2)=-1
+#
+# With r=1, (1±γ_ν) has 2 nonzeros per row → spin projection.
+# We hardcode these as inline functions for maximum performance.
+# ============================================================
+
+# ---- Spin projectors: each returns two 2-spinor components ----
+# (1-γ_ν): used for forward hop in D, backward hop in D†
+# (1+γ_ν): used for backward hop in D, forward hop in D†
+
+# (1-γ₁)ψ:  row1 = ψ₁ + i·ψ₄,  row2 = ψ₂ + i·ψ₃,  row3 = ψ₃ - i·ψ₂,  row4 = ψ₄ - i·ψ₁
+@inline _proj_m1(s1,s2,s3,s4) = (s1 + im*s4, s2 + im*s3, s3 - im*s2, s4 - im*s1)
+# (1+γ₁)ψ:  row1 = ψ₁ - i·ψ₄,  row2 = ψ₂ - i·ψ₃,  row3 = ψ₃ + i·ψ₂,  row4 = ψ₄ + i·ψ₁
+@inline _proj_p1(s1,s2,s3,s4) = (s1 - im*s4, s2 - im*s3, s3 + im*s2, s4 + im*s1)
+
+# (1-γ₂)ψ:  row1 = ψ₁ + ψ₄,  row2 = ψ₂ - ψ₃,  row3 = ψ₃ - ψ₂,  row4 = ψ₄ + ψ₁
+@inline _proj_m2(s1,s2,s3,s4) = (s1 + s4, s2 - s3, s3 - s2, s4 + s1)
+# (1+γ₂)ψ:  row1 = ψ₁ - ψ₄,  row2 = ψ₂ + ψ₃,  row3 = ψ₃ + ψ₂,  row4 = ψ₄ - ψ₁
+@inline _proj_p2(s1,s2,s3,s4) = (s1 - s4, s2 + s3, s3 + s2, s4 - s1)
+
+# (1-γ₃)ψ:  row1 = ψ₁ + i·ψ₃,  row2 = ψ₂ - i·ψ₄,  row3 = ψ₃ - i·ψ₁,  row4 = ψ₄ + i·ψ₂
+@inline _proj_m3(s1,s2,s3,s4) = (s1 + im*s3, s2 - im*s4, s3 - im*s1, s4 + im*s2)
+# (1+γ₃)ψ:  row1 = ψ₁ - i·ψ₃,  row2 = ψ₂ + i·ψ₄,  row3 = ψ₃ + i·ψ₁,  row4 = ψ₄ - i·ψ₂
+@inline _proj_p3(s1,s2,s3,s4) = (s1 - im*s3, s2 + im*s4, s3 + im*s1, s4 - im*s2)
+
+# (1-γ₄)ψ:  row1 = ψ₁ + ψ₃,  row2 = ψ₂ + ψ₄,  row3 = ψ₃ + ψ₁,  row4 = ψ₄ + ψ₂
+@inline _proj_m4(s1,s2,s3,s4) = (s1 + s3, s2 + s4, s3 + s1, s4 + s2)
+# (1+γ₄)ψ:  row1 = ψ₁ - ψ₃,  row2 = ψ₂ - ψ₄,  row3 = ψ₃ - ψ₁,  row4 = ψ₄ - ψ₂
+@inline _proj_p4(s1,s2,s3,s4) = (s1 - s3, s2 - s4, s3 - s1, s4 - s2)
+
+
+function _cudakernel_fused_wilson!(
+    yf     ::CuDeviceArray{ComplexF64, 4},   # output (3, 4, blocksize, rsize)
+    xf     ::CuDeviceArray{ComplexF64, 4},   # input
+    U1     ::CuDeviceArray{ComplexF64, 4},   # gauge μ=1 (3,3,bs,rs)
+    U2     ::CuDeviceArray{ComplexF64, 4},
+    U3     ::CuDeviceArray{ComplexF64, 4},
+    U4     ::CuDeviceArray{ComplexF64, 4},
+    κ      ::Float64,
+    blockinfo,
+    bc,
+    NX::Int, NY::Int, NZ::Int, NT::Int,
+    is_dagger::Bool   # false = D, true = D†
+)
+    b = Int64(CUDA.threadIdx().x)
+    r = Int64(CUDA.blockIdx().x)
+
+    # Read x at current site
+    @inbounds begin
+        x1_1 = xf[1,1,b,r]; x2_1 = xf[2,1,b,r]; x3_1 = xf[3,1,b,r]
+        x1_2 = xf[1,2,b,r]; x2_2 = xf[2,2,b,r]; x3_2 = xf[3,2,b,r]
+        x1_3 = xf[1,3,b,r]; x2_3 = xf[2,3,b,r]; x3_3 = xf[3,3,b,r]
+        x1_4 = xf[1,4,b,r]; x2_4 = xf[2,4,b,r]; x3_4 = xf[3,4,b,r]
+    end
+
+    # Accumulators for temp = Σ_ν contribution (per color, per spin)
+    a1_1=zero(ComplexF64); a2_1=zero(ComplexF64); a3_1=zero(ComplexF64)
+    a1_2=zero(ComplexF64); a2_2=zero(ComplexF64); a3_2=zero(ComplexF64)
+    a1_3=zero(ComplexF64); a2_3=zero(ComplexF64); a3_3=zero(ComplexF64)
+    a1_4=zero(ComplexF64); a2_4=zero(ComplexF64); a3_4=zero(ComplexF64)
+
+    # ---- Process each direction ν = 1..4 ----
+    for ν in 1:4
+        Uν = ν == 1 ? U1 : (ν == 2 ? U2 : (ν == 3 ? U3 : U4))
+
+        # ------ Forward hop: xplus = x(site+ν̂), temp1 = U_ν(site) * xplus ------
+        shift_fwd = (Int8(ν==1), Int8(ν==2), Int8(ν==3), Int8(ν==4))
+        bs_f, rs_f = _shifted_idx(b, r, shift_fwd, blockinfo)
+        fac_f = _bc_factor(b, r, shift_fwd, blockinfo, bc, NX, NY, NZ, NT)
+
+        @inbounds begin
+            # Read shifted fermion x(site+ν̂)
+            xp1_1 = xf[1,1,bs_f,rs_f]*fac_f; xp2_1 = xf[2,1,bs_f,rs_f]*fac_f; xp3_1 = xf[3,1,bs_f,rs_f]*fac_f
+            xp1_2 = xf[1,2,bs_f,rs_f]*fac_f; xp2_2 = xf[2,2,bs_f,rs_f]*fac_f; xp3_2 = xf[3,2,bs_f,rs_f]*fac_f
+            xp1_3 = xf[1,3,bs_f,rs_f]*fac_f; xp2_3 = xf[2,3,bs_f,rs_f]*fac_f; xp3_3 = xf[3,3,bs_f,rs_f]*fac_f
+            xp1_4 = xf[1,4,bs_f,rs_f]*fac_f; xp2_4 = xf[2,4,bs_f,rs_f]*fac_f; xp3_4 = xf[3,4,bs_f,rs_f]*fac_f
+
+            # U_ν(b,r) * xplus — for each spin component
+            u11=Uν[1,1,b,r]; u12=Uν[1,2,b,r]; u13=Uν[1,3,b,r]
+            u21=Uν[2,1,b,r]; u22=Uν[2,2,b,r]; u23=Uν[2,3,b,r]
+            u31=Uν[3,1,b,r]; u32=Uν[3,2,b,r]; u33=Uν[3,3,b,r]
+        end
+        # temp1[color, spin] = U * xplus  (per spin)
+        t1_1 = u11*xp1_1 + u12*xp2_1 + u13*xp3_1
+        t2_1 = u21*xp1_1 + u22*xp2_1 + u23*xp3_1
+        t3_1 = u31*xp1_1 + u32*xp2_1 + u33*xp3_1
+        t1_2 = u11*xp1_2 + u12*xp2_2 + u13*xp3_2
+        t2_2 = u21*xp1_2 + u22*xp2_2 + u23*xp3_2
+        t3_2 = u31*xp1_2 + u32*xp2_2 + u33*xp3_2
+        t1_3 = u11*xp1_3 + u12*xp2_3 + u13*xp3_3
+        t2_3 = u21*xp1_3 + u22*xp2_3 + u23*xp3_3
+        t3_3 = u31*xp1_3 + u32*xp2_3 + u33*xp3_3
+        t1_4 = u11*xp1_4 + u12*xp2_4 + u13*xp3_4
+        t2_4 = u21*xp1_4 + u22*xp2_4 + u23*xp3_4
+        t3_4 = u31*xp1_4 + u32*xp2_4 + u33*xp3_4
+
+        # Apply spin projector to temp1: D uses (r-γ_ν), D† uses (r+γ_ν)
+        # Apply per color independently (spin projector acts on Dirac indices only)
+        if !is_dagger
+            # Forward hop in D: (1-γ_ν)
+            if ν == 1
+                p1_1,p1_2,p1_3,p1_4 = _proj_m1(t1_1,t1_2,t1_3,t1_4)
+                p2_1,p2_2,p2_3,p2_4 = _proj_m1(t2_1,t2_2,t2_3,t2_4)
+                p3_1,p3_2,p3_3,p3_4 = _proj_m1(t3_1,t3_2,t3_3,t3_4)
+            elseif ν == 2
+                p1_1,p1_2,p1_3,p1_4 = _proj_m2(t1_1,t1_2,t1_3,t1_4)
+                p2_1,p2_2,p2_3,p2_4 = _proj_m2(t2_1,t2_2,t2_3,t2_4)
+                p3_1,p3_2,p3_3,p3_4 = _proj_m2(t3_1,t3_2,t3_3,t3_4)
+            elseif ν == 3
+                p1_1,p1_2,p1_3,p1_4 = _proj_m3(t1_1,t1_2,t1_3,t1_4)
+                p2_1,p2_2,p2_3,p2_4 = _proj_m3(t2_1,t2_2,t2_3,t2_4)
+                p3_1,p3_2,p3_3,p3_4 = _proj_m3(t3_1,t3_2,t3_3,t3_4)
+            else
+                p1_1,p1_2,p1_3,p1_4 = _proj_m4(t1_1,t1_2,t1_3,t1_4)
+                p2_1,p2_2,p2_3,p2_4 = _proj_m4(t2_1,t2_2,t2_3,t2_4)
+                p3_1,p3_2,p3_3,p3_4 = _proj_m4(t3_1,t3_2,t3_3,t3_4)
+            end
+        else
+            # Forward hop in D†: (1+γ_ν)
+            if ν == 1
+                p1_1,p1_2,p1_3,p1_4 = _proj_p1(t1_1,t1_2,t1_3,t1_4)
+                p2_1,p2_2,p2_3,p2_4 = _proj_p1(t2_1,t2_2,t2_3,t2_4)
+                p3_1,p3_2,p3_3,p3_4 = _proj_p1(t3_1,t3_2,t3_3,t3_4)
+            elseif ν == 2
+                p1_1,p1_2,p1_3,p1_4 = _proj_p2(t1_1,t1_2,t1_3,t1_4)
+                p2_1,p2_2,p2_3,p2_4 = _proj_p2(t2_1,t2_2,t2_3,t2_4)
+                p3_1,p3_2,p3_3,p3_4 = _proj_p2(t3_1,t3_2,t3_3,t3_4)
+            elseif ν == 3
+                p1_1,p1_2,p1_3,p1_4 = _proj_p3(t1_1,t1_2,t1_3,t1_4)
+                p2_1,p2_2,p2_3,p2_4 = _proj_p3(t2_1,t2_2,t2_3,t2_4)
+                p3_1,p3_2,p3_3,p3_4 = _proj_p3(t3_1,t3_2,t3_3,t3_4)
+            else
+                p1_1,p1_2,p1_3,p1_4 = _proj_p4(t1_1,t1_2,t1_3,t1_4)
+                p2_1,p2_2,p2_3,p2_4 = _proj_p4(t2_1,t2_2,t2_3,t2_4)
+                p3_1,p3_2,p3_3,p3_4 = _proj_p4(t3_1,t3_2,t3_3,t3_4)
+            end
+        end
+
+        # Accumulate forward contribution (κ * projected)
+        a1_1 += κ*p1_1; a2_1 += κ*p2_1; a3_1 += κ*p3_1
+        a1_2 += κ*p1_2; a2_2 += κ*p2_2; a3_2 += κ*p3_2
+        a1_3 += κ*p1_3; a2_3 += κ*p2_3; a3_3 += κ*p3_3
+        a1_4 += κ*p1_4; a2_4 += κ*p2_4; a3_4 += κ*p3_4
+
+        # ------ Backward hop: xminus = x(site-ν̂), temp2 = U†_ν(site-ν̂) * xminus ------
+        shift_bwd = (-Int8(ν==1), -Int8(ν==2), -Int8(ν==3), -Int8(ν==4))
+        bs_b, rs_b = _shifted_idx(b, r, shift_bwd, blockinfo)
+        fac_b = _bc_factor(b, r, shift_bwd, blockinfo, bc, NX, NY, NZ, NT)
+
+        @inbounds begin
+            xm1_1 = xf[1,1,bs_b,rs_b]*fac_b; xm2_1 = xf[2,1,bs_b,rs_b]*fac_b; xm3_1 = xf[3,1,bs_b,rs_b]*fac_b
+            xm1_2 = xf[1,2,bs_b,rs_b]*fac_b; xm2_2 = xf[2,2,bs_b,rs_b]*fac_b; xm3_2 = xf[3,2,bs_b,rs_b]*fac_b
+            xm1_3 = xf[1,3,bs_b,rs_b]*fac_b; xm2_3 = xf[2,3,bs_b,rs_b]*fac_b; xm3_3 = xf[3,3,bs_b,rs_b]*fac_b
+            xm1_4 = xf[1,4,bs_b,rs_b]*fac_b; xm2_4 = xf[2,4,bs_b,rs_b]*fac_b; xm3_4 = xf[3,4,bs_b,rs_b]*fac_b
+
+            # U†_ν(site-ν̂): conj transpose of U_ν at shifted site
+            v11=conj(Uν[1,1,bs_b,rs_b]); v12=conj(Uν[2,1,bs_b,rs_b]); v13=conj(Uν[3,1,bs_b,rs_b])
+            v21=conj(Uν[1,2,bs_b,rs_b]); v22=conj(Uν[2,2,bs_b,rs_b]); v23=conj(Uν[3,2,bs_b,rs_b])
+            v31=conj(Uν[1,3,bs_b,rs_b]); v32=conj(Uν[2,3,bs_b,rs_b]); v33=conj(Uν[3,3,bs_b,rs_b])
+        end
+        # temp2[color,spin] = U† * xminus
+        q1_1 = v11*xm1_1 + v12*xm2_1 + v13*xm3_1
+        q2_1 = v21*xm1_1 + v22*xm2_1 + v23*xm3_1
+        q3_1 = v31*xm1_1 + v32*xm2_1 + v33*xm3_1
+        q1_2 = v11*xm1_2 + v12*xm2_2 + v13*xm3_2
+        q2_2 = v21*xm1_2 + v22*xm2_2 + v23*xm3_2
+        q3_2 = v31*xm1_2 + v32*xm2_2 + v33*xm3_2
+        q1_3 = v11*xm1_3 + v12*xm2_3 + v13*xm3_3
+        q2_3 = v21*xm1_3 + v22*xm2_3 + v23*xm3_3
+        q3_3 = v31*xm1_3 + v32*xm2_3 + v33*xm3_3
+        q1_4 = v11*xm1_4 + v12*xm2_4 + v13*xm3_4
+        q2_4 = v21*xm1_4 + v22*xm2_4 + v23*xm3_4
+        q3_4 = v31*xm1_4 + v32*xm2_4 + v33*xm3_4
+
+        # Apply spin projector to temp2: D uses (r+γ_ν), D† uses (r-γ_ν)
+        if !is_dagger
+            if ν == 1
+                r1_1,r1_2,r1_3,r1_4 = _proj_p1(q1_1,q1_2,q1_3,q1_4)
+                r2_1,r2_2,r2_3,r2_4 = _proj_p1(q2_1,q2_2,q2_3,q2_4)
+                r3_1,r3_2,r3_3,r3_4 = _proj_p1(q3_1,q3_2,q3_3,q3_4)
+            elseif ν == 2
+                r1_1,r1_2,r1_3,r1_4 = _proj_p2(q1_1,q1_2,q1_3,q1_4)
+                r2_1,r2_2,r2_3,r2_4 = _proj_p2(q2_1,q2_2,q2_3,q2_4)
+                r3_1,r3_2,r3_3,r3_4 = _proj_p2(q3_1,q3_2,q3_3,q3_4)
+            elseif ν == 3
+                r1_1,r1_2,r1_3,r1_4 = _proj_p3(q1_1,q1_2,q1_3,q1_4)
+                r2_1,r2_2,r2_3,r2_4 = _proj_p3(q2_1,q2_2,q2_3,q2_4)
+                r3_1,r3_2,r3_3,r3_4 = _proj_p3(q3_1,q3_2,q3_3,q3_4)
+            else
+                r1_1,r1_2,r1_3,r1_4 = _proj_p4(q1_1,q1_2,q1_3,q1_4)
+                r2_1,r2_2,r2_3,r2_4 = _proj_p4(q2_1,q2_2,q2_3,q2_4)
+                r3_1,r3_2,r3_3,r3_4 = _proj_p4(q3_1,q3_2,q3_3,q3_4)
+            end
+        else
+            if ν == 1
+                r1_1,r1_2,r1_3,r1_4 = _proj_m1(q1_1,q1_2,q1_3,q1_4)
+                r2_1,r2_2,r2_3,r2_4 = _proj_m1(q2_1,q2_2,q2_3,q2_4)
+                r3_1,r3_2,r3_3,r3_4 = _proj_m1(q3_1,q3_2,q3_3,q3_4)
+            elseif ν == 2
+                r1_1,r1_2,r1_3,r1_4 = _proj_m2(q1_1,q1_2,q1_3,q1_4)
+                r2_1,r2_2,r2_3,r2_4 = _proj_m2(q2_1,q2_2,q2_3,q2_4)
+                r3_1,r3_2,r3_3,r3_4 = _proj_m2(q3_1,q3_2,q3_3,q3_4)
+            elseif ν == 3
+                r1_1,r1_2,r1_3,r1_4 = _proj_m3(q1_1,q1_2,q1_3,q1_4)
+                r2_1,r2_2,r2_3,r2_4 = _proj_m3(q2_1,q2_2,q2_3,q2_4)
+                r3_1,r3_2,r3_3,r3_4 = _proj_m3(q3_1,q3_2,q3_3,q3_4)
+            else
+                r1_1,r1_2,r1_3,r1_4 = _proj_m4(q1_1,q1_2,q1_3,q1_4)
+                r2_1,r2_2,r2_3,r2_4 = _proj_m4(q2_1,q2_2,q2_3,q2_4)
+                r3_1,r3_2,r3_3,r3_4 = _proj_m4(q3_1,q3_2,q3_3,q3_4)
+            end
+        end
+
+        # Accumulate backward contribution
+        a1_1 += κ*r1_1; a2_1 += κ*r2_1; a3_1 += κ*r3_1
+        a1_2 += κ*r1_2; a2_2 += κ*r2_2; a3_2 += κ*r3_2
+        a1_3 += κ*r1_3; a2_3 += κ*r2_3; a3_3 += κ*r3_3
+        a1_4 += κ*r1_4; a2_4 += κ*r2_4; a3_4 += κ*r3_4
+    end  # ν loop
+
+    # y = x - accumulated
+    @inbounds begin
+        yf[1,1,b,r] = x1_1 - a1_1; yf[2,1,b,r] = x2_1 - a2_1; yf[3,1,b,r] = x3_1 - a3_1
+        yf[1,2,b,r] = x1_2 - a1_2; yf[2,2,b,r] = x2_2 - a2_2; yf[3,2,b,r] = x3_2 - a3_2
+        yf[1,3,b,r] = x1_3 - a1_3; yf[2,3,b,r] = x2_3 - a2_3; yf[3,3,b,r] = x3_3 - a3_3
+        yf[1,4,b,r] = x1_4 - a1_4; yf[2,4,b,r] = x2_4 - a2_4; yf[3,4,b,r] = x3_4 - a3_4
+    end
+    return nothing
+end
+
+"""
+    fused_wilson_mul_gpu!(y, x, U, κ, is_dagger)
+
+Fused Wilson Dirac operator on GPU.  Zero allocations.
+  - is_dagger=false: y = D*x
+  - is_dagger=true:  y = D†*x
+Replaces external LatticeDiracOperators mul!(y, D, x) which allocates
+shift_fermion temporaries (~40 KB per call).
+"""
+function fused_wilson_mul_gpu!(y::WF3x1GPU, x::WF3x1GPU,
+                               U::GPUgauge, κ::Float64, is_dagger::Bool)
+    bi = x.blockinfo
+    blocksize = bi.blocksize
+    rsize     = bi.rsize
+    bc = _BC_DEFAULT
+    NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT
+    CUDA.@cuda threads=blocksize blocks=rsize _cudakernel_fused_wilson!(
+        y.f, x.f, U[1].U, U[2].U, U[3].U, U[4].U,
+        κ, bi, bc, NX, NY, NZ, NT, is_dagger)
+end
+
+
+"""
+    fused_hopping_gpu!(V, x, Gauge, paths_various)
+
+GPU hopping with fused kernels, double-buffering via f ↔ fshifted.
+Per step: 3 kernel launches + 3 CUDA.@sync → 1 kernel + 0 sync.
+"""
+function fused_hopping_gpu!(V::AbstractVector{<:WF3x1GPU}, x::WF3x1GPU,
+                            Gauge::GPUgauge, paths_various)
+    blocksize = x.blockinfo.blocksize
+    rsize     = x.blockinfo.rsize
+    NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
+    bi = x.blockinfo
+    bc = _BC_DEFAULT
+
+    @inbounds for k in eachindex(V)
+        copyx = V[k]
+        steps = paths_various[k].steps
+
+        # Initialize copyx from x (GPU memcpy, no kernel)
+        copyto!(copyx.f, x.f)
+
+        nsteps = length(steps)
+        if nsteps == 0 || (nsteps == 1 && steps[1].f == 0)
+            continue   # identity path
+        end
+
+        # Double-buffering: f ↔ fshifted, no intermediate sync
+        buf_a = copyx.f
+        buf_b = copyx.fshifted
+        flip = false
+
+        for step in steps
+            a = step.f
+            src = flip ? buf_b : buf_a
+            dst = flip ? buf_a : buf_b
+
+            if a > 0
+                shift = _dir_to_shift(-a)
+                CUDA.@cuda threads=blocksize blocks=rsize _cudakernel_fused_hop_pos!(
+                    dst, Gauge[a].U, src, shift, bi, bc, NX, NY, NZ, NT)
+            elseif a < 0
+                aa = -a
+                shift = _dir_to_shift(aa)
+                CUDA.@cuda threads=blocksize blocks=rsize _cudakernel_fused_hop_neg!(
+                    dst, Gauge[aa].U, src, shift, bi, bc, NX, NY, NZ, NT)
+            else
+                # a == 0: reset to original x
+                copyto!(dst, x.f)
+            end
+            flip = !flip
+        end
+
+        # If result is in fshifted (odd steps), copy back to f
+        if flip
+            copyto!(copyx.f, copyx.fshifted)
+        end
+    end
+end
+
+
+# ============================================================
+#  Batched multi-path hopping — 57 kernel launches → max_steps
+# ============================================================
+
+function _cudakernel_batched_hop_step!(
+    dst, src, U1, U2, U3, U4,
+    dirs,         # CuDeviceArray{Int8,2} (max_steps, npaths)
+    nsteps_arr,   # CuDeviceArray{Int32,1} (npaths,)
+    step_idx,     # Int32
+    npaths,       # Int32
+    blockinfo, bc,
+    NX::Int, NY::Int, NZ::Int, NT::Int
+)
+    b = Int64(CUDA.threadIdx().x)
+    r = Int64(CUDA.blockIdx().x)
+
+    @inbounds for pidx in Int32(1):npaths
+        if step_idx > nsteps_arr[pidx]
+            # Copy-through: path already done
+            for g in 1:4
+                dst[1,g,b,r,pidx] = src[1,g,b,r,pidx]
+                dst[2,g,b,r,pidx] = src[2,g,b,r,pidx]
+                dst[3,g,b,r,pidx] = src[3,g,b,r,pidx]
+            end
+        else
+            d = Int(dirs[step_idx, pidx])
+            if d > 0
+                # positive direction: y(b,r) = U†_d(bs,rs) * x(bs,rs) * fac
+                s1 = Int8(d==1 ? -1 : 0); s2 = Int8(d==2 ? -1 : 0)
+                s3 = Int8(d==3 ? -1 : 0); s4 = Int8(d==4 ? -1 : 0)
+                shift = (s1, s2, s3, s4)
+                bs, rs = _shifted_idx(b, r, shift, blockinfo)
+                fac = _bc_factor(b, r, shift, blockinfo, bc, NX, NY, NZ, NT)
+                Uν = d == 1 ? U1 : (d == 2 ? U2 : (d == 3 ? U3 : U4))
+                u11=Uν[1,1,bs,rs]; u21=Uν[2,1,bs,rs]; u31=Uν[3,1,bs,rs]
+                u12=Uν[1,2,bs,rs]; u22=Uν[2,2,bs,rs]; u32=Uν[3,2,bs,rs]
+                u13=Uν[1,3,bs,rs]; u23=Uν[2,3,bs,rs]; u33=Uν[3,3,bs,rs]
+                for alpha in 1:4
+                    x1 = src[1,alpha,bs,rs,pidx]*fac
+                    x2 = src[2,alpha,bs,rs,pidx]*fac
+                    x3 = src[3,alpha,bs,rs,pidx]*fac
+                    dst[1,alpha,b,r,pidx] = conj(u11)*x1 + conj(u21)*x2 + conj(u31)*x3
+                    dst[2,alpha,b,r,pidx] = conj(u12)*x1 + conj(u22)*x2 + conj(u32)*x3
+                    dst[3,alpha,b,r,pidx] = conj(u13)*x1 + conj(u23)*x2 + conj(u33)*x3
+                end
+            elseif d < 0
+                # negative direction: y(b,r) = U_|d|(b,r) * x(bs,rs) * fac
+                aa = -d
+                s1 = Int8(aa==1 ? 1 : 0); s2 = Int8(aa==2 ? 1 : 0)
+                s3 = Int8(aa==3 ? 1 : 0); s4 = Int8(aa==4 ? 1 : 0)
+                shift = (s1, s2, s3, s4)
+                bs, rs = _shifted_idx(b, r, shift, blockinfo)
+                fac = _bc_factor(b, r, shift, blockinfo, bc, NX, NY, NZ, NT)
+                Uν = aa == 1 ? U1 : (aa == 2 ? U2 : (aa == 3 ? U3 : U4))
+                u11=Uν[1,1,b,r]; u12=Uν[1,2,b,r]; u13=Uν[1,3,b,r]
+                u21=Uν[2,1,b,r]; u22=Uν[2,2,b,r]; u23=Uν[2,3,b,r]
+                u31=Uν[3,1,b,r]; u32=Uν[3,2,b,r]; u33=Uν[3,3,b,r]
+                for alpha in 1:4
+                    x1 = src[1,alpha,bs,rs,pidx]*fac
+                    x2 = src[2,alpha,bs,rs,pidx]*fac
+                    x3 = src[3,alpha,bs,rs,pidx]*fac
+                    dst[1,alpha,b,r,pidx] = u11*x1 + u12*x2 + u13*x3
+                    dst[2,alpha,b,r,pidx] = u21*x1 + u22*x2 + u23*x3
+                    dst[3,alpha,b,r,pidx] = u31*x1 + u32*x2 + u33*x3
+                end
+            else
+                # d == 0: identity step — copy through
+                for g in 1:4
+                    dst[1,g,b,r,pidx] = src[1,g,b,r,pidx]
+                    dst[2,g,b,r,pidx] = src[2,g,b,r,pidx]
+                    dst[3,g,b,r,pidx] = src[3,g,b,r,pidx]
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    batched_hopping_steps_gpu!(hopped_all, temp_5d, x_fields, Gauge,
+                                dirs_gpu, nsteps_gpu, max_steps, npaths,
+                                blocksize, rsize)
+
+25개 fused_hopping_gpu! (57 커널) → max_steps 커널.
+Double-buffering: hopped_all ↔ temp_5d, step별 1 커널.
+"""
+function batched_hopping_steps_gpu!(hopped_all, temp_5d, x_fields,
+                                    Gauge, dirs_gpu, nsteps_gpu, max_steps, npaths,
+                                    blocksize, rsize)
+    bi = x_fields[1].blockinfo
+    bc = _BC_DEFAULT
+    NX = x_fields[1].NX; NY = x_fields[1].NY
+    NZ = x_fields[1].NZ; NT = x_fields[1].NT
+
+    # 1) Pack all x[i] → hopped_all
+    pack_fermions!(hopped_all, x_fields)
+
+    # 2) Step-by-step batched hop with double-buffering
+    buf_a = hopped_all
+    buf_b = temp_5d
+    for s in Int32(1):Int32(max_steps)
+        CUDA.@cuda threads=blocksize blocks=rsize _cudakernel_batched_hop_step!(
+            buf_b, buf_a,
+            Gauge[1].U, Gauge[2].U, Gauge[3].U, Gauge[4].U,
+            dirs_gpu, nsteps_gpu, s, Int32(npaths),
+            bi, bc, NX, NY, NZ, NT)
+        buf_a, buf_b = buf_b, buf_a
+    end
+
+    # 3) After max_steps swaps: if even, buf_a=hopped_all; if odd, buf_a=temp_5d
+    if isodd(max_steps)
+        copyto!(hopped_all, temp_5d)
+    end
+end
+
+"""
+    batched_inv_hopping_gpu!(ci_all, temp_5d, Gauge,
+                              inv_dirs_gpu, nsteps_gpu, max_steps, npaths,
+                              blocksize, rsize, bi, NX, NY, NZ, NT)
+
+DeltaRule! 역경로 hop을 batched로 수행.
+ci_all을 in-place double-buffering으로 처리 (ci_all ↔ temp_5d).
+결과는 ci_all에 저장됨.
+"""
+function batched_inv_hopping_gpu!(ci_all, temp_5d, Gauge,
+                                   inv_dirs_gpu, nsteps_gpu, max_steps, npaths,
+                                   blocksize, rsize, bi, NX, NY, NZ, NT)
+    bc = _BC_DEFAULT
+
+    buf_a = ci_all
+    buf_b = temp_5d
+    for s in Int32(1):Int32(max_steps)
+        CUDA.@cuda threads=blocksize blocks=rsize _cudakernel_batched_hop_step!(
+            buf_b, buf_a,
+            Gauge[1].U, Gauge[2].U, Gauge[3].U, Gauge[4].U,
+            inv_dirs_gpu, nsteps_gpu, s, Int32(npaths),
+            bi, bc, NX, NY, NZ, NT)
+        buf_a, buf_b = buf_b, buf_a
+    end
+
+    if isodd(max_steps)
+        copyto!(ci_all, temp_5d)
+    end
+end
 
 
 end # module gpu
