@@ -13,6 +13,8 @@ export restrict_f2c!, prolongate_c2f!, coarse_apply!
 export mr_smooth!, sap_smooth!
 export block_orthonormalize!
 export deflated_initial_guess
+export precompute_coarse_operator!
+export gamma5!, chiral_project!, gamma5_sign
 
 
 const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
@@ -88,6 +90,128 @@ mutable struct DDalphaAMG_Setup{T<:WF3x1}
     NBX::Int; NBY::Int; NBZ::Int; NBT::Int
     Nblocks::Int
     Dc_matrix::Union{Nothing, Matrix{ComplexF64}}
+    coarse_stencil::Union{Nothing, Any}
+    _gmres_V::Vector{CoarseVector}
+    _gmres_w::Union{Nothing, CoarseVector}
+    _gmres_r::Union{Nothing, CoarseVector}
+    _gmres_H::Matrix{ComplexF64}
+    _gmres_e1::Vector{ComplexF64}
+    _gmres_restart::Int
+end
+
+
+"""
+    CoarseStencilOperator
+
+Coarse operator stored in block-stencil form on coarse grid DOFs:
+- onsite block: self[:, :, b]
+- nearest-neighbor links: plus[:, :, b, μ], minus[:, :, b, μ]  (μ=1..4)
+
+Each block matrix has size Nv×Nv, and total coarse size is Nv*Nblocks.
+"""
+mutable struct CoarseStencilOperator
+    Nv::Int
+    Nblocks::Int
+    NBX::Int
+    NBY::Int
+    NBZ::Int
+    NBT::Int
+    self::Array{ComplexF64,3}   # (Nv, Nv, Nblocks)
+    plus::Array{ComplexF64,4}   # (Nv, Nv, Nblocks, 4)
+    minus::Array{ComplexF64,4}  # (Nv, Nv, Nblocks, 4)
+    nb_plus::Matrix{Int}        # (Nblocks, 4)
+    nb_minus::Matrix{Int}       # (Nblocks, 4)
+end
+
+
+@inline function _block_coords(b::Int, NBX::Int, NBY::Int, NBZ::Int)
+    t = (b - 1) ÷ (NBX * NBY * NBZ)
+    rem1 = (b - 1) - t * (NBX * NBY * NBZ)
+    z = rem1 ÷ (NBX * NBY)
+    rem2 = rem1 - z * (NBX * NBY)
+    y = rem2 ÷ NBX
+    x = rem2 - y * NBX
+    return x + 1, y + 1, z + 1, t + 1
+end
+
+@inline function _periodic_shift(idx::Int, delta::Int, n::Int)
+    return mod1(idx + delta, n)
+end
+
+@inline function _neighbor_block(b::Int, mu::Int, sgn::Int, NBX::Int, NBY::Int, NBZ::Int, NBT::Int)
+    bx, by, bz, bt = _block_coords(b, NBX, NBY, NBZ)
+    if mu == 1
+        bx = _periodic_shift(bx, sgn, NBX)
+    elseif mu == 2
+        by = _periodic_shift(by, sgn, NBY)
+    elseif mu == 3
+        bz = _periodic_shift(bz, sgn, NBZ)
+    else
+        bt = _periodic_shift(bt, sgn, NBT)
+    end
+    return block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
+end
+
+
+function apply_coarse_stencil!(out::CoarseVector, op::CoarseStencilOperator, x::CoarseVector)
+    Nv = op.Nv
+    fill!(out.data, zero(ComplexF64))
+    # Coefficients were stored as A[dst, src] while fixing a source block basis vector.
+    # Therefore apply is most naturally done as source-based scatter.
+    @inbounds for bs in 1:op.Nblocks
+        src_base = (bs - 1) * Nv
+
+        # onsite: dst = bs
+        dst_base = src_base
+        for i in 1:Nv
+            acc = zero(ComplexF64)
+            for j in 1:Nv
+                acc += op.self[i, j, bs] * x.data[src_base + j]
+            end
+            out.data[dst_base + i] += acc
+        end
+
+        # +/− nearest neighbors: dst = nb_plus/minus(bs, mu)
+        for mu in 1:4
+            bp = op.nb_plus[bs, mu]
+            bm = op.nb_minus[bs, mu]
+            dstp_base = (bp - 1) * Nv
+            dstm_base = (bm - 1) * Nv
+
+            for i in 1:Nv
+                accp = zero(ComplexF64)
+                accm = zero(ComplexF64)
+                for j in 1:Nv
+                    accp += op.plus[i, j, bs, mu] * x.data[src_base + j]
+                    accm += op.minus[i, j, bs, mu] * x.data[src_base + j]
+                end
+                if bp == bm
+                    # On coarse extent 2 along direction mu, +/- neighbors coincide.
+                    # precompute currently stores the full response in both slots in this
+                    # degenerate case, so adding both would double-count.
+                    out.data[dstp_base + i] += accp
+                else
+                    out.data[dstp_base + i] += accp
+                    out.data[dstm_base + i] += accm
+                end
+            end
+        end
+    end
+    return out
+end
+
+
+function ensure_coarse_gmres_cache!(setup::DDalphaAMG_Setup, template::CoarseVector, restart::Int)
+    m = min(restart, length(template.data))
+    if setup._gmres_restart != m || length(setup._gmres_V) != m + 1
+        setup._gmres_V = [similar(template) for _ in 1:(m + 1)]
+        setup._gmres_w = similar(template)
+        setup._gmres_r = similar(template)
+        setup._gmres_H = zeros(ComplexF64, m + 1, m)
+        setup._gmres_e1 = zeros(ComplexF64, m + 1)
+        setup._gmres_restart = m
+    end
+    return m
 end
 
 
@@ -241,6 +365,65 @@ function block_inner_product(x::WF3x1, y::WF3x1, bx::Int, by::Int, bz::Int, bt::
         end
     end
     return val
+end
+
+
+# ==========================================
+#  γ₅ ユーティリティ (Chiral Splitting)
+# ==========================================
+
+"""
+γ₅ の符号。このコードでの convention:
+  γ₅ = diag(-1, -1, +1, +1)   (ig=1,2 → -1,  ig=3,4 → +1)
+"""
+@inline gamma5_sign(ig::Int) = ig <= 2 ? -1 : 1
+
+"""
+    gamma5!(x::WF3x1)
+
+x に γ₅ を in-place で適用: x → γ₅ x
+"""
+function gamma5!(x::WF3x1)
+    NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
+    NC, NG = x.NC, x.NG
+    @inbounds for it=1:NT, iz=1:NZ, iy=1:NY, ix=1:NX
+        for ic=1:NC
+            # ig=1,2 → ×(-1)
+            x[ic,ix,iy,iz,it,1] = -x[ic,ix,iy,iz,it,1]
+            x[ic,ix,iy,iz,it,2] = -x[ic,ix,iy,iz,it,2]
+            # ig=3,4 は γ₅=+1 なので変更不要
+        end
+    end
+    return x
+end
+
+"""
+    chiral_project!(x::WF3x1, chirality::Symbol)
+
+カイラル射影を in-place で適用:
+  :plus  → P₊ = (1+γ₅)/2: ig=3,4 を保持, ig=1,2 をゼロ化
+  :minus → P₋ = (1-γ₅)/2: ig=1,2 を保持, ig=3,4 をゼロ化
+
+Note: γ₅=diag(-1,-1,+1,+1) なので
+  P₊ = diag(0,0,1,1),  P₋ = diag(1,1,0,0)
+"""
+function chiral_project!(x::WF3x1, chirality::Symbol)
+    NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
+    NC = x.NC
+    @inbounds for it=1:NT, iz=1:NZ, iy=1:NY, ix=1:NX
+        for ic=1:NC
+            if chirality == :plus
+                # P₊: zero out ig=1,2 (γ₅ eigenvalue -1)
+                x[ic,ix,iy,iz,it,1] = zero(ComplexF64)
+                x[ic,ix,iy,iz,it,2] = zero(ComplexF64)
+            else
+                # P₋: zero out ig=3,4 (γ₅ eigenvalue +1)
+                x[ic,ix,iy,iz,it,3] = zero(ComplexF64)
+                x[ic,ix,iy,iz,it,4] = zero(ComplexF64)
+            end
+        end
+    end
+    return x
 end
 
 
@@ -491,16 +674,84 @@ end
 # ==========================================
 
 """
-    precompute_coarse_operator!(setup, D)
+    precompute_coarse_operator!(setup, D; verbose=false, mode=:stencil)
 
-粗格子演算子 Dc = R·D·P を密行列として事前計算し、setup.Dc_matrix に格納する。
-これにより coarse_gmres 内の coarse_apply が行列ベクトル積になり、
-fine grid D の適用が不要になる。
+Build coarse operator in one of two forms:
+- `mode=:stencil` (default): block-stencil operator with Nv×Nv couplings per block/neighbor.
+- `mode=:dense`: full dense matrix Dc (legacy path).
 """
-function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D; verbose::Bool=false)
+function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
+                                     verbose::Bool=false,
+                                     mode::Symbol=:stencil)
     Nv = setup.Nv
     Nblocks = setup.Nblocks
     n = Nv * Nblocks
+
+    setup.Dc_matrix = nothing
+    setup.coarse_stencil = nothing
+
+    if mode == :stencil
+        if verbose
+            nnz_blocks = Nblocks * (1 + 8)
+            bytes_est = nnz_blocks * Nv * Nv * 16
+            println("  粗格子演算子(stencil)を事前計算中... blocks=$(Nblocks), Nv=$(Nv), approx $(round(bytes_est/1024/1024, digits=1)) MB")
+        end
+
+        self = zeros(ComplexF64, Nv, Nv, Nblocks)
+        plus = zeros(ComplexF64, Nv, Nv, Nblocks, 4)
+        minus = zeros(ComplexF64, Nv, Nv, Nblocks, 4)
+        nb_plus = Matrix{Int}(undef, Nblocks, 4)
+        nb_minus = Matrix{Int}(undef, Nblocks, 4)
+
+        for b in 1:Nblocks, mu in 1:4
+            nb_plus[b, mu] = _neighbor_block(b, mu, +1, setup.NBX, setup.NBY, setup.NBZ, setup.NBT)
+            nb_minus[b, mu] = _neighbor_block(b, mu, -1, setup.NBX, setup.NBY, setup.NBZ, setup.NBT)
+        end
+
+        e_c = CoarseVector(Nv, Nblocks)
+        fine_buf1 = similar(setup.test_vectors[1])
+        fine_buf2 = similar(setup.test_vectors[1])
+        result_c = CoarseVector(Nv, Nblocks)
+
+        for bs in 1:Nblocks
+            src_base = (bs - 1) * Nv
+            for v in 1:Nv
+                fill!(e_c.data, zero(ComplexF64))
+                e_c.data[src_base + v] = one(ComplexF64)
+                coarse_apply!(result_c, setup, D, e_c, fine_buf1, fine_buf2)
+
+                # onsite
+                dst_base = (bs - 1) * Nv
+                @inbounds for i in 1:Nv
+                    self[i, v, bs] = result_c.data[dst_base + i]
+                end
+
+                # plus / minus neighbors
+                for mu in 1:4
+                    bp = nb_plus[bs, mu]
+                    bm = nb_minus[bs, mu]
+                    basep = (bp - 1) * Nv
+                    basem = (bm - 1) * Nv
+                    @inbounds for i in 1:Nv
+                        plus[i, v, bs, mu] = result_c.data[basep + i]
+                        minus[i, v, bs, mu] = result_c.data[basem + i]
+                    end
+                end
+            end
+        end
+
+        setup.coarse_stencil = CoarseStencilOperator(
+            Nv, Nblocks, setup.NBX, setup.NBY, setup.NBZ, setup.NBT,
+            self, plus, minus, nb_plus, nb_minus
+        )
+
+        if verbose
+            println("  粗格子演算子(stencil)の事前計算完了!")
+        end
+        return setup
+    elseif mode != :dense
+        throw(ArgumentError("unknown coarse operator mode: $mode (use :stencil or :dense)"))
+    end
 
     if verbose
         println("  粗格子演算子を事前計算中... ($(n)×$(n) 行列, $(round(n*n*16/1024/1024, digits=1)) MB)")
@@ -655,13 +906,18 @@ end
 
 粗格子上の GMRES ソルバー。Dc * x_c = b_c を解く。
 Dc は matrix-free で適用: Dc(v) = R · D · P(v)
-coarse_apply_counter が渡された場合、coarse_apply 呼出し回数を加算する。
+    coarse_apply_counter が渡された場合、粗格子演算子 Dc の適用回数を加算する。
 """
 function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
                       maxiter::Int=50, restart::Int=20, tol::Float64=1e-1,
                       coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing)
     x_c = similar(b_c)
+    b_norm = coarse_norm(b_c)
+    if b_norm < 1e-30
+        return x_c
+    end
     has_Dc = setup.Dc_matrix !== nothing
+    has_stencil = setup.coarse_stencil !== nothing
 
     # 事前計算済み行列がない場合のみ細格子バッファを確保
     local fine_buf1, fine_buf2
@@ -669,13 +925,18 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         fine_buf1 = similar(setup.test_vectors[1])
         fine_buf2 = similar(setup.test_vectors[1])
     end
-    # 粗格子作業バッファ
-    w_c = similar(b_c)
-    r_c = similar(b_c)
+    m = ensure_coarse_gmres_cache!(setup, b_c, restart)
+    V = setup._gmres_V
+    w_c = setup._gmres_w::CoarseVector
+    r_c = setup._gmres_r::CoarseVector
+    H = setup._gmres_H
+    e1 = setup._gmres_e1
 
     # 粗格子演算子適用のヘルパー
     @inline function apply_Dc!(w, v)
-        if has_Dc
+        if has_stencil
+            apply_coarse_stencil!(w, setup.coarse_stencil, v)
+        elseif has_Dc
             mul!(w.data, setup.Dc_matrix, v.data)
         else
             coarse_apply!(w, setup, D, v, fine_buf1, fine_buf2)
@@ -690,15 +951,13 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         coarse_axpby!(-1.0, w_c, 1.0, r_c)
 
         β = coarse_norm(r_c)
-        if β < tol
+        if β / b_norm < tol
             return x_c
         end
 
         # Arnoldi 過程
-        m = min(restart, length(b_c.data))
-        V = [similar(b_c) for _ in 1:m+1]
+        fill!(H, zero(ComplexF64))
         V[1].data .= r_c.data ./ β
-        H = zeros(ComplexF64, m+1, m)
 
         j_final = m
         for j = 1:m
@@ -719,9 +978,9 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         end
 
         # 最小二乗問題: min ||β*e₁ - H*y||
-        e1 = zeros(ComplexF64, j_final + 1)
+        fill!(e1, zero(ComplexF64))
         e1[1] = β
-        y = H[1:j_final+1, 1:j_final] \ e1
+        y = H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
 
         for k = 1:j_final
             coarse_axpby!(y[k], V[k], 1.0, x_c)
@@ -731,7 +990,7 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         r_c.data .= b_c.data
         apply_Dc!(w_c, x_c)
         coarse_axpby!(-1.0, w_c, 1.0, r_c)
-        if coarse_norm(r_c) < tol
+        if coarse_norm(r_c) / b_norm < tol
             return x_c
         end
     end
@@ -761,6 +1020,12 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 smoother::Symbol=:mr,
                 coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing)
     x = similar(b)
+    zero_wf!(x)
+
+    # Pre-allocate work buffers to avoid temporary WF allocations in hot path.
+    r_fine = similar(b)
+    correction = similar(b)
+    r_coarse = CoarseVector(setup.Nv, setup.Nblocks)
 
     # 1. Pre-smoothing
     if smoother == :sap
@@ -770,8 +1035,9 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
     end
 
     # 2. 残差計算 → 粗格子に射影
-    r_fine = b - D * x
-    r_coarse = restrict_f2c(setup, r_fine)
+    mul!(r_fine, D, x)       # r_fine = D*x
+    axpby!(1, b, -1, r_fine) # r_fine = b - D*x
+    restrict_f2c!(r_coarse, setup, r_fine)
 
     # 3. 粗格子求解
     e_coarse = coarse_gmres(setup, D, r_coarse;
@@ -779,7 +1045,7 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                             coarse_apply_counter=coarse_apply_counter)
 
     # 4. 細格子への補正
-    correction = prolongate_c2f(setup, e_coarse)
+    prolongate_c2f!(correction, setup, e_coarse)
     axpby!(1, correction, 1, x)
 
     # 5. Post-smoothing
@@ -823,7 +1089,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
     zero_wf!(r)
 
     total_coarse_gmres = 0  # coarse GMRES 呼出し回数カウンタ
-    _coarse_apply_counter = Ref(0)  # coarse_apply（= 細格子D適用）呼出し回数カウンタ
+    _coarse_apply_counter = Ref(0)  # 粗格子演算子 Dc 適用回数カウンタ
 
     for cycle = 1:maxiter
         # r = b - D * x
@@ -839,7 +1105,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
             if verbose
                 println("FGMRES converged! ($(cycle) cycles)")
                 println("  Total coarse GMRES calls: $total_coarse_gmres")
-                println("  Total coarse_apply (fine D mul): $(_coarse_apply_counter[])")
+                println("  Total coarse operator applications: $(_coarse_apply_counter[])")
             end
             return x
         end
@@ -939,7 +1205,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
             if verbose
                 println("FGMRES converged at cycle $cycle, step $(j_final)!")
                 println("  Total coarse GMRES calls: $total_coarse_gmres")
-                println("  Total coarse_apply (fine D mul): $(_coarse_apply_counter[])")
+                println("  Total coarse operator applications: $(_coarse_apply_counter[])")
             end
             return x
         end
@@ -950,7 +1216,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         println("FGMRES: max iterations reached. " *
                 "Final relative residual = $(sqrt(real(inner_product(r_final, r_final)))/b_norm)")
         println("  Total coarse GMRES calls: $total_coarse_gmres")
-        println("  Total coarse_apply (fine D mul): $(_coarse_apply_counter[])")
+        println("  Total coarse operator applications: $(_coarse_apply_counter[])")
     end
     return x
 end
@@ -992,10 +1258,11 @@ x = solve_DDalphaAMG(D, b, setup; tol=1e-10)
 """
 function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                           nsmooth::Int=8, verbose::Bool=true,
-                          coarse_vectors::Union{Nothing,Vector{WF3x1}}=nothing,
+                          coarse_vectors::Union{Nothing,Vector{<:WF3x1}}=nothing,
                           smoother::Symbol=:mr,
                           nvcycle::Int=4,
-                          vcycle_pre_smooth::Int=4, vcycle_post_smooth::Int=4)
+                          vcycle_pre_smooth::Int=4, vcycle_post_smooth::Int=4,
+                          use_chirality::Bool=false)
     NX, NY, NZ, NT = template.NX, template.NY, template.NZ, template.NT
     NC, NG = template.NC, template.NG
 
@@ -1003,6 +1270,14 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
     @assert NY % r == 0 "NY=$NY は r=$r で割り切れる必要があります"
     @assert NZ % r == 0 "NZ=$NZ は r=$r で割り切れる必要があります"
     @assert NT % r == 0 "NT=$NT は r=$r で割り切れる必要があります"
+
+    if use_chirality
+        @assert Nv % 2 == 0 "use_chirality=true の場合、Nv は偶数である必要があります (現在 Nv=$Nv)"
+    end
+    # Chiral setup also smooths Nv independent vectors.
+    # We then assign independent halves to P+ and P- sectors,
+    # instead of splitting each single vector into plus/minus copies.
+    Nv_smooth = Nv
 
     NBX = NX ÷ r; NBY = NY ÷ r; NBZ = NZ ÷ r; NBT = NT ÷ r
     Nblocks = NBX * NBY * NBZ * NBT
@@ -1012,20 +1287,23 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         println("  格子サイズ: $(NX)×$(NY)×$(NZ)×$(NT)")
         println("  ブロックサイズ: $(r)^4")
         println("  粗格子: $(NBX)×$(NBY)×$(NBZ)×$(NBT) = $(Nblocks) blocks")
-        println("  テストベクトル数: $Nv")
+        println("  テストベクトル数: $Nv", use_chirality ? " (カイラル分割: $(Nv_smooth)→$Nv)" : "")
         println("  粗格子自由度: $(Nblocks * Nv)")
     end
 
     # 1. ランダムテストベクトル生成
     if coarse_vectors !== nothing
         @assert length(coarse_vectors) == Nv "coarse_vectors の長さは Nv と一致する必要があります"
-        test_vectors = coarse_vectors
+        # Keep caller-provided vectors immutable from the setup's point of view.
+        # setup_DDalphaAMG performs in-place block orthonormalization, so aliasing
+        # the input vector array here corrupts later uses such as deflated_initial_guess(D, b, v).
+        test_vectors = deepcopy(coarse_vectors)
         if verbose
             println("  外部から提供されたテストベクトルを使用")
         end
     else
-        test_vectors = [similar(template) for _ in 1:Nv]
-        for v in 1:Nv
+        test_vectors = [similar(template) for _ in 1:Nv_smooth]
+        for v in 1:Nv_smooth
             random_fermion!(test_vectors[v])
         end
 
@@ -1033,57 +1311,62 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         zero_rhs = similar(template)
 
         if smoother == :vcycle
-            # Phase 1: MR で予備スムージング → 仮セットアップ構築
+            # Adaptive DD-αAMG setup (Frommer et al. 2014, Algorithm 4)
+            # Phase 1: MR で予備スムージング → 初期セットアップ構築
             if verbose
-                println("  [V-cycle setup] Phase 1: MR 予備スムージング ($nsmooth iterations)...")
+                println("  [Adaptive setup] Phase 1: MR 予備スムージング ($nsmooth iterations)...")
             end
-            for v in 1:Nv
+            for v in 1:Nv_smooth
                 mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
             end
 
-            # 仮ブロック直交正規化 → 仮セットアップ（固定コピーを使用）
-            pre_vectors = deepcopy(test_vectors)
-            block_orthonormalize!(pre_vectors, r)
-            pre_setup = DDalphaAMG_Setup{typeof(template)}(
-                pre_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
-                NBX, NBY, NBZ, NBT, Nblocks, nothing
-            )
-            # pre_setup は一時的なので Dc_matrix の事前計算は行わない
-            # (coarse_gmres は matrix-free fallback を使用)
-
-            # Phase 2: V-cycle でテストベクトルを再スムージング
-            #   pre_setup は固定（Phase 1 の basis のコピー）で、
-            #   test_vectors[v] を in-place に改善する。
-            if verbose
-                println("  [V-cycle setup] Phase 2: V-cycle スムージング ($nvcycle iterations)...")
-            end
-            # バッファを事前確保（ループ内で再利用）
+            # Phase 2: Adaptive iterations
+            #   各 iteration で：
+            #   1. 現在のテストベクトルからセットアップを(再)構築
+            #   2. 新しいランダムベクトルを V-cycle でスムージング
+            #   3. セットアップが収束するまで繰り返す
+            #
+            #   V-cycle は前の iteration のモードを除去するので、
+            #   残るのは「まだ捕捉されていない」near-null モード。
+            #   セットアップを毎回再構築することで、収束が保証される。
             r_fine = deepcopy(zero_rhs)
             correction = deepcopy(zero_rhs)
-            r_coarse = CoarseVector(Nv, Nblocks)
-            for v in 1:Nv
-                for _ in 1:nvcycle
-                    # 1. Pre-smoothing (in-place)
-                    mr_smooth!(test_vectors[v], D, zero_rhs; niter=vcycle_pre_smooth)
+            r_coarse = CoarseVector(Nv_smooth, Nblocks)
 
-                    # 2. 残差 r = 0 - D*ψ_v → 粗格子に射影
-                    mul!(r_fine, D, test_vectors[v])       # r_fine = D*ψ_v
-                    axpby!(1, zero_rhs, -1, r_fine)        # r_fine = 0 - D*ψ_v = -D*ψ_v
-                    restrict_f2c!(r_coarse, pre_setup, r_fine)
+            for iter in 1:nvcycle
+                # 現在のテストベクトルから仮セットアップを構築（deepcopy で分離）
+                cur_vectors = deepcopy(test_vectors)
+                block_orthonormalize!(cur_vectors, r)
+                cur_setup = DDalphaAMG_Setup{typeof(template)}(
+                    cur_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
+                    NBX, NBY, NBZ, NBT, Nblocks, nothing,
+                    nothing,
+                    CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0
+                )
+                precompute_coarse_operator!(cur_setup, D; mode=:stencil)
 
-                    # 3. 粗格子求解: Dc * e_c = r_c
-                    e_coarse = coarse_gmres(pre_setup, D, r_coarse;
-                                            maxiter=50, tol=1e-1)
+                # 同じテストベクトルを V-cycle でさらにスムージング
+                for v in 1:Nv_smooth
+                    for _ in 1:4
+                        # Pre-smoothing
+                        mr_smooth!(test_vectors[v], D, zero_rhs; niter=vcycle_pre_smooth)
 
-                    # 4. 補正を細格子に戻して適用: ψ_v += P(e_c)
-                    prolongate_c2f!(correction, pre_setup, e_coarse)
-                    axpby!(1, correction, 1, test_vectors[v])
+                        # 残差 → 粗格子に射影 → 粗格子求解 → 補正
+                        mul!(r_fine, D, test_vectors[v])
+                        axpby!(1, zero_rhs, -1, r_fine)
+                        restrict_f2c!(r_coarse, cur_setup, r_fine)
+                        e_coarse = coarse_gmres(cur_setup, D, r_coarse;
+                                                maxiter=50, tol=1e-1)
+                        prolongate_c2f!(correction, cur_setup, e_coarse)
+                        axpby!(1, correction, 1, test_vectors[v])
 
-                    # 5. Post-smoothing (in-place)
-                    mr_smooth!(test_vectors[v], D, zero_rhs; niter=vcycle_post_smooth)
+                        # Post-smoothing
+                        mr_smooth!(test_vectors[v], D, zero_rhs; niter=vcycle_post_smooth)
+                    end
                 end
-                if verbose && v % max(1, Nv ÷ 4) == 0
-                    println("    テストベクトル $v/$Nv 完了")
+
+                if verbose
+                    println("  [Adaptive setup] iteration $iter/$nvcycle 完了")
                 end
             end
         elseif smoother == :sap
@@ -1093,17 +1376,19 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             # SAP にはセットアップが必要 → まず仮セットアップを構築
             block_orthonormalize!(test_vectors, r)
             pre_setup = DDalphaAMG_Setup{typeof(template)}(
-                test_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
-                NBX, NBY, NBZ, NBT, Nblocks, nothing
+                test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
+                NBX, NBY, NBZ, NBT, Nblocks, nothing,
+                nothing,
+                CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0
             )
-            for v in 1:Nv
+            for v in 1:Nv_smooth
                 sap_smooth!(test_vectors[v], D, zero_rhs, pre_setup; niter=1, nblock_mr=nsmooth)
             end
         else  # :mr (デフォルト)
             if verbose
                 println("  テストベクトルを MR スムージング中 ($nsmooth iterations)...")
             end
-            for v in 1:Nv
+            for v in 1:Nv_smooth
                 mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
             end
         end
@@ -1111,19 +1396,49 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
 
 
 
+    # 2.5. カイラル分割 (chiral splitting)
+    if use_chirality && coarse_vectors === nothing
+        if verbose
+            println("  カイラル分割中 (P₊/P₋, independent vectors per sector)...")
+        end
+        chiral_vectors = Vector{typeof(template)}(undef, Nv)
+        half = Nv ÷ 2
+        # First half -> P+ sector, second half -> P- sector.
+        for v in 1:half
+            chiral_vectors[v] = deepcopy(test_vectors[v])
+            chiral_project!(chiral_vectors[v], :plus)   # ig=3,4 保持
+        end
+        for v in 1:half
+            chiral_vectors[half + v] = deepcopy(test_vectors[half + v])
+            chiral_project!(chiral_vectors[half + v], :minus)    # ig=1,2 保持
+        end
+        test_vectors = chiral_vectors
+    end
+
     # 3. ブロック直交正規化
     if verbose
         println("  ブロック直交正規化中...")
     end
-    block_orthonormalize!(test_vectors, r)
+    if use_chirality
+        # P₊ と P₋ セクターを別々に直交正規化 → カイラル構造を保持
+        half = Nv ÷ 2
+        plus_vectors  = test_vectors[1:half]       # P₊ (ig=3,4)
+        minus_vectors = test_vectors[half+1:end]   # P₋ (ig=1,2)
+        block_orthonormalize!(plus_vectors, r)
+        block_orthonormalize!(minus_vectors, r)
+    else
+        block_orthonormalize!(test_vectors, r)
+    end
 
     setup = DDalphaAMG_Setup{typeof(template)}(
         test_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
-        NBX, NBY, NBZ, NBT, Nblocks, nothing
+        NBX, NBY, NBZ, NBT, Nblocks, nothing,
+        nothing,
+        CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0
     )
 
     # 粗格子演算子を事前計算
-    precompute_coarse_operator!(setup, D; verbose=verbose)
+    precompute_coarse_operator!(setup, D; verbose=verbose, mode=:stencil)
 
     if verbose
         println("  セットアップ完了!")
@@ -1190,24 +1505,25 @@ function deflated_initial_guess(D, b::WF3x1, test_vectors::Vector{T};
                                  verbose::Bool=false) where T<:WF3x1
     Nv = length(test_vectors)
     Nv == 0 && return similar(b)
-    G   = zeros(ComplexF64, Nv)
+    G   = zeros(ComplexF64, Nv, Nv)
     rhs = zeros(ComplexF64, Nv)
 
     Dv = similar(b)
-    for i in 1:Nv
-        mul!(Dv, D, test_vectors[i])  # D v_i を計算
-        rhs[i] = inner_product(test_vectors[i], b)
-        G[i] = inner_product(test_vectors[i], Dv)  # G[i] = ⟨v_i, D v_i⟩
+    for j in 1:Nv
+        mul!(Dv, D, test_vectors[j])
+        for i in 1:Nv
+            G[i,j] = inner_product(test_vectors[i], Dv)
+        end
+        rhs[j] = inner_product(test_vectors[j], b)
     end
 
-
+    # G c = rhs を解く
+    c = G \ rhs
 
     # x₀ = Σ c_j v_j
-    #  c_j = ⟨v_j, b⟩ / ⟨v_j, D v_j⟩  (正規化込み)
     x0 = similar(b)
     for j in 1:Nv
-        c_j = rhs[j] / G[j]
-        axpby!(c_j, test_vectors[j], 1, x0)  # x0 += c_j * v_j
+        axpby!(c[j], test_vectors[j], 1, x0)
     end
 
     return x0
