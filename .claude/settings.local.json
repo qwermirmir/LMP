@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(julia --project=c:/Users/_s2220186/Desktop/Julia/LMP -e ' *)"
+    ]
+  }
+}
