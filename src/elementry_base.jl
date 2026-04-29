@@ -683,7 +683,7 @@ end
     compute_Fmunu(U, mu, nu)
 
 Clover field strength tensor F̂_μν(n)을 계산.
-반에르미트 무대각 (traceless anti-hermitian) 결과를 반환.
+반에르미트 (anti-hermitian) 결과를 반환.
 
 Returns: Array{ComplexF64, 6} of shape (3, 3, NX, NY, NZ, NT)
 """
@@ -739,10 +739,6 @@ function compute_Fmunu(U::Vector, mu::Int, nu::Int)
 
         # F̂ = (Q − Q†)/8  (anti-hermitian)
         F_site = (Q - Q') / 8
-
-        # traceless projection: F̂ -= (tr F̂ / 3) I
-        tr_F = (F_site[1,1] + F_site[2,2] + F_site[3,3]) / 3
-        F_site = F_site - tr_F * SMatrix{3,3}(1.0+0im,0,0, 0,1.0+0im,0, 0,0,1.0+0im)
 
         # 결과 저장
         for jc = 1:3, ic = 1:3
