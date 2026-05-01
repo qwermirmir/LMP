@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(julia --project=c:/Users/_s2220186/Desktop/Julia/LMP -e ' *)"
+      "Bash(julia --project=c:/Users/_s2220186/Desktop/Julia/LMP -e ' *)",
+      "Bash(python -c \"import json; f=open\\(r'c:/Users/_s2220186/Desktop/Julia/heatbath.ipynb'\\); data=json.load\\(f\\); [print\\(i, c['cell_type'], ':', c['source'][:3] if c['source'] else []\\) for i,c in enumerate\\(data['cells']\\)]\")",
+      "Bash(python -c ' *)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\_s2220186\\Desktop\\multilowmode"
     ]
   }
 }
