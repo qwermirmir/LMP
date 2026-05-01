@@ -16,6 +16,7 @@ import ..gpu: sync_W_to_gpu!,pack_fermions!,unpack_fermions!,batched_forward!,fu
 import ..Layer_types: DenseLinearLayer, PTLayer,fermionfield_Layer,GramSchmidt_Layer
 import ..Layer_types: BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
+using JLD2
 abstract type Operator end
 
 
@@ -2131,6 +2132,188 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
     fig.canvas.draw()
     fig.canvas.flush_events()
 
+
+end
+
+
+# Lazy-loading variant: gauge_paths は JLD2 ファイルパスのリスト。
+# U_template は再利用する GPU ゲージ場バッファ（メモリ常駐は1個分のみ）。
+# JLD2 の読み込みを @async でプリフェッチし、I/O を学習と重ねることで速度を維持する。
+function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_template, params;
+               epochs=100, batch=1, logfile=nothing,
+               test_paths::Union{Vector{String},Nothing}=nothing, test_interval=10) where {T<:Layer}
+
+    depth = length(layers)
+    N = length(gauge_paths)
+    loss_history = Float64[]
+
+    if logfile === nothing
+        logfile = "train_log_$(Libc.strftime("%Y-%m-%d_%H%M%S", time())).txt"
+    end
+    log_io = open(logfile, "a")
+    println(log_io, "=== Training started: $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
+    println(log_io, "epochs=$epochs, batch=$batch, depth=$depth, configs=$N")
+    flush(log_io)
+
+    fig, ax = plt.subplots()
+    ax.set_title("Loss Curve")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    line, = ax.plot([], [], "b-", linewidth=2)
+    test_line = nothing
+    if test_paths !== nothing
+        test_line, = ax.plot([], [], "r--", linewidth=2, label="test")
+        line.set_label("train")
+        ax.legend()
+    end
+    γ = Clifford()
+
+    # 最初の config を GPU バッファに転送
+    substitute_U!(U_template, JLD2.load(gauge_paths[1], "U"))
+    x = Initialize_pseudofermion_fields(U_template[1], "Wilson")
+    D = Dirac_operator(U_template, x, params)
+
+    dummy, f = forward_propagation(layers, D, D)
+    delta = deepcopy(dummy[2:end])
+    u = dummy
+
+    temp = Vector{ComplexF64}(undef, batch)
+    d = Vector{Any}(undef, depth)
+    test_loss_history = Float64[]
+
+    for epoch in 1:epochs
+        next_k = mod(epoch, N) + 1
+
+        # 次 config の JLD2 読み込みを学習と並行してバックグラウンド実行（CPU メモリのみ）
+        cpu_prefetch = @async JLD2.load(gauge_paths[next_k], "U")
+
+        D = Dirac_operator(U_template, x, params)
+        for i in 1:depth
+            if layers[i] isa PTLayer
+                layers[i].U = U_template
+            end
+        end
+        if layers[end] isa PtcRayleighQuotient_Layer
+            layers[end].D = D
+        elseif layers[end] isa LossSumLayer
+            if layers[end].l1 isa PtcRayleighQuotient_Layer
+                layers[end].l1.D = D
+            end
+            if layers[end].l2 isa PtcRayleighQuotient_Layer
+                layers[end].l2.D = D
+            end
+        end
+        if layers[end] isa Ritz_Layer
+            layers[end].D = D
+        end
+
+        fill!(d, nothing)
+        for b in 1:batch
+            f = forward_propagation!(layers, D, D, u)
+            temp[b] = f
+            backward_propagation!(layers, u, batch, delta)
+
+            for i in 1:depth-1
+                gi = gradient(layers[i], layers[i].activation, u[i], delta[i], γ)
+                gi === nothing && continue
+                if d[i] === nothing
+                    d[i] = gi
+                else
+                    d[i] += gi
+                end
+            end
+        end
+
+        for i in 1:depth-1
+            d[i] === nothing && continue
+            update!(layers[i], opt, d[i])
+        end
+
+        current_loss = 0.0
+        for b in 1:batch
+            current_loss += temp[b]
+        end
+        push!(real(loss_history), real(current_loss))
+
+        println("Epoch: $(epoch), Loss: $current_loss")
+        println(log_io, "Epoch: $(epoch), Loss: $current_loss")
+        flush(log_io)
+
+        if test_paths !== nothing && mod(epoch, test_interval) == 0
+            test_loss = 0.0
+            for tc in 1:length(test_paths)
+                # U_template を test config に一時的に置き換え
+                substitute_U!(U_template, JLD2.load(test_paths[tc], "U"))
+                D_test = Dirac_operator(U_template, x, params)
+                for i in 1:depth
+                    if layers[i] isa PTLayer
+                        layers[i].U = U_template
+                    end
+                end
+                if layers[end] isa PtcRayleighQuotient_Layer
+                    layers[end].D = D_test
+                elseif layers[end] isa LossSumLayer
+                    if layers[end].l1 isa PtcRayleighQuotient_Layer
+                        layers[end].l1.D = D_test
+                    end
+                    if layers[end].l2 isa PtcRayleighQuotient_Layer
+                        layers[end].l2.D = D_test
+                    end
+                end
+                if layers[end] isa Ritz_Layer
+                    layers[end].D = D_test
+                end
+                for b in 1:batch
+                    test_loss += real(forward_propagation!(layers, D_test, D_test, u))
+                end
+            end
+            test_loss /= length(test_paths)
+            push!(test_loss_history, real(test_loss))
+            println("  [Test] Epoch: $(epoch), Test Loss: $test_loss")
+            println(log_io, "  [Test] Epoch: $(epoch), Test Loss: $test_loss")
+            flush(log_io)
+
+            test_line.set_xdata(test_interval:test_interval:(test_interval*length(test_loss_history)))
+            test_line.set_ydata(test_loss_history)
+        end
+
+        # プリフェッチ済み CPU データを GPU バッファに転送（CUDA memcpy は高速）
+        substitute_U!(U_template, fetch(cpu_prefetch))
+
+        # test 評価後、layer の U/D を GPU バッファに戻す
+        if test_paths !== nothing && mod(epoch, test_interval) == 0
+            D = Dirac_operator(U_template, x, params)
+            for i in 1:depth
+                if layers[i] isa PTLayer
+                    layers[i].U = U_template
+                end
+            end
+            if layers[end] isa PtcRayleighQuotient_Layer
+                layers[end].D = D
+            elseif layers[end] isa LossSumLayer
+                if layers[end].l1 isa PtcRayleighQuotient_Layer
+                    layers[end].l1.D = D
+                end
+                if layers[end].l2 isa PtcRayleighQuotient_Layer
+                    layers[end].l2.D = D
+                end
+            end
+            if layers[end] isa Ritz_Layer
+                layers[end].D = D
+            end
+        end
+    end
+
+    println(log_io, "=== Training finished: $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
+    close(log_io)
+
+    line.set_xdata(1:length(loss_history))
+    line.set_ydata(loss_history)
+    ax.set_yscale("log")
+    ax.relim()
+    ax.autoscale_view()
+    fig.canvas.draw()
+    fig.canvas.flush_events()
 
 end
 
