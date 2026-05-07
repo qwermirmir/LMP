@@ -17,7 +17,7 @@ import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttenti
 import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer,BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
 import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,Matmul_batch!,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!
-import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!,get_shared_buf!
+import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!,get_shared_buf!,batched_hopping_steps_gpu!
 
 export gradient, DeltaRule,DeltaRule!
 export Identity, ReLU, Sigmoid, Tanh
@@ -2710,7 +2710,7 @@ function DeltaRule(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{
     return result
 end
 
-function DeltaRule!(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{WF3x1}, delta::Vector{WF3x1}) where T<:WF3x1
+function DeltaRule!(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{<:WF3x1}, delta::Vector{<:WF3x1}) where T<:WF3x1
 
     W   = layer.W
     In  = layer.In
@@ -2784,33 +2784,39 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
     @assert length(d) == Out "PTLayer gradient: d의 길이는 Out과 같아야 합니다. length(d)=$(length(d)), Out=$Out"
     @assert length(W) == npaths*Out "The length of W must be equal to length(paths)*Out."
 
-    # forward에서 캐싱된 hopped 결과 재사용 (hop 재계산 방지)
-    if layer._initialized && (layer._hopped_all !== nothing || length(layer._hopped) == npaths)
-        if d[1] isa WF3x1GPU && layer._hopped_all !== nothing
+    # gradient checkpointing: hopped_all은 per-layer로 저장하지 않고 z에서 재계산
+    # (9 PTLayer × 628MB = 5.6GB 절약 — backward는 sequential이므로 shared buffer 안전)
+    if layer._W_gpu !== nothing
+        if d[1] isa WF3x1GPU
             # GPU batched: 625개 kernel → 1회 launch, GPU→CPU 전송 없음
             blocksize = d[1].blockinfo.blocksize
             rsize     = d[1].blockinfo.rsize
             NC = 3; NG = 4
 
-            # lazy init d_buf, grad_gpu
-            if layer._d_buf === nothing || size(layer._d_buf, 5) != Out
-                layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Out)
+            # 공유 버퍼로 hopped_all 재계산 (hop 재실행, per-layer 저장 없음)
+            _hopped_g = get_shared_buf!(:hopped_all, NC, NG, blocksize, rsize, npaths)
+            _hop_t    = get_shared_buf!(:hop_temp,   NC, NG, blocksize, rsize, npaths)
+            pack_fermions!(_hopped_g, z)
+            if layer._hop_max_steps > 0 && layer._hop_dirs_gpu !== nothing
+                batched_hopping_steps_gpu!(
+                    _hopped_g, _hop_t, z,
+                    layer.U, layer._hop_dirs_gpu, layer._hop_nsteps_gpu,
+                    layer._hop_max_steps, npaths, blocksize, rsize)
             end
+
+            # d_buf: 전역 공유 버퍼 사용
+            _d_buf_g = get_shared_buf!(:d_buf, NC, NG, blocksize, rsize, Out)
             if layer._grad_gpu === nothing || size(layer._grad_gpu, 3) != n
                 layer._grad_gpu = CUDA.zeros(ComplexF64, NG, NG, n)
             end
 
-            # pack d → d_buf  (hopped_all는 forward에서 이미 packed)
-            pack_fermions!(layer._d_buf, d)
-
-            # 1회 batched gradient kernel
-            batched_gradient!(layer._grad_gpu, layer._d_buf, layer._hopped_all,
+            pack_fermions!(_d_buf_g, d)
+            batched_gradient!(layer._grad_gpu, _d_buf_g, _hopped_g,
                               blocksize, rsize, Out, npaths)
 
-            # grad_gpu를 그대로 반환 (optimizer가 GPU에서 처리)
             return [layer._grad_gpu]
-        else
-            # CPU: @threads 병렬화
+        elseif length(layer._hopped) == npaths
+            # CPU: @threads 병렬화 (CPU path는 _hopped 캐시 그대로 사용)
             grad = Vector{typeof(W[1])}(undef, n)
             @threads for idx in 1:n
                 j = ((idx-1) % Out) + 1

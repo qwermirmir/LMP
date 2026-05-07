@@ -1157,17 +1157,17 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
         blocksize = x[1].blockinfo.blocksize
         rsize     = x[1].blockinfo.rsize
 
-        # lazy init GPU buffers (W, hopped_all, etc.)
+        # lazy init GPU buffers (W only — hopped_all uses shared pool to avoid per-layer 628MB)
         NW = npaths * Out
         if layer._W_gpu === nothing
-            layer._W_gpu      = CUDA.zeros(ComplexF64, NG, NG, NW)
-            layer._Wadj_gpu   = CUDA.zeros(ComplexF64, NG, NG, NW)
-            layer._hopped_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, npaths)
+            layer._W_gpu    = CUDA.zeros(ComplexF64, NG, NG, NW)
+            layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
             sync_W_to_gpu!(layer._W_gpu, W)
         end
-        # 공유 임시 버퍼 (layers 간 재사용 — forward 직후 unpack되므로 안전)
-        _result_buf = get_shared_buf!(:result_all, NC, NG, blocksize, rsize, Out)
-        _hop_temp   = get_shared_buf!(:hop_temp, NC, NG, blocksize, rsize, npaths)
+        # 공유 임시 버퍼 (layers 간 재사용): hopped_all도 공유하여 9 PTLayer × 628MB = 5.6GB 절약
+        _result_buf  = get_shared_buf!(:result_all, NC, NG, blocksize, rsize, Out)
+        _hop_temp    = get_shared_buf!(:hop_temp,   NC, NG, blocksize, rsize, npaths)
+        _hopped_all  = get_shared_buf!(:hopped_all, NC, NG, blocksize, rsize, npaths)
 
         # lazy init batched hop tables
         if layer._hop_dirs_gpu === nothing
@@ -1201,18 +1201,53 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
         end
 
-        # Batched hop: pack x → hopped_all, then max_steps batched kernels
+        # [NaN 진단] 입력 x의 NaN/Inf 체크 + 최대 절댓값 출력 (GPU-native, no CPU transfer)
+        let _xbad = false, _xmax = 0.0
+            for _xi in x
+                if hasproperty(_xi, :f) && _xi.f isa CuArray
+                    _xbad = _xbad || any(isnan, _xi.f) || any(isinf, _xi.f)
+                    _xmax = max(_xmax, sqrt(Float64(maximum(abs2, _xi.f))))
+                end
+            end
+            if _xbad
+                println("[PTLayer NaN] INPUT x has NaN/Inf BEFORE hopping (Out=$Out, npaths=$npaths, max_abs=$_xmax)")
+            elseif _xmax > 1e10
+                println("[PTLayer LARGE] INPUT x is finite but large: max_abs=$_xmax (Out=$Out, npaths=$npaths)")
+            end
+        end
+
+        # Batched hop: pack x → shared _hopped_all, then max_steps batched kernels
         if layer._hop_max_steps > 0
+            # [NaN 진단] pack 직후 NaN + 최대절댓값 체크 (hop 전, GPU-native)
+            pack_fermions!(_hopped_all, x)
+            let _pb = any(isnan, _hopped_all) || any(isinf, _hopped_all),
+                _pm = sqrt(Float64(maximum(abs2, _hopped_all)))
+                _pb && println("[PTLayer NaN] _hopped_all has NaN/Inf RIGHT AFTER pack (before hop steps), max_abs=$_pm")
+                (!_pb && _pm > 1e10) && println("[PTLayer LARGE] _hopped_all after pack: max_abs=$_pm (finite but large)")
+            end
             batched_hopping_steps_gpu!(
-                layer._hopped_all, _hop_temp, x,
+                _hopped_all, _hop_temp, x,
                 layer.U, layer._hop_dirs_gpu, layer._hop_nsteps_gpu,
                 layer._hop_max_steps, npaths, blocksize, rsize)
         else
-            pack_fermions!(layer._hopped_all, x)
+            pack_fermions!(_hopped_all, x)
+        end
+
+        # [NaN 진단] 호핑 후 NaN 체크 + 최대절댓값 (GPU-native)
+        let _hbad = any(isnan, _hopped_all) || any(isinf, _hopped_all),
+            _hmax = sqrt(Float64(maximum(abs2, _hopped_all)))
+            if _hbad
+                println("[PTLayer NaN] _hopped_all has NaN/Inf AFTER hopping (max_steps=$(layer._hop_max_steps)), max_abs=$_hmax")
+            elseif _hmax > 1e10
+                println("[PTLayer LARGE] _hopped_all after hopping: max_abs=$_hmax (finite but large)")
+            end
+        end
+        let _wbad = any(isnan, layer._W_gpu)
+            _wbad && println("[PTLayer NaN] _W_gpu has NaN (Out=$Out, npaths=$npaths)")
         end
 
         # 1회 batched forward kernel (공유 버퍼 사용)
-        batched_forward!(_result_buf, layer._W_gpu, layer._hopped_all, blocksize, rsize, npaths, Out)
+        batched_forward!(_result_buf, layer._W_gpu, _hopped_all, blocksize, rsize, npaths, Out)
 
         # unpack result_all → result
         unpack_fermions!(result, _result_buf)
@@ -1470,6 +1505,30 @@ function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
     end
 
     # 3) generalized eigen + 캐시 (DeltaRule!에서 재사용)
+    # [진단] A, B NaN/Inf 체크
+    if any(isnan, A) || any(isinf, A) || any(isnan, B) || any(isinf, B)
+        n_nanA = count(isnan, A); n_infA = count(isinf, A)
+        n_nanB = count(isnan, B); n_infB = count(isinf, B)
+        println("[Ritz NaN] A: $(n_nanA) NaN, $(n_infA) Inf / $(length(A)) | B: $(n_nanB) NaN, $(n_infB) Inf / $(length(B))")
+        # x NaN 체크 (GPU-native)
+        for i in 1:l
+            _xf = hasproperty(x[i], :f) ? x[i].f : nothing
+            _dxf = hasproperty(Dx[i], :f) ? Dx[i].f : nothing
+            if _xf !== nothing && (_xf isa AbstractArray) && (any(isnan, _xf) || any(isinf, _xf))
+                println("[Ritz NaN] x[$i] contains NaN/Inf")
+            end
+            if _dxf !== nothing && (_dxf isa AbstractArray) && (any(isnan, _dxf) || any(isinf, _dxf))
+                println("[Ritz NaN] Dx[$i] contains NaN/Inf")
+            end
+        end
+        # U NaN 체크 (GPU-native)
+        for (μ, ui) in enumerate(layer.D.U)
+            if hasproperty(ui, :U) && ui.U isa CuArray
+                n_bad = count(x -> isnan(x) || isinf(x), ui.U)
+                n_bad > 0 && println("[Ritz NaN] D.U[$μ]: $n_bad / $(length(ui.U)) NaN/Inf")
+            end
+        end
+    end
     F = eigen(Hermitian(A), Hermitian(B))
     layer._evals = F.values
     layer._evecs = F.vectors
@@ -1690,6 +1749,23 @@ function forward_propagation!(layers::Vector{T}, input::Any, target::Any, u::Vec
 
     for i in 1:(L-1)
         u[i+1] = layers[i](u[i])
+        # NaN/Inf 진단: 처음 발생한 레이어 출력 (GPU-native, no CPU transfer)
+        _bad = false
+        for _v in u[i+1]
+            if _v isa CuArray
+                _bad = any(isnan, _v) || any(isinf, _v); _bad && break
+            elseif _v isa AbstractArray
+                _bad = any(isnan, _v) || any(isinf, _v); _bad && break
+            elseif hasproperty(_v, :f)
+                _f = _v.f
+                _bad = (_f isa CuArray || _f isa AbstractArray) && (any(isnan, _f) || any(isinf, _f))
+                _bad && break
+            end
+        end
+        if _bad
+            println("[NaN FIRST] Layer $i ($(nameof(typeof(layers[i])))) output has NaN/Inf — aborting forward pass")
+            return NaN + 0.0im
+        end
     end
 
     f = layers[L](u[L])
@@ -2136,6 +2212,80 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
 end
 
 
+# 게이지 필드의 NaN/Inf (경계 패딩 셀) 를 0으로 교체 (GPU-native in-place map)
+function _sanitize_U!(U::Vector)
+    for ui in U
+        if hasproperty(ui, :U) && ui.U isa CuArray
+            map!(x -> (isnan(x) || isinf(x)) ? zero(x) : x, ui.U, ui.U)
+        end
+    end
+end
+
+# backward + gradient 를 한 패스로 처리하는 ping-pong 버전.
+# delta 전체(L-1개)를 유지하는 대신, ping-pong 2버퍼만 사용.
+# layer j의 역전파와 동시에 gradient(layers[j])를 계산하므로 delta[j]를 즉시 해제 가능.
+#
+# 인자:
+#   delta_tail  : 소수의 "tail" 항목(비-body 크기) j → 버퍼 Dict
+#   buf_a/buf_b : body 크기용 ping-pong 버퍼 2개
+#   transition_j: tail 영역의 가장 작은 j (여기서부터 body ping-pong으로 전환)
+function backward_and_gradient!(
+    layers::Vector{T},
+    u::Vector{Any},
+    batch::Int,
+    delta_tail::Dict{Int,Any},
+    buf_a::Vector,
+    buf_b::Vector,
+    transition_j::Int,
+    d::Vector{Any},
+    γ,
+    delta1_buf=nothing   # 올바른 크기(u[1])로 사전 할당된 버퍼 — layer 1 gradient용
+) where T<:Layer
+
+    L = length(layers)
+
+    # 1. 마지막 레이어: delta[L-1] 를 delta_tail[L-1] 에 기록
+    DeltaRule!(layers[L], layers[L].activation, u[L], delta_tail[L-1], batch)
+
+    # 2. Tail 영역: j = L-1 → transition_j (소수의 비-body 크기 항목)
+    for j in (L-1):-1:transition_j
+        cur = delta_tail[j]
+
+        gi = gradient(layers[j], layers[j].activation, u[j], cur, γ)
+        gi !== nothing && (d[j] = d[j] === nothing ? gi : d[j] + gi)
+
+        if j > transition_j
+            DeltaRule!(layers[j], layers[j].activation, u[j], cur, delta_tail[j-1])
+        else
+            # j == transition_j: body 크기 ping-pong 버퍼로 전환
+            DeltaRule!(layers[j], layers[j].activation, u[j], cur, buf_a)
+        end
+    end
+
+    # 3. Body 영역 (ping-pong): j = transition_j-1 → 2
+    #    cur_buf = delta[j], nxt_buf = 다음 쓰기 대상, 매 step 교체
+    cur_buf, nxt_buf = buf_a, buf_b
+    for j in (transition_j - 1):-1:2
+        gi = gradient(layers[j], layers[j].activation, u[j], cur_buf, γ)
+        gi !== nothing && (d[j] = d[j] === nothing ? gi : d[j] + gi)
+
+        if j > 2
+            DeltaRule!(layers[j], layers[j].activation, u[j], cur_buf, nxt_buf)
+            cur_buf, nxt_buf = nxt_buf, cur_buf
+        end
+        # j == 2: DeltaRule! 는 아래 layer 1 처리에서 별도로 수행
+    end
+
+    # 4. Layer 1: delta1_buf(u[1]과 동일 크기)로 DeltaRule! 후 gradient 계산
+    #    ping-pong 버퍼(body_size)를 쓰면 DenseLinearLayer.In != body_size 시 CUDA 에러 발생
+    if delta1_buf !== nothing && L >= 2
+        DeltaRule!(layers[2], layers[2].activation, u[2], cur_buf, delta1_buf)
+        gi1 = gradient(layers[1], layers[1].activation, u[1], delta1_buf, γ)
+        gi1 !== nothing && (d[1] = d[1] === nothing ? gi1 : d[1] + gi1)
+    end
+end
+
+
 # Lazy-loading variant: gauge_paths は JLD2 ファイルパスのリスト。
 # U_template は再利用する GPU ゲージ場バッファ（メモリ常駐は1個分のみ）。
 # JLD2 の読み込みを @async でプリフェッチし、I/O を学習と重ねることで速度を維持する。
@@ -2170,12 +2320,39 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
 
     # 最初の config を GPU バッファに転送
     substitute_U!(U_template, JLD2.load(gauge_paths[1], "U"))
+    _sanitize_U!(U_template)
     x = Initialize_pseudofermion_fields(U_template[1], "Wilson")
     D = Dirac_operator(U_template, x, params)
 
     dummy, f = forward_propagation(layers, D, D)
-    delta = deepcopy(dummy[2:end])
     u = dummy
+
+    # Ping-pong 버퍼 셋업 ---------------------------------------------------
+    # body_size: 대부분의 PT 레이어 출력 크기 (= pl)
+    body_size = length(u[min(4, depth)])
+
+    # Tail 항목: delta[j] 크기가 body_size 와 다른 j (마지막 레이어 기록 대상 포함)
+    delta_tail = Dict{Int,Any}(depth-1 => deepcopy(u[depth]))
+    for j in 3:depth-2
+        length(u[j+1]) != body_size && (delta_tail[j] = deepcopy(u[j+1]))
+    end
+
+    # transition_j: tail 의 최소 j (여기서 body ping-pong 으로 전환)
+    transition_j = minimum(keys(delta_tail))
+
+    # tail 영역을 연속적으로 채우기 (gap 방지)
+    for j in transition_j:depth-1
+        haskey(delta_tail, j) || (delta_tail[j] = deepcopy(u[j+1]))
+    end
+
+    # Ping-pong 2버퍼: u[transition_j] 와 같은 크기 (= body_size)
+    buf_a = deepcopy(u[transition_j])
+    buf_b = deepcopy(u[transition_j])
+
+    # Layer 1 gradient용 버퍼: u[2]와 동일 크기 (= fermionfield_Layer 출력 = DenseLinearLayer 입력)
+    # u[1]=[D](Dirac operator)이므로 u[2]를 써야 함. body_size와 다를 수 있어 ping-pong 버퍼 재사용 불가
+    delta1_buf = depth >= 2 ? deepcopy(u[2]) : nothing
+    # -----------------------------------------------------------------------
 
     temp = Vector{ComplexF64}(undef, batch)
     d = Vector{Any}(undef, depth)
@@ -2186,6 +2363,16 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
 
         # 次 config の JLD2 読み込みを学習と並行してバックグラウンド実行（CPU メモリのみ）
         cpu_prefetch = @async JLD2.load(gauge_paths[next_k], "U")
+
+        # U_template NaN 체크 (이상 시에만 출력)
+        for _ui in U_template
+            if hasproperty(_ui, :U) && _ui.U isa CuArray
+                if any(isnan, _ui.U) || any(isinf, _ui.U)
+                    println("[U NaN] Epoch=$epoch: U_template has NaN/Inf")
+                    break
+                end
+            end
+        end
 
         D = Dirac_operator(U_template, x, params)
         for i in 1:depth
@@ -2211,22 +2398,47 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         for b in 1:batch
             f = forward_propagation!(layers, D, D, u)
             temp[b] = f
-            backward_propagation!(layers, u, batch, delta)
-
-            for i in 1:depth-1
-                gi = gradient(layers[i], layers[i].activation, u[i], delta[i], γ)
-                gi === nothing && continue
-                if d[i] === nothing
-                    d[i] = gi
-                else
-                    d[i] += gi
-                end
-            end
+            backward_and_gradient!(layers, u, batch, delta_tail, buf_a, buf_b,
+                                   transition_j, d, γ, delta1_buf)
         end
 
         for i in 1:depth-1
             d[i] === nothing && continue
+            # Gradient norm logging (NaN/Inf 진단용, GPU-native — no Array() on large CuArrays)
+            gnorm = 0.0
+            has_nan = false
+            if d[i] isa Vector
+                for g in d[i]
+                    if g isa AbstractArray  # includes CuArray
+                        if any(isnan, g) || any(isinf, g)
+                            has_nan = true
+                        end
+                        gnorm += Float64(sum(abs2, g))
+                    elseif hasproperty(g, :f) && g.f isa AbstractArray
+                        if any(isnan, g.f) || any(isinf, g.f)
+                            has_nan = true
+                        end
+                        gnorm += Float64(sum(abs2, g.f))
+                    end
+                end
+            elseif d[i] isa AbstractArray
+                if any(isnan, d[i]) || any(isinf, d[i])
+                    has_nan = true
+                end
+                gnorm += Float64(sum(abs2, d[i]))
+            end
+            gnorm = sqrt(gnorm)
+            if has_nan || gnorm > 1e4
+                println("  [GRAD] Epoch=$epoch Layer=$i ($(nameof(typeof(layers[i])))) norm=$(round(gnorm,sigdigits=4)) has_nan=$has_nan")
+                println(log_io, "  [GRAD] Epoch=$epoch Layer=$i norm=$(round(gnorm,sigdigits=4)) has_nan=$has_nan")
+            end
             update!(layers[i], opt, d[i])
+            # Adam 업데이트 후 W_gpu NaN 체크 (W_gpu is small — Array() OK)
+            if layers[i] isa PTLayer && layers[i]._W_gpu !== nothing
+                if any(isnan, layers[i]._W_gpu) || any(isinf, layers[i]._W_gpu)
+                    println("  [Adam NaN] Epoch=$epoch Layer=$i PTLayer _W_gpu has NaN/Inf AFTER update!")
+                end
+            end
         end
 
         current_loss = 0.0
@@ -2244,6 +2456,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             for tc in 1:length(test_paths)
                 # U_template を test config に一時的に置き換え
                 substitute_U!(U_template, JLD2.load(test_paths[tc], "U"))
+                _sanitize_U!(U_template)  # test config도 패딩 셀 NaN 제거
                 D_test = Dirac_operator(U_template, x, params)
                 for i in 1:depth
                     if layers[i] isa PTLayer
@@ -2279,6 +2492,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
 
         # プリフェッチ済み CPU データを GPU バッファに転送（CUDA memcpy は高速）
         substitute_U!(U_template, fetch(cpu_prefetch))
+        _sanitize_U!(U_template)  # 패딩 셀 NaN/Inf → 0 (경계 셀 uninitialized 방지)
 
         # test 評価後、layer の U/D を GPU バッファに戻す
         if test_paths !== nothing && mod(epoch, test_interval) == 0
