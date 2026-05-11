@@ -963,15 +963,17 @@ end
 
 """Vector{WF3x1GPU} → CuArray{ComplexF64, 5} (NC,NG,bs,rs,n)"""
 function pack_fermions!(buf::CuArray{ComplexF64, 5}, fields::AbstractVector)
+    len = size(buf, 1) * size(buf, 2) * size(buf, 3) * size(buf, 4)
     @inbounds for i in eachindex(fields)
-        copyto!(@view(buf[:,:,:,:,i]), fields[i].f)
+        copyto!(buf, (i-1)*len + 1, fields[i].f, 1, len)
     end
 end
 
 """CuArray{ComplexF64, 5} → Vector{WF3x1GPU}  (각 field의 .f에 복사)"""
 function unpack_fermions!(fields::AbstractVector, buf::CuArray{ComplexF64, 5})
+    len = size(buf, 1) * size(buf, 2) * size(buf, 3) * size(buf, 4)
     @inbounds for j in eachindex(fields)
-        copyto!(fields[j].f, @view(buf[:,:,:,:,j]))
+        copyto!(fields[j].f, 1, buf, (j-1)*len + 1, len)
     end
 end
 
@@ -1347,6 +1349,36 @@ export fused_wilson_mul_gpu!
 export batched_hopping_steps_gpu!
 export batched_inv_hopping_gpu!
 export get_shared_buf!
+export _alloc_result_wf
+
+# ============================================================
+#  WF3x1GPU deepcopy override — fshifted를 1-element 더미로 대체
+#  LMP GPU path는 result 버퍼의 fshifted를 절대 사용하지 않음.
+#  freed CuArray deepcopy 오류 방지: 해제 대신 tiny placeholder 할당.
+#  24 MB → 16 bytes per result buffer (~18.6 GB 총 절약, 31×25 field 기준)
+# ============================================================
+function Base.deepcopy_internal(x::WF3x1GPU, dict::IdDict)
+    haskey(dict, x) && return dict[x]::WF3x1GPU
+    # immutable struct: collect all fields first, then construct via jl_new_structv
+    nf = nfields(x)
+    fields = Vector{Any}(undef, nf)
+    for i in 1:nf
+        if fieldname(WF3x1GPU, i) === :fshifted
+            # tiny 1-element placeholder: 16 bytes instead of 24 MB
+            fields[i] = CuArray{ComplexF64,4,CUDA.DeviceMemory}(undef, 1, 1, 1, 1)
+        elseif isdefined(x, i)
+            fields[i] = Base.deepcopy_internal(getfield(x, i), dict)
+        end
+    end
+    y = ccall(:jl_new_structv, Any, (Any, Ptr{Any}, UInt32), WF3x1GPU, fields, UInt32(nf))::WF3x1GPU
+    dict[x] = y
+    return y
+end
+
+function _alloc_result_wf(x::WF3x1GPU)
+    return deepcopy(x)  # 위의 deepcopy_internal이 fshifted를 자동으로 교체
+end
+_alloc_result_wf(x::WF3x1CPU) = deepcopy(x)
 
 # ============================================================
 #  Shared GPU buffer pool — layers 간 임시 버퍼 공유

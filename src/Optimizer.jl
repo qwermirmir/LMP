@@ -21,7 +21,7 @@ import LatticeDiracOperators: Dirac_Operator
 
 abstract type Opt end
 
-export Adam, update!
+export Adam, update!, sync_layers!
 export Opt
 
 
@@ -451,7 +451,6 @@ function update!(layer::DenseLinearLayer, opt::Adam, grad)
         end
         gpu_adam_update!(layer._W_gpu, layer._adam_m_gpu, layer._adam_v_gpu, grad[1],
                          opt.α, opt.β1, opt.β2, opt.ε, opt.t)
-        sync_W_from_gpu!(layer.W, layer._W_gpu)
     else
         param = layer.W
         if length(param) == 1
@@ -478,8 +477,6 @@ function update!(layer::PTLayer, opt::Adam, grad)
         end
         gpu_adam_update!(layer._W_gpu, layer._adam_m_gpu, layer._adam_v_gpu, grad[1],
                          opt.α, opt.β1, opt.β2, opt.ε, opt.t)
-        # W_gpu → W (CPU) 동기화 (저장/로깅용)
-        sync_W_from_gpu!(layer.W, layer._W_gpu)
     else
         # CPU fallback
         param = layer.W
@@ -723,6 +720,21 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad::Matrix{ComplexF64})
     end
 end
 
+
+"""
+    sync_layers!(layers)
+
+저장/substitute_Layer! 전에 호출. _W_gpu → W (CPU) 동기화.
+"""
+function sync_layers!(layers)
+    for layer in layers
+        if layer isa PTLayer && layer._W_gpu !== nothing
+            sync_W_from_gpu!(layer.W, layer._W_gpu)
+        elseif layer isa DenseLinearLayer && layer._W_gpu !== nothing
+            sync_W_from_gpu!(layer.W, layer._W_gpu)
+        end
+    end
+end
 
 end # module Optimizer
 

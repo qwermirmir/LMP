@@ -41,8 +41,9 @@ const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 # const Dirac_operator =LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}
 # const DagDirac_operator =LatticeDiracOperators.Dirac_operators.Adjoint_Wilson_operator{LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}}
 
+import ..gpu: _alloc_result_wf
 
-export forward_propagation, Lossfunction, train,  preD,Operator ,doubletrain,backward_propagation!
+export forward_propagation, Lossfunction, train,  preD,Operator ,doubletrain,backward_propagation!,forward_propagation!, backward_and_gradient!
 export refresh_fermionfield!, refresh_model!
 export substitute_Layer!
 export _to_cpu, _to_gpu,_to_cpu_gauge
@@ -1033,7 +1034,7 @@ function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     if !layer._dl_init || length(layer._result) != Out
         layer._result = Vector{WF3x1}(undef, Out)
         for i in 1:Out
-            layer._result[i] = deepcopy(x[1])
+            layer._result[i] = _alloc_result_wf(x[1])
         end
         layer._yi = [deepcopy(x[1])]
         layer._dl_init = true
@@ -1119,7 +1120,7 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
         end
         layer._result = Vector{WF3x1}(undef, Out)
         for j in 1:Out
-            layer._result[j] = deepcopy(x[1])
+            layer._result[j] = _alloc_result_wf(x[1])
         end
         layer._initialized = true
     end
@@ -1201,49 +1202,14 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
         end
 
-        # [NaN 진단] 입력 x의 NaN/Inf 체크 + 최대 절댓값 출력 (GPU-native, no CPU transfer)
-        let _xbad = false, _xmax = 0.0
-            for _xi in x
-                if hasproperty(_xi, :f) && _xi.f isa CuArray
-                    _xbad = _xbad || any(isnan, _xi.f) || any(isinf, _xi.f)
-                    _xmax = max(_xmax, sqrt(Float64(maximum(abs2, _xi.f))))
-                end
-            end
-            if _xbad
-                println("[PTLayer NaN] INPUT x has NaN/Inf BEFORE hopping (Out=$Out, npaths=$npaths, max_abs=$_xmax)")
-            elseif _xmax > 1e10
-                println("[PTLayer LARGE] INPUT x is finite but large: max_abs=$_xmax (Out=$Out, npaths=$npaths)")
-            end
-        end
-
         # Batched hop: pack x → shared _hopped_all, then max_steps batched kernels
         if layer._hop_max_steps > 0
-            # [NaN 진단] pack 직후 NaN + 최대절댓값 체크 (hop 전, GPU-native)
-            pack_fermions!(_hopped_all, x)
-            let _pb = any(isnan, _hopped_all) || any(isinf, _hopped_all),
-                _pm = sqrt(Float64(maximum(abs2, _hopped_all)))
-                _pb && println("[PTLayer NaN] _hopped_all has NaN/Inf RIGHT AFTER pack (before hop steps), max_abs=$_pm")
-                (!_pb && _pm > 1e10) && println("[PTLayer LARGE] _hopped_all after pack: max_abs=$_pm (finite but large)")
-            end
             batched_hopping_steps_gpu!(
                 _hopped_all, _hop_temp, x,
                 layer.U, layer._hop_dirs_gpu, layer._hop_nsteps_gpu,
                 layer._hop_max_steps, npaths, blocksize, rsize)
         else
             pack_fermions!(_hopped_all, x)
-        end
-
-        # [NaN 진단] 호핑 후 NaN 체크 + 최대절댓값 (GPU-native)
-        let _hbad = any(isnan, _hopped_all) || any(isinf, _hopped_all),
-            _hmax = sqrt(Float64(maximum(abs2, _hopped_all)))
-            if _hbad
-                println("[PTLayer NaN] _hopped_all has NaN/Inf AFTER hopping (max_steps=$(layer._hop_max_steps)), max_abs=$_hmax")
-            elseif _hmax > 1e10
-                println("[PTLayer LARGE] _hopped_all after hopping: max_abs=$_hmax (finite but large)")
-            end
-        end
-        let _wbad = any(isnan, layer._W_gpu)
-            _wbad && println("[PTLayer NaN] _W_gpu has NaN (Out=$Out, npaths=$npaths)")
         end
 
         # 1회 batched forward kernel (공유 버퍼 사용)
@@ -1325,7 +1291,7 @@ function (layer::NormLayer)(x::AbstractVector{<:WF3x1})
     n = length(x)
     # 캐시 존재하면 재사용 (GPU↔CPU 전환 시 재초기화)
     if !layer._norm_init || length(layer._result) != n || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(x[1]))
-        layer._result = [deepcopy(x[i]) for i in 1:n]
+        layer._result = [_alloc_result_wf(x[i]) for i in 1:n]
         layer._norm_init = true
     end
     result = layer._result
@@ -1452,8 +1418,8 @@ function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
         layer._Dz = Vector{Any}(undef, l)
         layer._DdagDz = Vector{Any}(undef, l)
         for i in 1:l
-            layer._Dz[i] = deepcopy(x[1])
-            layer._DdagDz[i] = deepcopy(x[1])
+            layer._Dz[i] = _alloc_result_wf(x[1])
+            layer._DdagDz[i] = _alloc_result_wf(x[1])
         end
         layer._ritz_init = true
     end
@@ -1749,23 +1715,6 @@ function forward_propagation!(layers::Vector{T}, input::Any, target::Any, u::Vec
 
     for i in 1:(L-1)
         u[i+1] = layers[i](u[i])
-        # NaN/Inf 진단: 처음 발생한 레이어 출력 (GPU-native, no CPU transfer)
-        _bad = false
-        for _v in u[i+1]
-            if _v isa CuArray
-                _bad = any(isnan, _v) || any(isinf, _v); _bad && break
-            elseif _v isa AbstractArray
-                _bad = any(isnan, _v) || any(isinf, _v); _bad && break
-            elseif hasproperty(_v, :f)
-                _f = _v.f
-                _bad = (_f isa CuArray || _f isa AbstractArray) && (any(isnan, _f) || any(isinf, _f))
-                _bad && break
-            end
-        end
-        if _bad
-            println("[NaN FIRST] Layer $i ($(nameof(typeof(layers[i])))) output has NaN/Inf — aborting forward pass")
-            return NaN + 0.0im
-        end
     end
 
     f = layers[L](u[L])
@@ -2358,40 +2307,23 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
     d = Vector{Any}(undef, depth)
     test_loss_history = Float64[]
 
+    # D는 루프 내에서 재생성하지 않음 — substitute_U! 가 U_template 내부 데이터를 in-place 수정하므로
+    # D가 U_template 참조를 보유하면 자동 갱신됨. 손실 레이어의 D 참조만 초기화
+    if layers[end] isa PtcRayleighQuotient_Layer; layers[end].D = D
+    elseif layers[end] isa Ritz_Layer;            layers[end].D = D
+    end
+
     for epoch in 1:epochs
         next_k = mod(epoch, N) + 1
 
         # 次 config の JLD2 読み込みを学習と並行してバックグラウンド実行（CPU メモリのみ）
         cpu_prefetch = @async JLD2.load(gauge_paths[next_k], "U")
 
-        # U_template NaN 체크 (이상 시에만 출력)
-        for _ui in U_template
-            if hasproperty(_ui, :U) && _ui.U isa CuArray
-                if any(isnan, _ui.U) || any(isinf, _ui.U)
-                    println("[U NaN] Epoch=$epoch: U_template has NaN/Inf")
-                    break
-                end
-            end
-        end
-
-        D = Dirac_operator(U_template, x, params)
+        # PTLayer.U 참조 갱신 (D는 U_template 참조를 보유하므로 재생성 불필요)
         for i in 1:depth
             if layers[i] isa PTLayer
                 layers[i].U = U_template
             end
-        end
-        if layers[end] isa PtcRayleighQuotient_Layer
-            layers[end].D = D
-        elseif layers[end] isa LossSumLayer
-            if layers[end].l1 isa PtcRayleighQuotient_Layer
-                layers[end].l1.D = D
-            end
-            if layers[end].l2 isa PtcRayleighQuotient_Layer
-                layers[end].l2.D = D
-            end
-        end
-        if layers[end] isa Ritz_Layer
-            layers[end].D = D
         end
 
         fill!(d, nothing)
@@ -2404,41 +2336,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
 
         for i in 1:depth-1
             d[i] === nothing && continue
-            # Gradient norm logging (NaN/Inf 진단용, GPU-native — no Array() on large CuArrays)
-            gnorm = 0.0
-            has_nan = false
-            if d[i] isa Vector
-                for g in d[i]
-                    if g isa AbstractArray  # includes CuArray
-                        if any(isnan, g) || any(isinf, g)
-                            has_nan = true
-                        end
-                        gnorm += Float64(sum(abs2, g))
-                    elseif hasproperty(g, :f) && g.f isa AbstractArray
-                        if any(isnan, g.f) || any(isinf, g.f)
-                            has_nan = true
-                        end
-                        gnorm += Float64(sum(abs2, g.f))
-                    end
-                end
-            elseif d[i] isa AbstractArray
-                if any(isnan, d[i]) || any(isinf, d[i])
-                    has_nan = true
-                end
-                gnorm += Float64(sum(abs2, d[i]))
-            end
-            gnorm = sqrt(gnorm)
-            if has_nan || gnorm > 1e4
-                println("  [GRAD] Epoch=$epoch Layer=$i ($(nameof(typeof(layers[i])))) norm=$(round(gnorm,sigdigits=4)) has_nan=$has_nan")
-                println(log_io, "  [GRAD] Epoch=$epoch Layer=$i norm=$(round(gnorm,sigdigits=4)) has_nan=$has_nan")
-            end
             update!(layers[i], opt, d[i])
-            # Adam 업데이트 후 W_gpu NaN 체크 (W_gpu is small — Array() OK)
-            if layers[i] isa PTLayer && layers[i]._W_gpu !== nothing
-                if any(isnan, layers[i]._W_gpu) || any(isinf, layers[i]._W_gpu)
-                    println("  [Adam NaN] Epoch=$epoch Layer=$i PTLayer _W_gpu has NaN/Inf AFTER update!")
-                end
-            end
         end
 
         current_loss = 0.0
@@ -2453,34 +2351,26 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
 
         if test_paths !== nothing && mod(epoch, test_interval) == 0
             test_loss = 0.0
-            for tc in 1:length(test_paths)
-                # U_template を test config に一時的に置き換え
-                substitute_U!(U_template, JLD2.load(test_paths[tc], "U"))
-                _sanitize_U!(U_template)  # test config도 패딩 셀 NaN 제거
-                D_test = Dirac_operator(U_template, x, params)
+            n_test = length(test_paths)
+            # 30개 JLD2 파일을 CPU threads로 동시 로드 (GPU forward와 완전 독립)
+            test_Us_cpu = Vector{Any}(undef, n_test)
+            @sync for tc in 1:n_test
+                Threads.@spawn test_Us_cpu[tc] = JLD2.load(test_paths[tc], "U")
+            end
+            # GPU forward는 순차 (shared layers/U_template/u 버퍼)
+            for tc in 1:n_test
+                substitute_U!(U_template, test_Us_cpu[tc])
+                _sanitize_U!(U_template)
                 for i in 1:depth
                     if layers[i] isa PTLayer
                         layers[i].U = U_template
                     end
                 end
-                if layers[end] isa PtcRayleighQuotient_Layer
-                    layers[end].D = D_test
-                elseif layers[end] isa LossSumLayer
-                    if layers[end].l1 isa PtcRayleighQuotient_Layer
-                        layers[end].l1.D = D_test
-                    end
-                    if layers[end].l2 isa PtcRayleighQuotient_Layer
-                        layers[end].l2.D = D_test
-                    end
-                end
-                if layers[end] isa Ritz_Layer
-                    layers[end].D = D_test
-                end
                 for b in 1:batch
-                    test_loss += real(forward_propagation!(layers, D_test, D_test, u))
+                    test_loss += real(forward_propagation!(layers, D, D, u))
                 end
             end
-            test_loss /= length(test_paths)
+            test_loss /= n_test
             push!(test_loss_history, real(test_loss))
             println("  [Test] Epoch: $(epoch), Test Loss: $test_loss")
             println(log_io, "  [Test] Epoch: $(epoch), Test Loss: $test_loss")
@@ -2494,26 +2384,12 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         substitute_U!(U_template, fetch(cpu_prefetch))
         _sanitize_U!(U_template)  # 패딩 셀 NaN/Inf → 0 (경계 셀 uninitialized 방지)
 
-        # test 評価後、layer の U/D を GPU バッファに戻す
+        # 테스트 후 학습 config 복원 (PTLayer.U만 갱신, D는 auto-update)
         if test_paths !== nothing && mod(epoch, test_interval) == 0
-            D = Dirac_operator(U_template, x, params)
             for i in 1:depth
                 if layers[i] isa PTLayer
                     layers[i].U = U_template
                 end
-            end
-            if layers[end] isa PtcRayleighQuotient_Layer
-                layers[end].D = D
-            elseif layers[end] isa LossSumLayer
-                if layers[end].l1 isa PtcRayleighQuotient_Layer
-                    layers[end].l1.D = D
-                end
-                if layers[end].l2 isa PtcRayleighQuotient_Layer
-                    layers[end].l2.D = D
-                end
-            end
-            if layers[end] isa Ritz_Layer
-                layers[end].D = D
             end
         end
     end
