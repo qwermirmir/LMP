@@ -28,7 +28,7 @@ using DisplayAs
 
 
 # ✅ `LatticeDiracOperators` 방식 적용: import 후 export 실행
-export Opt, Adam, update!
+export Opt, Adam, update!, sync_layers!
 export Hopping_operator
 export Onestep
 export Paths
@@ -94,7 +94,7 @@ export GramSchmidt_Layer
 export BlockScalar_Layer
 export conj!
 export gpuconj!
-export backward_propagation!
+export backward_propagation!,forward_propagation!
 export zero_wf!
 export refresh_fermionfield!, refresh_model!
 export substitute_Layer!

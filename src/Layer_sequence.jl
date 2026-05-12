@@ -41,8 +41,9 @@ const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 # const Dirac_operator =LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}
 # const DagDirac_operator =LatticeDiracOperators.Dirac_operators.Adjoint_Wilson_operator{LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}}
 
+import ..gpu: _alloc_result_wf
 
-export forward_propagation, Lossfunction, train,  preD,Operator ,doubletrain,backward_propagation!
+export forward_propagation, Lossfunction, train,  preD,Operator ,doubletrain,backward_propagation!,forward_propagation!, backward_and_gradient!
 export refresh_fermionfield!, refresh_model!
 export substitute_Layer!
 export _to_cpu, _to_gpu,_to_cpu_gauge
@@ -1033,7 +1034,7 @@ function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     if !layer._dl_init || length(layer._result) != Out
         layer._result = Vector{WF3x1}(undef, Out)
         for i in 1:Out
-            layer._result[i] = deepcopy(x[1])
+            layer._result[i] = _alloc_result_wf(x[1])
         end
         layer._yi = [deepcopy(x[1])]
         layer._dl_init = true
@@ -1119,7 +1120,7 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
         end
         layer._result = Vector{WF3x1}(undef, Out)
         for j in 1:Out
-            layer._result[j] = deepcopy(x[1])
+            layer._result[j] = _alloc_result_wf(x[1])
         end
         layer._initialized = true
     end
@@ -1201,8 +1202,6 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
         end
 
-
-
         # Batched hop: identity paths → pack only; hop paths → batched_hopping_steps_gpu! (internally packs)
         if layer._hop_max_steps > 0
             batched_hopping_steps_gpu!(
@@ -1218,6 +1217,7 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             layer._hopped_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, npaths)
         end
         copyto!(layer._hopped_all, _hopped_all)
+
 
         # 1회 batched forward kernel (공유 버퍼 사용)
         batched_forward!(_result_buf, layer._W_gpu, _hopped_all, blocksize, rsize, npaths, Out)
@@ -1298,7 +1298,7 @@ function (layer::NormLayer)(x::AbstractVector{<:WF3x1})
     n = length(x)
     # 캐시 존재하면 재사용 (GPU↔CPU 전환 시 재초기화)
     if !layer._norm_init || length(layer._result) != n || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(x[1]))
-        layer._result = [deepcopy(x[i]) for i in 1:n]
+        layer._result = [_alloc_result_wf(x[i]) for i in 1:n]
         layer._norm_init = true
     end
     result = layer._result
@@ -1425,8 +1425,8 @@ function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
         layer._Dz = Vector{Any}(undef, l)
         layer._DdagDz = Vector{Any}(undef, l)
         for i in 1:l
-            layer._Dz[i] = deepcopy(x[1])
-            layer._DdagDz[i] = deepcopy(x[1])
+            layer._Dz[i] = _alloc_result_wf(x[1])
+            layer._DdagDz[i] = _alloc_result_wf(x[1])
         end
         layer._ritz_init = true
     end
@@ -2336,11 +2336,25 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
     d = Vector{Any}(undef, depth)
     test_loss_history = Float64[]
 
+    # D는 루프 내에서 재생성하지 않음 — substitute_U! 가 U_template 내부 데이터를 in-place 수정하므로
+    # D가 U_template 참조를 보유하면 자동 갱신됨. 손실 레이어의 D 참조만 초기화
+    if layers[end] isa PtcRayleighQuotient_Layer; layers[end].D = D
+    elseif layers[end] isa Ritz_Layer;            layers[end].D = D
+    end
+
     for epoch in 1:epochs
         next_k = mod(epoch, N) + 1
 
         # 次 config の JLD2 読み込みを学習と並行してバックグラウンド実行（CPU メモリのみ）
         cpu_prefetch = @async JLD2.load(gauge_paths[next_k], "U")
+
+        # PTLayer.U 참조 갱신 (D는 U_template 참조를 보유하므로 재생성 불필요)
+        for i in 1:depth
+            if layers[i] isa PTLayer
+                layers[i].U = U_template
+            end
+        end
+
 
         fill!(d, nothing)
         for b in 1:batch
@@ -2351,6 +2365,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         end
 
         for i in 1:depth-1
+            d[i] === nothing && continue
             update!(layers[i], opt, d[i])
         end
 
@@ -2366,17 +2381,21 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
 
         if test_paths !== nothing && mod(epoch, test_interval) == 0
             test_loss = 0.0
-            for tc in 1:length(test_paths)
-                _test_U = JLD2.load(test_paths[tc], "U")
+            n_test = length(test_paths)
+            test_Us_cpu = Vector{Any}(undef, n_test)
+            @sync for tc in 1:n_test
+                Threads.@spawn test_Us_cpu[tc] = JLD2.load(test_paths[tc], "U")
+            end
+            for tc in 1:n_test
                 for μ in eachindex(U_template)
-                    substitute_U!(U_template[μ], _test_U[μ], _staging[μ])
+                    substitute_U!(U_template[μ], test_Us_cpu[tc][μ], _staging[μ])
                 end
                 _sanitize_U!(U_template)
                 for b in 1:batch
                     test_loss += real(forward_propagation!(layers, D, D, u))
                 end
             end
-            test_loss /= length(test_paths)
+            test_loss /= n_test
             push!(test_loss_history, real(test_loss))
             println("  [Test] Epoch: $(epoch), Test Loss: $test_loss")
             println(log_io, "  [Test] Epoch: $(epoch), Test Loss: $test_loss")
@@ -2386,7 +2405,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             test_line !== nothing && test_line.set_ydata(test_loss_history)
         end
 
-        # 次 epoch 用 U に置き換え (in-place → D も自동で追従)
+        # 次 epoch 用 U に置き換え (in-place → D も自동으로 추종)
         _next_U = fetch(cpu_prefetch)
         for μ in eachindex(U_template)
             substitute_U!(U_template[μ], _next_U[μ], _staging[μ])

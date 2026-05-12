@@ -27,6 +27,8 @@ const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerat
 
 const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 
+import ..gpu: _alloc_result_wf
+
 
 
 
@@ -2517,9 +2519,9 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
     if need_vd_reinit
         layer._VD = Vector{Any}(undef, l)
         for i in 1:l
-            layer._VD[i] = deepcopy(z[1])
+            layer._VD[i] = _alloc_result_wf(z[1])
         end
-        layer._work = Any[deepcopy(z[1]), deepcopy(z[1])]  # [ψ, r] only (y, f 불필요)
+        layer._work = Any[_alloc_result_wf(z[1]), _alloc_result_wf(z[1])]  # [ψ, r] only (y, f 불필요)
     end
 
     VD = layer._VD
@@ -3355,7 +3357,7 @@ function DeltaRule!(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}
 
     # conj 버퍼 초기화 (1회만, deepcopy 방지)
     if isempty(layer._conj_buf) || typeof(layer._conj_buf[1]) != typeof(z[1])
-        layer._conj_buf = [deepcopy(z[1])]
+        layer._conj_buf = [_alloc_result_wf(z[1])]
     end
     cj_buf = layer._conj_buf[1]
 
