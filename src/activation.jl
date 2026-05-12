@@ -2793,15 +2793,19 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
             rsize     = d[1].blockinfo.rsize
             NC = 3; NG = 4
 
-            # 공유 버퍼로 hopped_all 재계산 (hop 재실행, per-layer 저장 없음)
-            _hopped_g = get_shared_buf!(:hopped_all, NC, NG, blocksize, rsize, npaths)
-            _hop_t    = get_shared_buf!(:hop_temp,   NC, NG, blocksize, rsize, npaths)
-            pack_fermions!(_hopped_g, z)
-            if layer._hop_max_steps > 0 && layer._hop_dirs_gpu !== nothing
-                batched_hopping_steps_gpu!(
-                    _hopped_g, _hop_t, z,
-                    layer.U, layer._hop_dirs_gpu, layer._hop_nsteps_gpu,
-                    layer._hop_max_steps, npaths, blocksize, rsize)
+            # forward에서 캐싱된 hop 결과 재사용 (hop 재계산 방지)
+            if layer._hopped_all !== nothing && size(layer._hopped_all, 5) == npaths
+                _hopped_g = layer._hopped_all
+            else
+                _hopped_g = get_shared_buf!(:hopped_all, NC, NG, blocksize, rsize, npaths)
+                _hop_t    = get_shared_buf!(:hop_temp,   NC, NG, blocksize, rsize, npaths)
+                pack_fermions!(_hopped_g, z)
+                if layer._hop_max_steps > 0 && layer._hop_dirs_gpu !== nothing
+                    batched_hopping_steps_gpu!(
+                        _hopped_g, _hop_t, z,
+                        layer.U, layer._hop_dirs_gpu, layer._hop_nsteps_gpu,
+                        layer._hop_max_steps, npaths, blocksize, rsize)
+                end
             end
 
             # d_buf: 전역 공유 버퍼 사용
