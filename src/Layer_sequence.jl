@@ -1202,7 +1202,7 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
         end
 
-        # Batched hop: pack x → shared _hopped_all, then max_steps batched kernels
+        # Batched hop: identity paths → pack only; hop paths → batched_hopping_steps_gpu! (internally packs)
         if layer._hop_max_steps > 0
             batched_hopping_steps_gpu!(
                 _hopped_all, _hop_temp, x,
@@ -1211,6 +1211,13 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
         else
             pack_fermions!(_hopped_all, x)
         end
+
+        # gradient 재계산 방지: hop 결과를 per-layer 캐시에 저장 (GPU memcpy, ~0.1ms)
+        if layer._hopped_all === nothing || size(layer._hopped_all) != size(_hopped_all)
+            layer._hopped_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, npaths)
+        end
+        copyto!(layer._hopped_all, _hopped_all)
+
 
         # 1회 batched forward kernel (공유 버퍼 사용)
         batched_forward!(_result_buf, layer._W_gpu, _hopped_all, blocksize, rsize, npaths, Out)
@@ -2268,10 +2275,32 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
     γ = Clifford()
 
     # 最初の config を GPU バッファに転送
-    substitute_U!(U_template, JLD2.load(gauge_paths[1], "U"))
+    first_U = JLD2.load(gauge_paths[1], "U")
+    substitute_U!(U_template, first_U)
     _sanitize_U!(U_template)
+
+    # Pre-allocate CPU staging buffers for substitute_U! (avoids per-epoch CUDA malloc)
+    _staging = [Array{ComplexF64}(undef, U_template[μ].NC, U_template[μ].NC,
+                                  U_template[μ].blockinfo.blocksize,
+                                  U_template[μ].blockinfo.rsize) for μ in 1:length(U_template)]
     x = Initialize_pseudofermion_fields(U_template[1], "Wilson")
     D = Dirac_operator(U_template, x, params)
+
+    # layer U/D 를 U_template / D 로 고정 (substitute_U! 이 in-place 업데이트하므로 1회만)
+    for i in 1:depth
+        if layers[i] isa PTLayer
+            layers[i].U = U_template
+        end
+    end
+    if layers[end] isa PtcRayleighQuotient_Layer
+        layers[end].D = D
+    elseif layers[end] isa LossSumLayer
+        if layers[end].l1 isa PtcRayleighQuotient_Layer; layers[end].l1.D = D; end
+        if layers[end].l2 isa PtcRayleighQuotient_Layer; layers[end].l2.D = D; end
+    end
+    if layers[end] isa Ritz_Layer
+        layers[end].D = D
+    end
 
     dummy, f = forward_propagation(layers, D, D)
     u = dummy
@@ -2326,6 +2355,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             end
         end
 
+
         fill!(d, nothing)
         for b in 1:batch
             f = forward_propagation!(layers, D, D, u)
@@ -2352,20 +2382,15 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         if test_paths !== nothing && mod(epoch, test_interval) == 0
             test_loss = 0.0
             n_test = length(test_paths)
-            # 30개 JLD2 파일을 CPU threads로 동시 로드 (GPU forward와 완전 독립)
             test_Us_cpu = Vector{Any}(undef, n_test)
             @sync for tc in 1:n_test
                 Threads.@spawn test_Us_cpu[tc] = JLD2.load(test_paths[tc], "U")
             end
-            # GPU forward는 순차 (shared layers/U_template/u 버퍼)
             for tc in 1:n_test
-                substitute_U!(U_template, test_Us_cpu[tc])
-                _sanitize_U!(U_template)
-                for i in 1:depth
-                    if layers[i] isa PTLayer
-                        layers[i].U = U_template
-                    end
+                for μ in eachindex(U_template)
+                    substitute_U!(U_template[μ], test_Us_cpu[tc][μ], _staging[μ])
                 end
+                _sanitize_U!(U_template)
                 for b in 1:batch
                     test_loss += real(forward_propagation!(layers, D, D, u))
                 end
@@ -2376,22 +2401,16 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             println(log_io, "  [Test] Epoch: $(epoch), Test Loss: $test_loss")
             flush(log_io)
 
-            test_line.set_xdata(test_interval:test_interval:(test_interval*length(test_loss_history)))
-            test_line.set_ydata(test_loss_history)
+            test_line !== nothing && test_line.set_xdata(test_interval:test_interval:(test_interval*length(test_loss_history)))
+            test_line !== nothing && test_line.set_ydata(test_loss_history)
         end
 
-        # プリフェッチ済み CPU データを GPU バッファに転送（CUDA memcpy は高速）
-        substitute_U!(U_template, fetch(cpu_prefetch))
-        _sanitize_U!(U_template)  # 패딩 셀 NaN/Inf → 0 (경계 셀 uninitialized 방지)
-
-        # 테스트 후 학습 config 복원 (PTLayer.U만 갱신, D는 auto-update)
-        if test_paths !== nothing && mod(epoch, test_interval) == 0
-            for i in 1:depth
-                if layers[i] isa PTLayer
-                    layers[i].U = U_template
-                end
-            end
+        # 次 epoch 用 U に置き換え (in-place → D も自동으로 추종)
+        _next_U = fetch(cpu_prefetch)
+        for μ in eachindex(U_template)
+            substitute_U!(U_template[μ], _next_U[μ], _staging[μ])
         end
+        _sanitize_U!(U_template)
     end
 
     println(log_io, "=== Training finished: $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")

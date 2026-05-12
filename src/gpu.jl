@@ -1737,7 +1737,7 @@ end
 function _cudakernel_batched_hop_step!(
     dst, src, U1, U2, U3, U4,
     dirs,         # CuDeviceArray{Int8,2} (max_steps, npaths)
-    nsteps_arr,   # CuDeviceArray{Int32,1} (npaths,)
+    nsteps_arr,   # CuDeviceArray{Int32,1} (npaths,)sync_W_to_gpu!
     step_idx,     # Int32
     npaths,       # Int32
     blockinfo, bc,

@@ -3,7 +3,12 @@
     "allow": [
       "Bash(julia --project=c:/Users/_s2220186/Desktop/Julia/LMP -e ' *)",
       "Bash(python -c \"import json; f=open\\(r'c:/Users/_s2220186/Desktop/Julia/heatbath.ipynb'\\); data=json.load\\(f\\); [print\\(i, c['cell_type'], ':', c['source'][:3] if c['source'] else []\\) for i,c in enumerate\\(data['cells']\\)]\")",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Read(//c/Users/_s2220186/.julia/packages/**)",
+      "Bash(xargs grep *)",
+      "Bash(grep -n \"^module\\\\|^end$\" ~/.julia/packages/Gaugefields/GVeWR/src/4D/kernelfunctions/gaugefields_4D_cudakernels.jl)",
+      "PowerShell(icacls \"$env:USERPROFILE\\\\.julia\\\\packages\\\\Gaugefields\\\\GVeWR\\\\src\\\\4D\\\\kernelfunctions\\\\gaugefields_4D_cudakernels.jl\" /grant \"$env:USERNAME:F\")",
+      "PowerShell(icacls \"$env:USERPROFILE\\\\.julia\\\\packages\\\\Gaugefields\\\\GVeWR\\\\src\\\\4D\\\\kernelfunctions\\\\gaugefields_4D_cudakernels.jl\" /grant \"${env:USERNAME}:\\(F\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\_s2220186\\Desktop\\multilowmode"
