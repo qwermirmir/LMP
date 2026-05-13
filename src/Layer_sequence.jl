@@ -1313,7 +1313,6 @@ function (layer::NormLayer)(x::AbstractVector{<:WF3x1})
 end
 
 # GPU 특화: 전 필드를 1개의 5D 버퍼로 pack 후 한 번의 mapreduce로 n개의 norm 계산
-# norm2(x[i]) 1회 = CUDA.@sync 1회 → n회 직렬 sync → 병목
 # 아래는 pack(n회 copyto!) + 1회 mapreduce + 1회 Array() 로 n개 norm 일괄 취득
 function (layer::NormLayer)(x::AbstractVector{<:WF3x1GPU})
     n = length(x)
@@ -2545,9 +2544,10 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
     temp       = Vector{ComplexF64}(undef, batch)
     d          = Vector{Any}(undef, depth)
 
-    # 레이어 이름: 0-패딩해서 sortby=:name 시 순서 유지
+    # 레이어 이름: 0-패딩 + fwd/bwd 접두사로 분리 (동일 키로 인한 타이머 공유 방지)
     npad = ndigits(depth)
-    layer_names = [lpad(i, npad, '0') * "_$(nameof(typeof(layers[i])))" for i in 1:depth]
+    fwd_names = ["fwd_" * lpad(i, npad, '0') * "_$(nameof(typeof(layers[i])))" for i in 1:depth]
+    bwd_names = ["bwd_" * lpad(i, npad, '0') * "_$(nameof(typeof(layers[i])))" for i in 1:depth]
 
     println("train_timed: epochs=$epochs, batch=$batch, depth=$depth")
 
@@ -2567,9 +2567,9 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
             @timeit to "forward" begin
                 u[1] = [D]
                 for i in 1:(depth-1)
-                    @timeit to layer_names[i] u[i+1] = layers[i](u[i])
+                    @timeit to fwd_names[i] u[i+1] = layers[i](u[i])
                 end
-                @timeit to layer_names[depth] temp[b] = layers[depth](u[depth])
+                @timeit to fwd_names[depth] temp[b] = layers[depth](u[depth])
             end
             CUDA.synchronize()
 
@@ -2578,12 +2578,12 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
                 L = depth
 
                 # 마지막 레이어 (loss)
-                @timeit to layer_names[L] DeltaRule!(layers[L], layers[L].activation, u[L], delta_tail[L-1], batch)
+                @timeit to bwd_names[L] DeltaRule!(layers[L], layers[L].activation, u[L], delta_tail[L-1], batch)
 
                 # tail 영역: j = L-1 → transition_j
                 for j in (L-1):-1:transition_j
                     cur = delta_tail[j]
-                    @timeit to layer_names[j] begin
+                    @timeit to bwd_names[j] begin
                         gi = gradient(layers[j], layers[j].activation, u[j], cur, γ)
                         gi !== nothing && (d[j] = d[j] === nothing ? gi : d[j] + gi)
                         if j > transition_j
@@ -2597,7 +2597,7 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
                 # body 영역 (ping-pong): j = transition_j-1 → 2
                 cur_buf, nxt_buf = buf_a, buf_b
                 for j in (transition_j - 1):-1:2
-                    @timeit to layer_names[j] begin
+                    @timeit to bwd_names[j] begin
                         gi = gradient(layers[j], layers[j].activation, u[j], cur_buf, γ)
                         gi !== nothing && (d[j] = d[j] === nothing ? gi : d[j] + gi)
                         if j > 2
@@ -2609,8 +2609,8 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
 
                 # 레이어 2 DeltaRule! + 레이어 1 gradient
                 if delta1_buf !== nothing && L >= 2
-                    @timeit to layer_names[2] DeltaRule!(layers[2], layers[2].activation, u[2], cur_buf, delta1_buf)
-                    @timeit to layer_names[1] begin
+                    @timeit to bwd_names[2] DeltaRule!(layers[2], layers[2].activation, u[2], cur_buf, delta1_buf)
+                    @timeit to bwd_names[1] begin
                         gi1 = gradient(layers[1], layers[1].activation, u[1], delta1_buf, γ)
                         gi1 !== nothing && (d[1] = d[1] === nothing ? gi1 : d[1] + gi1)
                     end
@@ -2642,12 +2642,12 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
         println("  epoch $epoch / $epochs  loss=$(real(sum(temp)))")
     end
 
-    println("\n===== forward =====")
+    println("\n===== forward (레이어 순서) =====")
     show(to["forward"]; sortby=:name)
-    println("\n===== backward =====")
+    println("\n===== backward (레이어 순서) =====")
     show(to["backward"]; sortby=:name)
-    println("\n===== 전체 요약 =====")
-    show(to; sortby=:time)
+    println("\n===== 구간별 합산 (시간 순) =====")
+    show(to; sortby=:time, compact=true)
     println()
     return to
 end
