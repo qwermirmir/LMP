@@ -31,6 +31,7 @@ using LatticeDiracOperators
 using LinearAlgebra
 using Plots
 using CUDA
+using TimerOutputs
 
 # import LatticeDiracOperators: Dirac_Operators
 
@@ -47,6 +48,7 @@ export forward_propagation, Lossfunction, train,  preD,Operator ,doubletrain,bac
 export refresh_fermionfield!, refresh_model!
 export substitute_Layer!
 export _to_cpu, _to_gpu,_to_cpu_gauge
+export train_timed
 
 
 
@@ -2456,6 +2458,131 @@ end
 
 
 
+
+
+
+# ============================================================
+#  train_timed: TimerOutputs로 에폭 내 각 구간 시간 측정
+#  사용법:
+#    to = train_timed(opt, layers, gauge_paths, U_template, params; epochs=5)
+#    show(to)          # 상세 테이블
+#    reset_timer!(to)  # 초기화 후 재측정
+# ============================================================
+function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
+                     U_template, params;
+                     epochs::Int=5, batch::Int=1) where {T<:Layer}
+
+    to = TimerOutput()
+    depth  = length(layers)
+    N      = length(gauge_paths)
+    γ      = Clifford()
+
+    # --- 초기 셋업 (train() 과 동일) ---
+    first_U = JLD2.load(gauge_paths[1], "U")
+    substitute_U!(U_template, first_U)
+    _sanitize_U!(U_template)
+
+    _staging = [Array{ComplexF64}(undef, U_template[μ].NC, U_template[μ].NC,
+                                  U_template[μ].blockinfo.blocksize,
+                                  U_template[μ].blockinfo.rsize)
+                for μ in 1:length(U_template)]
+
+    x = Initialize_pseudofermion_fields(U_template[1], "Wilson")
+    D = Dirac_operator(U_template, x, params)
+
+    for i in 1:depth
+        layers[i] isa PTLayer && (layers[i].U = U_template)
+    end
+    if layers[end] isa PtcRayleighQuotient_Layer; layers[end].D = D
+    elseif layers[end] isa Ritz_Layer;            layers[end].D = D
+    end
+
+    u, _ = forward_propagation(layers, D, D)
+
+    body_size   = length(u[min(4, depth)])
+    delta_tail  = Dict{Int,Any}(depth-1 => deepcopy(u[depth]))
+    for j in 3:depth-2
+        length(u[j+1]) != body_size && (delta_tail[j] = deepcopy(u[j+1]))
+    end
+    transition_j = minimum(keys(delta_tail))
+    for j in transition_j:depth-1
+        haskey(delta_tail, j) || (delta_tail[j] = deepcopy(u[j+1]))
+    end
+    buf_a      = deepcopy(u[transition_j])
+    buf_b      = deepcopy(u[transition_j])
+    delta1_buf = depth >= 2 ? deepcopy(u[2]) : nothing
+    temp       = Vector{ComplexF64}(undef, batch)
+    d          = Vector{Any}(undef, depth)
+
+    # layer 타입 이름 캐시 (매 에폭마다 nameof 반복 호출 방지)
+    layer_names = ["$(i)_$(nameof(typeof(layers[i])))" for i in 1:depth]
+
+    println("train_timed: epochs=$epochs, batch=$batch, depth=$depth")
+    println("  layer types: ", join(layer_names, ", "))
+
+    # --- 타이밍 에폭 루프 ---
+    for epoch in 1:epochs
+        next_k = mod(epoch, N) + 1
+
+        # JLD2 프리페치 (비동기 실행, 끝나는 시간은 gauge_copy 에서 측정)
+        cpu_prefetch = @async JLD2.load(gauge_paths[next_k], "U")
+
+        for i in 1:depth
+            layers[i] isa PTLayer && (layers[i].U = U_template)
+        end
+
+        fill!(d, nothing)
+
+        for b in 1:batch
+            # --- forward (레이어별 타이밍) ---
+            @timeit to "forward" begin
+                u[1] = [D]
+                for i in 1:(depth-1)
+                    @timeit to layer_names[i] u[i+1] = layers[i](u[i])
+                end
+                @timeit to "$(depth)_loss" temp[b] = layers[depth](u[depth])
+            end
+
+            # GPU 연산 완료 대기 (forward 시간 정확도 확보)
+            CUDA.synchronize()
+
+            # --- backward ---
+            @timeit to "backward" begin
+                backward_and_gradient!(layers, u, batch, delta_tail, buf_a, buf_b,
+                                       transition_j, d, γ, delta1_buf)
+            end
+
+            CUDA.synchronize()
+        end
+
+        # --- optimizer ---
+        @timeit to "optimizer" begin
+            for i in 1:depth-1
+                d[i] === nothing && continue
+                update!(layers[i], opt, d[i])
+            end
+            CUDA.synchronize()
+        end
+
+        # --- gauge copy (JLD2 fetch 대기 + CPU→GPU 전송) ---
+        @timeit to "gauge_copy" begin
+            @timeit to "jld2_fetch"    _next_U = fetch(cpu_prefetch)
+            @timeit to "substitute_U!" begin
+                for μ in eachindex(U_template)
+                    _fast_substitute_U!(U_template[μ], _next_U[μ], _staging[μ])
+                end
+                _sanitize_U!(U_template)
+            end
+        end
+
+        println("  epoch $epoch / $epochs  loss=$(real(sum(temp)))")
+    end
+
+    println("\n===== TimerOutput =====")
+    show(to; sortby=:time)
+    println()
+    return to
+end
 
 
 end # module Layer_sequence
