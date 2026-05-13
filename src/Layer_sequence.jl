@@ -2168,6 +2168,31 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
 end
 
 
+# Gaugefields 패치 없이 동작하는 substitute_U! 대체 구현.
+# staging 버퍼를 재사용하여 CUDA malloc과 GPU→CPU sync를 제거.
+# convert_br(b, r, blocks, blocks_s, blocknumbers, blocknumbers_s)
+#   = 1 + mod(div(b-1,blocks_s),blocks) + mod(div(r-1,blocknumbers_s),blocknumbers)*blocks
+@inline function _cvt_br(b, r, blk, blk_s, nblk, nblk_s)
+    return 1 + mod(div(b - 1, blk_s), blk) + mod(div(r - 1, nblk_s), nblk) * blk
+end
+
+function _fast_substitute_U!(A, B, staging::Array)
+    bi = A.blockinfo
+    NC = A.NC
+    @inbounds for r in 1:bi.rsize
+        for b in 1:bi.blocksize
+            ix = _cvt_br(b, r, bi.blocks[1], bi.blocks_s[1], bi.blocknumbers[1], bi.blocknumbers_s[1])
+            iy = _cvt_br(b, r, bi.blocks[2], bi.blocks_s[2], bi.blocknumbers[2], bi.blocknumbers_s[2])
+            iz = _cvt_br(b, r, bi.blocks[3], bi.blocks_s[3], bi.blocknumbers[3], bi.blocknumbers_s[3])
+            it = _cvt_br(b, r, bi.blocks[4], bi.blocks_s[4], bi.blocknumbers[4], bi.blocknumbers_s[4])
+            for ic in 1:NC, jc in 1:NC
+                staging[jc, ic, b, r] = B[jc, ic, ix, iy, iz, it]
+            end
+        end
+    end
+    copyto!(A.U, staging)
+end
+
 # 게이지 필드의 NaN/Inf (경계 패딩 셀) 를 0으로 교체 (GPU-native in-place map)
 function _sanitize_U!(U::Vector)
     for ui in U
@@ -2388,7 +2413,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             end
             for tc in 1:n_test
                 for μ in eachindex(U_template)
-                    substitute_U!(U_template[μ], test_Us_cpu[tc][μ], _staging[μ])
+                    _fast_substitute_U!(U_template[μ], test_Us_cpu[tc][μ], _staging[μ])
                 end
                 _sanitize_U!(U_template)
                 for b in 1:batch
@@ -2408,7 +2433,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         # 次 epoch 用 U に置き換え (in-place → D も自동으로 추종)
         _next_U = fetch(cpu_prefetch)
         for μ in eachindex(U_template)
-            substitute_U!(U_template[μ], _next_U[μ], _staging[μ])
+            _fast_substitute_U!(U_template[μ], _next_U[μ], _staging[μ])
         end
         _sanitize_U!(U_template)
     end
