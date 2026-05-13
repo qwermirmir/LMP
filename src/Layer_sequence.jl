@@ -1312,6 +1312,37 @@ function (layer::NormLayer)(x::AbstractVector{<:WF3x1})
     return result
 end
 
+# GPU 특화: 전 필드를 1개의 5D 버퍼로 pack 후 한 번의 mapreduce로 n개의 norm 계산
+# norm2(x[i]) 1회 = CUDA.@sync 1회 → n회 직렬 sync → 병목
+# 아래는 pack(n회 copyto!) + 1회 mapreduce + 1회 Array() 로 n개 norm 일괄 취득
+function (layer::NormLayer)(x::AbstractVector{<:WF3x1GPU})
+    n = length(x)
+    if !layer._norm_init || length(layer._result) != n || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(x[1]))
+        layer._result = [_alloc_result_wf(x[i]) for i in 1:n]
+        layer._norm_init = true
+    end
+    result = layer._result
+
+    # 5D 스크래치 버퍼 (NC, NG, blocksize, rsize, n) — 공유 풀에서 재사용
+    f1 = x[1].f
+    NC, NG, bs, rs = size(f1, 1), size(f1, 2), size(f1, 3), size(f1, 4)
+    buf = get_shared_buf!(:normlayer_pack, NC, NG, bs, rs, n)
+
+    # 全フィールドを1つのバッファにコピー（n回 GPU memcpy, sync なし）
+    pack_fermions!(buf, x)
+
+    # 一括 norm 計算: dims=(1,2,3,4) で NG+NC+site をまとめて reduce → (1,1,1,1,n)
+    # Array() は1回だけ呼ぶので GPU sync は1回のみ
+    norms_sq = Array(dropdims(mapreduce(abs2, +, buf; dims=(1, 2, 3, 4)), dims=(1, 2, 3, 4)))
+
+    @inbounds for i in 1:n
+        s = layer.alpha / sqrt(real(norms_sq[i]))
+        axpby!(s, x[i], 0, result[i])
+    end
+
+    return result
+end
+
 function (layer::complexNormLayer)(x::WF3x1)
 
 
