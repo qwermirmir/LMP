@@ -325,24 +325,14 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
     _Wadj::Vector{T}             # adjoint(W) 캐시 벡터
     _invhops::Vector{Any}        # 스레드별 Hopping_operator 캐시
     _hop_out::Vector{Vector{WF3x1}} # 스레드별 hop 출력 버퍼 (1-element)
-    # --- gradient 캐시 버퍼 ---
-    _grad_M_all::Any            # CuArray for Matmul_batch
-    _grad_M_cpu::Array{ComplexF64,3}  # CPU buffer for Matmul_batch
-    _grad_result::Vector{Any}   # Spin_matrix result
-    _grad_Qs::Vector{Any}       # Qs reference vector
-    _grad_Ks::Vector{Any}       # Ks reference vector
     # --- GPU-resident batched buffers ---
     _W_gpu::Any                 # CuArray{ComplexF64,3} (4,4,NW)
     _Wadj_gpu::Any              # CuArray{ComplexF64,3} (4,4,NW) adjoint(W)
-    _hopped_all::Any            # CuArray{ComplexF64,5} (NC,NG,bs,rs,npaths)
-    _result_all::Any            # CuArray{ComplexF64,5} (NC,NG,bs,rs,Out)
-    _d_buf::Any                 # CuArray{ComplexF64,5} (NC,NG,bs,rs,Out) d packing
-    _ci_all::Any                # CuArray{ComplexF64,5} (NC,NG,bs,rs,npaths) DeltaRule intermediate
+    _hopped_all::Any            # CuArray{ComplexF64,5} (NC,NG,bs,rs,npaths) — forward hop cache for gradient
     _grad_gpu::Any              # CuArray{ComplexF64,3} (4,4,NW) gradient on GPU
-    _adam_m_gpu::Any             # CuArray{ComplexF64,3} Adam 1st moment
-    _adam_v_gpu::Any             # CuArray{ComplexF64,3} Adam 2nd moment
+    _adam_m_gpu::Any            # CuArray{ComplexF64,3} Adam 1st moment
+    _adam_v_gpu::Any            # CuArray{ComplexF64,3} Adam 2nd moment
     # --- Batched hopping cache ---
-    _hop_temp_5d::Any            # CuArray{ComplexF64,5} double-buffer for batched hop
     _hop_dirs_gpu::Any           # CuArray{Int8,2} (max_steps, npaths) direction table
     _hop_nsteps_gpu::Any         # CuArray{Int32,1} (npaths,) step counts
     _hop_max_steps::Int          # max steps across all paths
@@ -351,7 +341,7 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
     function PTLayer(paths::Vector{Paths}, U::Vector{G}, Out::Int,
                      activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields}
 
-        if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator  # ★ U는 Vector니까 eltype(U)로 체크
+        if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
             W = Vector{Spin_matrix_GPU}(undef, length(paths)*Out)
             for i in eachindex(W)
                 W[i] = Random_SpinM_GPU("complex")
@@ -360,9 +350,8 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
                        WF3x1[], WF3x1[], false,
                        Paths[], WF3x1[], WF3x1[], false,
                        Spin_matrix_GPU[], Any[], Vector{WF3x1}[],
-                       nothing, Array{ComplexF64}(undef,0,0,0), Any[], Any[], Any[],
-                       nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
-                       nothing, nothing, nothing, 0, nothing)
+                       nothing, nothing, nothing, nothing, nothing, nothing,
+                       nothing, nothing, 0, nothing)
         else
             W = Vector{Spin_matrix}(undef, length(paths)*Out)
             for i in eachindex(W)
@@ -372,9 +361,8 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
                        WF3x1[], WF3x1[], false,
                        Paths[], WF3x1[], WF3x1[], false,
                        Spin_matrix[], Any[], Vector{WF3x1}[],
-                       nothing, Array{ComplexF64}(undef,0,0,0), Any[], Any[], Any[],
-                       nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
-                       nothing, nothing, nothing, 0, nothing)
+                       nothing, nothing, nothing, nothing, nothing, nothing,
+                       nothing, nothing, 0, nothing)
         end
     end
 end
