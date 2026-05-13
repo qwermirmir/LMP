@@ -2514,17 +2514,15 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
     temp       = Vector{ComplexF64}(undef, batch)
     d          = Vector{Any}(undef, depth)
 
-    # layer 타입 이름 캐시 (매 에폭마다 nameof 반복 호출 방지)
-    layer_names = ["$(i)_$(nameof(typeof(layers[i])))" for i in 1:depth]
+    # 레이어 이름: 0-패딩해서 sortby=:name 시 순서 유지
+    npad = ndigits(depth)
+    layer_names = [lpad(i, npad, '0') * "_$(nameof(typeof(layers[i])))" for i in 1:depth]
 
     println("train_timed: epochs=$epochs, batch=$batch, depth=$depth")
-    println("  layer types: ", join(layer_names, ", "))
 
     # --- 타이밍 에폭 루프 ---
     for epoch in 1:epochs
         next_k = mod(epoch, N) + 1
-
-        # JLD2 프리페치 (비동기 실행, 끝나는 시간은 gauge_copy 에서 측정)
         cpu_prefetch = @async JLD2.load(gauge_paths[next_k], "U")
 
         for i in 1:depth
@@ -2540,18 +2538,53 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
                 for i in 1:(depth-1)
                     @timeit to layer_names[i] u[i+1] = layers[i](u[i])
                 end
-                @timeit to "$(depth)_loss" temp[b] = layers[depth](u[depth])
+                @timeit to layer_names[depth] temp[b] = layers[depth](u[depth])
             end
-
-            # GPU 연산 완료 대기 (forward 시간 정확도 확보)
             CUDA.synchronize()
 
-            # --- backward ---
+            # --- backward: backward_and_gradient! 를 인라인하여 레이어별 타이밍 ---
             @timeit to "backward" begin
-                backward_and_gradient!(layers, u, batch, delta_tail, buf_a, buf_b,
-                                       transition_j, d, γ, delta1_buf)
-            end
+                L = depth
 
+                # 마지막 레이어 (loss)
+                @timeit to layer_names[L] DeltaRule!(layers[L], layers[L].activation, u[L], delta_tail[L-1], batch)
+
+                # tail 영역: j = L-1 → transition_j
+                for j in (L-1):-1:transition_j
+                    cur = delta_tail[j]
+                    @timeit to layer_names[j] begin
+                        gi = gradient(layers[j], layers[j].activation, u[j], cur, γ)
+                        gi !== nothing && (d[j] = d[j] === nothing ? gi : d[j] + gi)
+                        if j > transition_j
+                            DeltaRule!(layers[j], layers[j].activation, u[j], cur, delta_tail[j-1])
+                        else
+                            DeltaRule!(layers[j], layers[j].activation, u[j], cur, buf_a)
+                        end
+                    end
+                end
+
+                # body 영역 (ping-pong): j = transition_j-1 → 2
+                cur_buf, nxt_buf = buf_a, buf_b
+                for j in (transition_j - 1):-1:2
+                    @timeit to layer_names[j] begin
+                        gi = gradient(layers[j], layers[j].activation, u[j], cur_buf, γ)
+                        gi !== nothing && (d[j] = d[j] === nothing ? gi : d[j] + gi)
+                        if j > 2
+                            DeltaRule!(layers[j], layers[j].activation, u[j], cur_buf, nxt_buf)
+                            cur_buf, nxt_buf = nxt_buf, cur_buf
+                        end
+                    end
+                end
+
+                # 레이어 2 DeltaRule! + 레이어 1 gradient
+                if delta1_buf !== nothing && L >= 2
+                    @timeit to layer_names[2] DeltaRule!(layers[2], layers[2].activation, u[2], cur_buf, delta1_buf)
+                    @timeit to layer_names[1] begin
+                        gi1 = gradient(layers[1], layers[1].activation, u[1], delta1_buf, γ)
+                        gi1 !== nothing && (d[1] = d[1] === nothing ? gi1 : d[1] + gi1)
+                    end
+                end
+            end
             CUDA.synchronize()
         end
 
@@ -2578,7 +2611,11 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
         println("  epoch $epoch / $epochs  loss=$(real(sum(temp)))")
     end
 
-    println("\n===== TimerOutput =====")
+    println("\n===== forward =====")
+    show(to["forward"]; sortby=:name)
+    println("\n===== backward =====")
+    show(to["backward"]; sortby=:name)
+    println("\n===== 전체 요약 =====")
     show(to; sortby=:time)
     println()
     return to
