@@ -901,9 +901,18 @@ function _init_gpu_block_cache!(layer, x::WF3x1GPU)
             bmap[idx] = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
         end
     end
+    sites, counts = _blockscalar_sites_by_block(bmap, size(layer.W, 1))
     layer._gpu_block_map = bmap
     layer._gpu_w_cpu = zeros(ComplexF64, blocksize, rsize)
-    layer._gpu_w_buf = CUDA.zeros(ComplexF64, 1, 1, blocksize, rsize)
+    layer._gpu_w_buf = Dict{Symbol,Any}(
+        :W => CuArray(layer.W),
+        :bmap => CuArray(Int32.(bmap)),
+        :block_sites => CuArray(sites),
+        :block_counts => CuArray(counts),
+        :grad => nothing,
+        :adam_m => nothing,
+        :adam_v => nothing,
+    )
 end
 
 """
@@ -917,11 +926,197 @@ function _update_block_weight_gpu!(layer, W_col::AbstractVector{<:Number})
     @inbounds for i in eachindex(bmap)
         w_cpu[i] = W_col[bmap[i]]
     end
-    copyto!(layer._gpu_w_buf, reshape(w_cpu, 1, 1, size(w_cpu)...))
-    return layer._gpu_w_buf
+    cache = layer._gpu_w_buf
+    if cache isa Dict
+        if !haskey(cache, :expanded) || cache[:expanded] === nothing || size(cache[:expanded]) != (1, 1, size(w_cpu, 1), size(w_cpu, 2))
+            cache[:expanded] = CUDA.zeros(ComplexF64, 1, 1, size(w_cpu, 1), size(w_cpu, 2))
+        end
+        copyto!(cache[:expanded], reshape(w_cpu, 1, 1, size(w_cpu)...))
+        return cache[:expanded]
+    else
+        copyto!(layer._gpu_w_buf, reshape(w_cpu, 1, 1, size(w_cpu)...))
+        return layer._gpu_w_buf
+    end
+end
+
+function _sync_blockscalar_W_gpu!(layer; upload::Bool=true)
+    cache = layer._gpu_w_buf
+    if !(cache isa Dict) || !haskey(cache, :W) || size(cache[:W]) != size(layer.W)
+        sites, counts = _blockscalar_sites_by_block(layer._gpu_block_map, size(layer.W, 1))
+        cache = Dict{Symbol,Any}(
+            :W => CuArray(layer.W),
+            :bmap => CuArray(Int32.(layer._gpu_block_map)),
+            :block_sites => CuArray(sites),
+            :block_counts => CuArray(counts),
+            :grad => nothing,
+            :adam_m => nothing,
+            :adam_v => nothing,
+        )
+        layer._gpu_w_buf = cache
+    elseif upload
+        copyto!(cache[:W], layer.W)
+    end
+    return cache[:W], cache[:bmap], cache
+end
+
+function _blockscalar_sites_by_block(bmap::Vector{Int}, nblocks::Int)
+    counts = zeros(Int32, nblocks)
+    @inbounds for bid in bmap
+        counts[bid] += Int32(1)
+    end
+    max_count = maximum(counts)
+    sites = zeros(Int32, Int(max_count), nblocks)
+    pos = zeros(Int32, nblocks)
+    @inbounds for site in eachindex(bmap)
+        bid = bmap[site]
+        pos[bid] += Int32(1)
+        sites[Int(pos[bid]), bid] = Int32(site)
+    end
+    return sites, counts
+end
+
+function _blockscalar_apply_kernel!(
+    out::CuDeviceVector{ComplexF64},
+    x::CuDeviceVector{ComplexF64},
+    W::CuDeviceMatrix{ComplexF64},
+    bmap::CuDeviceVector{Int32},
+    nc_ng::Int32,
+    total::Int32,
+    k::Int32,
+    residual::Bool,
+)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if tid <= total
+        site = (tid - Int32(1)) ÷ nc_ng + Int32(1)
+        bid = bmap[site]
+        v = W[bid, k] * x[tid]
+        if residual
+            v += x[tid]
+        end
+        out[tid] = v
+    end
+    return nothing
+end
+
+function blockscalar_apply_gpu!(out::CuArray{ComplexF64,4}, x::CuArray{ComplexF64,4},
+                                W::CuArray{ComplexF64,2}, bmap::CuArray{Int32,1},
+                                k::Int, residual::Bool)
+    nc_ng = Int32(size(x, 1) * size(x, 2))
+    total = Int32(length(x))
+    @cuda threads=256 blocks=cld(Int(total), 256) _blockscalar_apply_kernel!(
+        reshape(out, :), reshape(x, :), W, bmap, nc_ng, total, Int32(k), residual)
+    return out
+end
+
+function _blockscalar_grad_kernel!(
+    grad_re::CuDeviceMatrix{Float64},
+    grad_im::CuDeviceMatrix{Float64},
+    z::CuDeviceVector{ComplexF64},
+    d::CuDeviceVector{ComplexF64},
+    bmap::CuDeviceVector{Int32},
+    nc_ng::Int32,
+    nsites::Int32,
+    k::Int32,
+)
+    site = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if site <= nsites
+        base = (site - Int32(1)) * nc_ng
+        s = ComplexF64(0.0)
+        for j in Int32(1):nc_ng
+            @inbounds s += d[base + j] * z[base + j]
+        end
+        bid = bmap[site]
+        cs = conj(s)
+        CUDA.@atomic grad_re[bid, k] += real(cs)
+        CUDA.@atomic grad_im[bid, k] += imag(cs)
+    end
+    return nothing
+end
+
+function _blockscalar_grad_by_block_kernel!(
+    grad::CuDeviceMatrix{ComplexF64},
+    z::CuDeviceVector{ComplexF64},
+    d::CuDeviceVector{ComplexF64},
+    block_sites::CuDeviceMatrix{Int32},
+    block_counts::CuDeviceVector{Int32},
+    nc_ng::Int32,
+    k_arg::Int32,
+)
+    bid = Int32(blockIdx().x)
+    k = k_arg
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
+
+    s = ComplexF64(0.0)
+    count = block_counts[bid]
+    p = tid
+    while p <= count
+        site = block_sites[p, bid]
+        base = (site - Int32(1)) * nc_ng
+        for j in Int32(1):nc_ng
+            @inbounds s += d[base + j] * z[base + j]
+        end
+        p += bsz
+    end
+    @inbounds sh[tid] = s
+    sync_threads()
+
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            @inbounds sh[tid] += sh[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+
+    if tid == Int32(1)
+        @inbounds grad[bid, k] = conj(sh[Int32(1)])
+    end
+    return nothing
+end
+
+function blockscalar_gradient_gpu!(layer, z::AbstractVector, d::AbstractVector)
+    cache = layer._gpu_w_buf
+    if !(cache isa Dict) || !haskey(cache, :bmap)
+        sites, counts = _blockscalar_sites_by_block(layer._gpu_block_map, size(layer.W, 1))
+        cache = Dict{Symbol,Any}(
+            :W => CuArray(layer.W),
+            :bmap => CuArray(Int32.(layer._gpu_block_map)),
+            :block_sites => CuArray(sites),
+            :block_counts => CuArray(counts),
+            :grad => nothing,
+            :adam_m => nothing,
+            :adam_v => nothing,
+        )
+        layer._gpu_w_buf = cache
+    end
+    nblocks, n = size(layer.W)
+    if !haskey(cache, :block_sites) || cache[:block_sites] === nothing || size(cache[:block_sites], 2) != nblocks
+        sites, counts = _blockscalar_sites_by_block(layer._gpu_block_map, nblocks)
+        cache[:block_sites] = CuArray(sites)
+        cache[:block_counts] = CuArray(counts)
+    end
+    block_sites = cache[:block_sites]
+    block_counts = cache[:block_counts]
+    if !haskey(cache, :grad) || cache[:grad] === nothing || size(cache[:grad]) != (nblocks, n)
+        cache[:grad] = CUDA.zeros(ComplexF64, nblocks, n)
+    end
+    grad = cache[:grad]
+
+    fref = z[1].f
+    nc_ng = Int32(size(fref, 1) * size(fref, 2))
+    for k in 1:n
+        @cuda threads=256 blocks=(nblocks, 1) shmem=(256 * sizeof(ComplexF64)) _blockscalar_grad_by_block_kernel!(
+            grad, reshape(z[k].f, :), reshape(d[k].f, :),
+            block_sites, block_counts, nc_ng, Int32(k))
+    end
+    return grad
 end
 
 export _build_block_weight_gpu, _init_gpu_block_cache!, _update_block_weight_gpu!
+export _sync_blockscalar_W_gpu!, blockscalar_apply_gpu!, blockscalar_gradient_gpu!
 
 
 # ============================================================
@@ -959,19 +1154,73 @@ function sync_W_from_gpu!(W::AbstractVector{<:AbstractSpinMatrix}, W_gpu::CuArra
     end
 end
 
+function sync_W_from_gpu!(W::AbstractVector{<:AbstractSpinMatrix}, W_gpu::CuArray{ComplexF64, 3}, W_cpu_buf::Array{ComplexF64, 3})
+    copyto!(W_cpu_buf, W_gpu)
+    @inbounds for k in eachindex(W)
+        sm = W[k].sm
+        for j in 1:4, i in 1:4
+            sm[i, j] = W_cpu_buf[i, j, k]
+        end
+    end
+end
+
 # ---- Pack / Unpack fermion fields ----
+# n개의 serial copyto! 대신 single CUDA kernel launch 로 전체를 처리.
+# 포인터 캐시: (buf_addr, n) 키로 CuArray{CuPtr} 를 재사용 — 첫 호출에만 할당.
+
+# 포인터는 UInt64 로 저장 — kernel 내에서 LLVMPtr 로 reinterpret
+const _field_ptr_cache = Dict{Tuple{UInt64,Int}, Tuple{UInt64, CuArray{UInt64,1}}}()
+
+function _cached_field_ptrs!(buf::CuArray{ComplexF64,5}, fields)
+    n  = length(fields)
+    kb = reinterpret(UInt64, pointer(buf))
+    p0 = reinterpret(UInt64, pointer(fields[1].f))
+    k  = (kb, n)
+    cached = get(_field_ptr_cache, k, nothing)
+    if cached === nothing || cached[1] != p0
+        _field_ptr_cache[k] = (p0, CuArray([reinterpret(UInt64, pointer(fields[i].f)) for i in 1:n]))
+    end
+    return _field_ptr_cache[k][2]
+end
+
+function _pack_kernel!(dst, ptrs_u64, inner::Int32)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    fid = Int32(blockIdx().y)
+    if tid <= inner
+        ptr = reinterpret(Core.LLVMPtr{ComplexF64, 1}, ptrs_u64[fid])
+        @inbounds dst[(fid - Int32(1)) * inner + tid] = unsafe_load(ptr, tid)
+    end
+    return nothing
+end
+
+function _unpack_kernel!(ptrs_u64, src, inner::Int32)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    fid = Int32(blockIdx().y)
+    if tid <= inner
+        ptr = reinterpret(Core.LLVMPtr{ComplexF64, 1}, ptrs_u64[fid])
+        unsafe_store!(ptr, src[(fid - Int32(1)) * inner + tid], tid)
+    end
+    return nothing
+end
 
 """Vector{WF3x1GPU} → CuArray{ComplexF64, 5} (NC,NG,bs,rs,n)"""
 function pack_fermions!(buf::CuArray{ComplexF64, 5}, fields::AbstractVector)
-    len = size(buf, 1) * size(buf, 2) * size(buf, 3) * size(buf, 4)
-    @inbounds for i in eachindex(fields)
-        copyto!(buf, (i-1)*len + 1, fields[i].f, 1, len)
+    n = length(fields); n == 0 && return
+    inner = size(buf,1) * size(buf,2) * size(buf,3) * size(buf,4)
+    if n >= 32
+        ptrs   = _cached_field_ptrs!(buf, fields)
+        nblock = cld(inner, 256)
+        @cuda threads=256 blocks=(nblock, Int(n)) _pack_kernel!(reshape(buf, :), ptrs, Int32(inner))
+    else
+        @inbounds for i in 1:n
+            copyto!(buf, (i-1)*inner + 1, fields[i].f, 1, inner)
+        end
     end
 end
 
 """CuArray{ComplexF64, 5} → Vector{WF3x1GPU}  (각 field의 .f에 복사)"""
 function unpack_fermions!(fields::AbstractVector, buf::CuArray{ComplexF64, 5})
-    len = size(buf, 1) * size(buf, 2) * size(buf, 3) * size(buf, 4)
+    len = size(buf,1) * size(buf,2) * size(buf,3) * size(buf,4)
     @inbounds for j in eachindex(fields)
         copyto!(fields[j].f, 1, buf, (j-1)*len + 1, len)
     end
@@ -1148,10 +1397,10 @@ end
 # ──── GPU-side Adam update ────
 
 function _cudakernel_adam_complex!(
-    W_gpu   ::CuDeviceArray{ComplexF64, 3},
-    m_gpu   ::CuDeviceArray{ComplexF64, 3},
-    v_gpu   ::CuDeviceArray{ComplexF64, 3},
-    grad_gpu::CuDeviceArray{ComplexF64, 3},
+    W_gpu   ::CuDeviceArray{ComplexF64},
+    m_gpu   ::CuDeviceArray{ComplexF64},
+    v_gpu   ::CuDeviceArray{ComplexF64},
+    grad_gpu::CuDeviceArray{ComplexF64},
     α::Float64, β1::Float64, β2::Float64, ε::Float64,
     bias1::Float64, bias2::Float64
 )
@@ -1199,6 +1448,54 @@ function gpu_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
 end
 
 # ---- Wadj 동기화 커널 ----
+function _cudakernel_adam_complex_standard!(
+    W_gpu::CuDeviceArray{ComplexF64},
+    m_gpu::CuDeviceArray{ComplexF64},
+    v_gpu::CuDeviceArray{ComplexF64},
+    grad_gpu::CuDeviceArray{ComplexF64},
+    alpha::Float64, beta1::Float64, beta2::Float64, eps::Float64,
+    bias1::Float64, bias2::Float64
+)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    total = length(W_gpu)
+    if idx > total; return; end
+
+    @inbounds begin
+        g = grad_gpu[idx]
+        g_re = real(g); g_im = imag(g)
+
+        m = m_gpu[idx]
+        mr = beta1 * real(m) + (1 - beta1) * g_re
+        mi = beta1 * imag(m) + (1 - beta1) * g_im
+
+        v = v_gpu[idx]
+        vr = beta2 * real(v) + (1 - beta2) * g_re * g_re
+        vi = beta2 * imag(v) + (1 - beta2) * g_im * g_im
+
+        m_gpu[idx] = complex(mr, mi)
+        v_gpu[idx] = complex(vr, vi)
+
+        upd_re = alpha * (mr * bias1) / (sqrt(vr * bias2) + eps)
+        upd_im = alpha * (mi * bias1) / (sqrt(vi * bias2) + eps)
+
+        W_gpu[idx] -= complex(upd_re, upd_im)
+    end
+    return nothing
+end
+
+function blockscalar_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
+                                  alpha, beta1, beta2, eps, t)
+    bias1 = 1.0 / (1.0 - beta1^t)
+    bias2 = 1.0 / (1.0 - beta2^t)
+    total = length(W_gpu)
+    threads = min(256, total)
+    nblocks = cld(total, threads)
+    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adam_complex_standard!(
+        W_gpu, m_gpu, v_gpu, grad_gpu, alpha, beta1, beta2, eps, bias1, bias2)
+end
+
+export blockscalar_adam_update!
+
 function _cudakernel_adjoint_W!(Wadj, W, n)
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     if idx > n; return; end
@@ -1349,6 +1646,7 @@ export fused_wilson_mul_gpu!
 export batched_hopping_steps_gpu!
 export batched_inv_hopping_gpu!
 export get_shared_buf!
+export get_shared_float_buf!
 export _alloc_result_wf
 
 # ============================================================
@@ -1402,6 +1700,399 @@ function get_shared_buf!(key::Symbol, NC::Int, NG::Int, bs::Int, rs::Int, n::Int
     end
     return buf
 end
+
+const _shared_float_pool = Dict{Tuple{Symbol,Int}, CuArray{Float64,5}}()
+
+function get_shared_float_buf!(key::Symbol, NC::Int, NG::Int, bs::Int, rs::Int, n::Int)
+    k = (key, n)
+    buf = get(_shared_float_pool, k, nothing)
+    if buf === nothing || size(buf, 3) != bs || size(buf, 4) != rs
+        buf = CUDA.zeros(Float64, NC, NG, bs, rs, n)
+        _shared_float_pool[k] = buf
+    end
+    return buf
+end
+
+# ============================================================
+#  Batched norm²/dot kernels — NormLayer fwd/bwd 전용
+#  map!(abs2,…)+sum(…;dims=1:4) 을 완전히 대체. 0 allocation.
+# ============================================================
+
+function _batch_normsq_kernel!(
+    out::CuDeviceVector{Float64},
+    x::CuDeviceVector{ComplexF64},
+    inner::Int32
+)
+    bid = Int32(blockIdx().x)
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sdata = CUDA.@cuDynamicSharedMem(Float64, Int(bsz))
+    s = 0.0
+    base = (bid - Int32(1)) * inner
+    j = tid
+    while j <= inner
+        @inbounds v = x[base + j]
+        s += real(v)^2 + imag(v)^2
+        j += bsz
+    end
+    @inbounds sdata[tid] = s
+    sync_threads()
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            @inbounds sdata[tid] += sdata[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+    if tid == Int32(1)
+        @inbounds out[bid] = sdata[Int32(1)]
+    end
+    nothing
+end
+
+function _batch_normsq!(out::CuVector{Float64}, x::CuArray{ComplexF64,5})
+    n     = length(out)
+    inner = Int32(length(x) ÷ n)
+    @cuda threads=256 blocks=n shmem=(256*sizeof(Float64)) _batch_normsq_kernel!(
+        out, reshape(x, :), inner)
+end
+
+function _normalize_batch_kernel!(
+    out::CuDeviceVector{ComplexF64},
+    x::CuDeviceVector{ComplexF64},
+    norms::CuDeviceVector{Float64},
+    alpha::Float64,
+    inner::Int32,
+    n::Int32
+)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if tid <= inner * n
+        batch_i = (tid - Int32(1)) ÷ inner + Int32(1)
+        @inbounds scale = alpha / sqrt(norms[batch_i])
+        @inbounds out[tid] = scale * x[tid]
+    end
+    nothing
+end
+
+function _normalize_batch!(out::CuArray{ComplexF64,5}, x::CuArray{ComplexF64,5},
+                           norms::CuVector{Float64}, alpha::Float64)
+    n     = Int32(length(norms))
+    inner = Int32(length(x) ÷ Int(n))
+    total = Int(inner) * Int(n)
+    @cuda threads=256 blocks=cld(total,256) _normalize_batch_kernel!(
+        reshape(out,:), reshape(x,:), norms, alpha, inner, n)
+end
+
+function _batch_normsq_dot_kernel!(
+    normsq::CuDeviceVector{Float64},
+    dotprod::CuDeviceVector{ComplexF64},
+    z::CuDeviceVector{ComplexF64},
+    d::CuDeviceVector{ComplexF64},
+    inner::Int32
+)
+    bid = Int32(blockIdx().x)
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sn = CUDA.@cuDynamicSharedMem(Float64,    Int(bsz))
+    sd = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz), Int(bsz) * sizeof(Float64))
+    sn_val = 0.0
+    sd_val = ComplexF64(0.0)
+    base = (bid - Int32(1)) * inner
+    j = tid
+    while j <= inner
+        @inbounds zj = z[base + j]
+        @inbounds dj = d[base + j]
+        sn_val += real(zj)^2 + imag(zj)^2
+        sd_val += zj * dj
+        j += bsz
+    end
+    @inbounds sn[tid] = sn_val
+    @inbounds sd[tid] = sd_val
+    sync_threads()
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            @inbounds sn[tid] += sn[tid + half]
+            @inbounds sd[tid] += sd[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+    if tid == Int32(1)
+        @inbounds normsq[bid]  = sn[Int32(1)]
+        @inbounds dotprod[bid] = sd[Int32(1)]
+    end
+    nothing
+end
+
+function _batch_normsq_dot!(normsq::CuVector{Float64}, dotprod::CuVector{ComplexF64},
+                            z::CuArray{ComplexF64,5}, d::CuArray{ComplexF64,5})
+    n     = length(normsq)
+    inner = Int32(length(z) ÷ n)
+    shmem = 256 * (sizeof(Float64) + sizeof(ComplexF64))
+    @cuda threads=256 blocks=n shmem=shmem _batch_normsq_dot_kernel!(
+        normsq, dotprod, reshape(z,:), reshape(d,:), inner)
+end
+
+function _backward_normalize_kernel!(
+    out::CuDeviceVector{ComplexF64},
+    z::CuDeviceVector{ComplexF64},
+    d::CuDeviceVector{ComplexF64},
+    normsq::CuDeviceVector{Float64},
+    dotprod::CuDeviceVector{ComplexF64},
+    inner::Int32,
+    n::Int32
+)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if tid <= inner * n
+        batch_i = (tid - Int32(1)) ÷ inner + Int32(1)
+        @inbounds nsq = normsq[batch_i]
+        @inbounds dt  = dotprod[batch_i]
+        inv_n = 1.0 / sqrt(nsq)
+        coeff = -real(dt) * inv_n^3
+        @inbounds out[tid] = inv_n * d[tid] + coeff * conj(z[tid])
+    end
+    nothing
+end
+
+function _backward_normalize!(out::CuArray{ComplexF64,5}, z::CuArray{ComplexF64,5},
+                              d::CuArray{ComplexF64,5},
+                              normsq::CuVector{Float64}, dotprod::CuVector{ComplexF64})
+    n     = Int32(length(normsq))
+    inner = Int32(length(z) ÷ Int(n))
+    total = Int(inner) * Int(n)
+    @cuda threads=256 blocks=cld(total,256) _backward_normalize_kernel!(
+        reshape(out,:), reshape(z,:), reshape(d,:), normsq, dotprod, inner, n)
+end
+
+export _batch_normsq!, _normalize_batch!, _batch_normsq_dot!, _backward_normalize!
+
+# ==============================================================
+#  NormLayer per-field fused kernels — pack/unpack 없이 직접 처리
+# ==============================================================
+
+function _normlayer_fwd_kernel!(
+    out  ::CuDeviceArray{ComplexF64,4},
+    x    ::CuDeviceArray{ComplexF64,4},
+    alpha::Float64,
+    total::Int32
+)
+    tid   = Int32(threadIdx().x)
+    bsz   = Int32(blockDim().x)
+    sdata = CUDA.@cuDynamicSharedMem(Float64, Int(bsz))
+    s = 0.0
+    j = tid
+    while j <= total
+        @inbounds v = x[j]
+        s += real(v)^2 + imag(v)^2
+        j += bsz
+    end
+    @inbounds sdata[tid] = s
+    sync_threads()
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            @inbounds sdata[tid] += sdata[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+    scale = alpha / sqrt(sdata[Int32(1)])
+    j = tid
+    while j <= total
+        @inbounds out[j] = scale * x[j]
+        j += bsz
+    end
+    return nothing
+end
+
+function _normlayer_fwd!(out::CuArray{ComplexF64,4}, x::CuArray{ComplexF64,4}, alpha::Float64)
+    total = Int32(length(x))
+    @cuda threads=256 blocks=1 shmem=(256*sizeof(Float64)) _normlayer_fwd_kernel!(
+        out, x, alpha, total)
+end
+
+function _normlayer_bwd_kernel!(
+    out  ::CuDeviceArray{ComplexF64,4},
+    z    ::CuDeviceArray{ComplexF64,4},
+    d    ::CuDeviceArray{ComplexF64,4},
+    total::Int32
+)
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sn  = CUDA.@cuDynamicSharedMem(Float64,    Int(bsz))
+    sd  = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz), Int(bsz) * sizeof(Float64))
+    sn_val = 0.0
+    sd_val = zero(ComplexF64)
+    j = tid
+    while j <= total
+        @inbounds zj = z[j]
+        @inbounds dj = d[j]
+        sn_val += real(zj)^2 + imag(zj)^2
+        sd_val += zj * dj
+        j += bsz
+    end
+    @inbounds sn[tid] = sn_val
+    @inbounds sd[tid] = sd_val
+    sync_threads()
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            @inbounds sn[tid] += sn[tid + half]
+            @inbounds sd[tid] += sd[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+    inv_n = 1.0 / sqrt(sn[Int32(1)])
+    coeff = -real(sd[Int32(1)]) * inv_n^3
+    j = tid
+    while j <= total
+        @inbounds out[j] = inv_n * d[j] + coeff * conj(z[j])
+        j += bsz
+    end
+    return nothing
+end
+
+function _normlayer_bwd!(out::CuArray{ComplexF64,4}, z::CuArray{ComplexF64,4}, d::CuArray{ComplexF64,4})
+    total = Int32(length(z))
+    shmem = 256 * (sizeof(Float64) + sizeof(ComplexF64))
+    @cuda threads=256 blocks=1 shmem=shmem _normlayer_bwd_kernel!(
+        out, z, d, total)
+end
+
+export _normlayer_fwd!, _normlayer_bwd!
+
+const _shared_matrix_pool = Dict{Tuple{Symbol,Int}, CuArray{ComplexF64,2}}()
+
+function get_shared_matrix!(key::Symbol, n::Int)
+    k = (key, n)
+    buf = get(_shared_matrix_pool, k, nothing)
+    if buf === nothing || size(buf) != (n, n)
+        buf = CUDA.zeros(ComplexF64, n, n)
+        _shared_matrix_pool[k] = buf
+    end
+    return buf
+end
+
+
+function _gram_matrix_kernel!(
+    G::CuDeviceMatrix{ComplexF64},
+    X::CuDeviceVector{ComplexF64},
+    Y::CuDeviceVector{ComplexF64},
+    inner::Int32,
+    n::Int32
+)
+    pair = Int32(blockIdx().x)
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
+
+    i = (pair - Int32(1)) % n + Int32(1)
+    j = (pair - Int32(1)) ÷ n + Int32(1)
+    base_i = (i - Int32(1)) * inner
+    base_j = (j - Int32(1)) * inner
+
+    s = ComplexF64(0.0)
+    p = tid
+    while p <= inner
+        @inbounds s += conj(X[base_i + p]) * Y[base_j + p]
+        p += bsz
+    end
+    @inbounds sh[tid] = s
+    sync_threads()
+
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            @inbounds sh[tid] += sh[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+
+    if tid == Int32(1)
+        @inbounds G[i, j] = sh[Int32(1)]
+    end
+    return nothing
+end
+
+function ritz_gram_matrices_gpu!(Agpu::CuArray{ComplexF64,2}, Bgpu::CuArray{ComplexF64,2},
+                                 x::AbstractVector, Dx::AbstractVector)
+    n = length(x)
+    f1 = x[1].f
+    NC, NG, bs, rs = size(f1, 1), size(f1, 2), size(f1, 3), size(f1, 4)
+    Xbuf = get_shared_buf!(:ritz_x_all,  NC, NG, bs, rs, n)
+    Dbuf = get_shared_buf!(:ritz_dx_all, NC, NG, bs, rs, n)
+    pack_fermions!(Xbuf, x)
+    pack_fermions!(Dbuf, Dx)
+    inner = Int32(NC * NG * bs * rs)
+    npairs = n * n
+    @cuda threads=256 blocks=npairs shmem=(256 * sizeof(ComplexF64)) _gram_matrix_kernel!(
+        Bgpu, reshape(Xbuf, :), reshape(Xbuf, :), inner, Int32(n))
+    @cuda threads=256 blocks=npairs shmem=(256 * sizeof(ComplexF64)) _gram_matrix_kernel!(
+        Agpu, reshape(Dbuf, :), reshape(Dbuf, :), inner, Int32(n))
+    return Agpu, Bgpu
+end
+
+function ritz_gram_matrices_gpu!(A::Matrix{ComplexF64}, B::Matrix{ComplexF64},
+                                 x::AbstractVector, Dx::AbstractVector)
+    n = length(x)
+    Agpu = get_shared_matrix!(:ritz_A, n)
+    Bgpu = get_shared_matrix!(:ritz_B, n)
+    ritz_gram_matrices_gpu!(Agpu, Bgpu, x, Dx)
+    copyto!(A, Agpu)
+    copyto!(B, Bgpu)
+    return A, B
+end
+
+export get_shared_matrix!, ritz_gram_matrices_gpu!
+
+# ============================================================
+#  BlockScalar gradient: sum over spin/color (dims 1,2) — 0 allocation
+#  PT layer: in-place conjugation kernel — 0 allocation
+# ============================================================
+
+function _sum_spin_color_kernel!(
+    out::CuDeviceVector{ComplexF64},
+    x::CuDeviceVector{ComplexF64},
+    nc_ng::Int32,
+    n_sites::Int32
+)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if tid <= n_sites
+        s = ComplexF64(0.0)
+        base = nc_ng * (tid - Int32(1))
+        for j in Int32(1):nc_ng
+            @inbounds s += x[base + j]
+        end
+        @inbounds out[tid] = s
+    end
+    nothing
+end
+
+function _sum_spin_color!(out::CuArray{ComplexF64}, x::CuArray{ComplexF64,4})
+    nc_ng   = Int32(size(x, 1) * size(x, 2))
+    n_sites = Int32(size(x, 3) * size(x, 4))
+    @cuda threads=256 blocks=cld(Int(n_sites), 256) _sum_spin_color_kernel!(
+        reshape(out, :), reshape(x, :), nc_ng, n_sites)
+end
+
+function _inplace_conj_kernel!(x::CuDeviceVector{ComplexF64}, n::Int32)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if tid <= n
+        @inbounds x[tid] = conj(x[tid])
+    end
+    nothing
+end
+
+function inplace_conj!(x::CuArray{ComplexF64})
+    n = Int32(length(x))
+    @cuda threads=256 blocks=cld(Int(n), 256) _inplace_conj_kernel!(reshape(x, :), n)
+end
+
+export _sum_spin_color!, inplace_conj!
 
 # ============================================================
 #  Fused Wilson Dirac kernel — replaces external mul!(y, D, x)

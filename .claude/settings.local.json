@@ -8,7 +8,13 @@
       "Bash(xargs grep *)",
       "Bash(grep -n \"^module\\\\|^end$\" ~/.julia/packages/Gaugefields/GVeWR/src/4D/kernelfunctions/gaugefields_4D_cudakernels.jl)",
       "PowerShell(icacls \"$env:USERPROFILE\\\\.julia\\\\packages\\\\Gaugefields\\\\GVeWR\\\\src\\\\4D\\\\kernelfunctions\\\\gaugefields_4D_cudakernels.jl\" /grant \"$env:USERNAME:F\")",
-      "PowerShell(icacls \"$env:USERPROFILE\\\\.julia\\\\packages\\\\Gaugefields\\\\GVeWR\\\\src\\\\4D\\\\kernelfunctions\\\\gaugefields_4D_cudakernels.jl\" /grant \"${env:USERNAME}:\\(F\\)\")"
+      "PowerShell(icacls \"$env:USERPROFILE\\\\.julia\\\\packages\\\\Gaugefields\\\\GVeWR\\\\src\\\\4D\\\\kernelfunctions\\\\gaugefields_4D_cudakernels.jl\" /grant \"${env:USERNAME}:\\(F\\)\")",
+      "Bash(git merge *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(python3 -c ' *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\_s2220186\\Desktop\\multilowmode"

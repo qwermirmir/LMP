@@ -16,8 +16,8 @@ import ..Layer_types: CPTC_Layer, PTC_Layer, Layer,ActivationFunction,Identity ,
 import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,ModRelu,RayleighQuotient_Layer,PtcRayleighQuotient_Layer
 import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer,BlockScalar_Layer
 import ..elementry_base: blockize, unblockize
-import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,Matmul_batch!,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!
-import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!,get_shared_buf!,batched_hopping_steps_gpu!
+import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,Matmul_batch!,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,blockscalar_gradient_gpu!
+import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!,get_shared_buf!,get_shared_float_buf!,batched_hopping_steps_gpu!,_batch_normsq_dot!,_backward_normalize!,_sum_spin_color!,inplace_conj!,_normlayer_bwd!
 
 export gradient, DeltaRule,DeltaRule!
 export Identity, ReLU, Sigmoid, Tanh
@@ -2502,7 +2502,7 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
     l = length(z)
     D = layer.D
     for i in 1:length(delta)
-        zero_wf!(delta[i])  
+        zero_wf!(delta[i])
     end
 
     # forward에서 캐싱된 eigen 결과 재사용 (Gram matrix + inner_product 6회 + eigen 재계산 제거)
@@ -3045,7 +3045,7 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
         end
 
         # batch conj
-        _ci_buf .= conj.(_ci_buf)
+        inplace_conj!(_ci_buf)
 
         # unpack → result
         unpack_fermions!(result, _ci_buf)
@@ -3250,7 +3250,7 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
         end
 
         # batch conj
-        _ci_buf .= conj.(_ci_buf)
+        inplace_conj!(_ci_buf)
 
         # unpack → delta
         unpack_fermions!(delta, _ci_buf)
@@ -3329,53 +3329,56 @@ function gradient(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,
 end
 
 
-function DeltaRule(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) where T<:WF3x1
+# function DeltaRule(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) where T<:WF3x1
 
 
 
-    result = Vector{WF3x1}(undef, length(z))
-    α = layer.alpha
+#     result = Vector{WF3x1}(undef, length(z))
+#     α = layer.alpha
 
 
-    @inbounds for i in 1:length(z)
-        cz=conj(z[i])
-        norm = sqrt(norm2(z[i]))
-        eta1 = inner_product(cz, d[i])/2                  # z† d
-        eta2 = inner_product(z[i], conj(d[i]))/2            # zᵗ d*
+#     @inbounds for i in 1:length(z)
+#         cz=conj(z[i])
+#         norm = sqrt(norm2(z[i]))
+#         eta1 = inner_product(cz, d[i])/2                  # z† d
+#         eta2 = inner_product(z[i], conj(d[i]))/2            # zᵗ d*
 
-        result[i] = d[i] / norm
-        result[i] -= (eta1 * cz) / norm^3
-        result[i] -= (eta2 * cz) / norm^3
-    end
+#         result[i] = d[i] / norm
+#         result[i] -= (eta1 * cz) / norm^3
+#         result[i] -= (eta2 * cz) / norm^3
+#     end
 
-    return result
-end
+#     return result
+# end
 
 function DeltaRule!(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
 
-    α = layer.alpha
-
-    # conj 버퍼 초기화 (1회만, deepcopy 방지)
+    n = length(z)
     if isempty(layer._conj_buf) || typeof(layer._conj_buf[1]) != typeof(z[1])
         layer._conj_buf = [_alloc_result_wf(z[1])]
     end
     cj_buf = layer._conj_buf[1]
 
-    @inbounds for i in 1:length(z)
-        nrm = sqrt(norm2(z[i]))
-        inv_n = 1.0 / nrm
-        inv_n3 = inv_n^3
+    if n > 0 && z[1].f isa CuArray
+        for i in 1:n
+            _normlayer_bwd!(
+                (delta[i]::WF3x1GPU).f,
+                (z[i]::WF3x1GPU).f,
+                (d[i]::WF3x1GPU).f)
+        end
+    else
+        @inbounds for i in 1:n
+            nrm   = sqrt(norm2(z[i]))
+            inv_n = 1.0 / nrm
 
-        conj!(cj_buf, z[i])                       # cj_buf = conj(z[i])  (재사용)
-        eta1 = inner_product(cj_buf, d[i]) / 2
-        # eta2 = conj(eta1) なので eta1+eta2 = 2*real(eta1)
-        coeff = -2 * real(eta1) * inv_n3
+            conj!(cj_buf, z[i])
+            eta1  = inner_product(cj_buf, d[i]) / 2
+            coeff = -2 * real(eta1) * inv_n^3
 
-        # delta[i] = d[i]/norm + coeff * conj(z[i])
-        axpby!(inv_n, d[i], 0, delta[i])           # delta[i] = d[i] / norm
-        axpby!(coeff, cj_buf, 1, delta[i])          # delta[i] += coeff * conj(z[i])
+            axpby!(inv_n, d[i], false, delta[i])
+            axpby!(coeff, cj_buf, true,  delta[i])
+        end
     end
-
 
 end
 
@@ -3533,11 +3536,22 @@ end
 
 # --- BlockScalar_Layer ---
 function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, γ::Vector{Spin_matrix}) where T<:WF3x1
-    nblocks, n = size(layer.W)
-    grad_W = zeros(ComplexF64, nblocks, n)
-
     if z[1] isa WF3x1GPU
+        return [blockscalar_gradient_gpu!(layer, z, d)]
+    end
+
+    nblocks, n = size(layer.W)
+    if size(layer._grad_W) != (nblocks, n)
+        layer._grad_W = zeros(ComplexF64, nblocks, n)
+    else
+        fill!(layer._grad_W, zero(ComplexF64))
+    end
+    grad_W = layer._grad_W
+
+    if false
         # GPU: preallocated buffers로 사이트별 내적 → 블록별 합산 (alloc 0)
+        blockscalar_gradient_gpu!(grad_W, layer, z, d)
+        return grad_W
         bmap = layer._gpu_block_map
         nblocks_total = length(bmap)
         fref = d[1].f  # CuArray{ComplexF64,4} reference
@@ -3553,7 +3567,7 @@ function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{WF3x1}, d::Vec
 
         for k in 1:n
             prod_buf .= d[k].f .* z[k].f
-            sum!(site_buf, prod_buf)
+            _sum_spin_color!(site_buf, prod_buf)
             copyto!(layer._grad_site_cpu, vec(site_buf))
 
             @inbounds for i in 1:nblocks_total
@@ -3619,12 +3633,9 @@ function DeltaRule(layer::BlockScalar_Layer, ::Identity,
     result = layer._result
 
     if d[1] isa WF3x1GPU
+        W_gpu, bmap_gpu, _ = _sync_blockscalar_W_gpu!(layer; upload=false)
         for k in 1:n
-            w_gpu = _update_block_weight_gpu!(layer, view(layer.W, :, k))
-            result[k].f .= w_gpu .* d[k].f
-            if layer.residual
-                axpby!(1, d[k], 1, result[k])
-            end
+            blockscalar_apply_gpu!(result[k].f, d[k].f, W_gpu, bmap_gpu, k, layer.residual)
         end
     else
         # CPU: block_map으로 직접 스칼라 곱 (blockize/unblockize 제거)
@@ -3661,12 +3672,9 @@ function DeltaRule!(layer::BlockScalar_Layer, ::Identity,
     r = layer.r
 
     if d[1] isa WF3x1GPU
+        W_gpu, bmap_gpu, _ = _sync_blockscalar_W_gpu!(layer; upload=false)
         for k in 1:n
-            w_gpu = _update_block_weight_gpu!(layer, view(layer.W, :, k))
-            delta[k].f .= w_gpu .* d[k].f
-            if layer.residual
-                axpby!(1, d[k], 1, delta[k])
-            end
+            blockscalar_apply_gpu!(delta[k].f, d[k].f, W_gpu, bmap_gpu, k, layer.residual)
         end
     else
         # CPU: block_map으로 직접 스칼라 곱 (blockize/unblockize 제거)

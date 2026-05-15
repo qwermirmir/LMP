@@ -109,5 +109,6 @@ export mr_smooth!, sap_smooth!
 export block_orthonormalize!,deflated_initial_guess,_to_cpu,_to_gpu,_to_cpu_gauge
 export gamma5!, chiral_project!, gamma5_sign
 export CloverDiracOperator, compute_Fmunu, refresh_clover!
+export train_timed
 end  # module LMP
 
