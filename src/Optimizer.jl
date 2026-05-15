@@ -10,7 +10,7 @@ import ..Layer_types: PrallelTransportAttention_Layer,siteweight_Layer,Dirac_Lay
 import ..Layer_types: fermionfield_Layer
 import ..Layer_types: BlockScalar_Layer
 
-import ..gpu: gpu_adam_update!, sync_W_from_gpu!, sync_W_to_gpu!
+import ..gpu: gpu_adam_update!, blockscalar_adam_update!, sync_W_from_gpu!, sync_W_to_gpu!, Spin_matrix_GPU, zero_wf!
 
 const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
 const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
@@ -21,7 +21,7 @@ import LatticeDiracOperators: Dirac_Operator
 
 abstract type Opt end
 
-export Adam, update!, sync_layers!
+export Adam, update!, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!
 export Opt
 
 
@@ -573,7 +573,11 @@ function wf_adam_step!(param::WF3x1, opt::Adam, grad::WF3x1)
 
     # m, v 상태 가져오기 (없으면 similar(param)으로 초기화)
     state = get!(opt.wf_state, key) do
-        AdamState{WF3x1}(similar(param), similar(param))
+        m0 = similar(param)
+        v0 = similar(param)
+        zero_wf!(m0)
+        zero_wf!(v0)
+        AdamState{WF3x1}(m0, v0)
     end
     m, v = state.m, state.v
 
@@ -666,6 +670,8 @@ function wf_adam_step!(param::WF3x1GPU, opt::Adam, grad::WF3x1GPU)
         # similar(param)이 0으로 채운다 해도, 확실히 0으로 만드는 게 안전함
         m0 = similar(param)
         v0 = similar(param)
+        zero_wf!(m0)
+        zero_wf!(v0)
         AdamState{WF3x1}(m0, v0)
     end
 
@@ -720,18 +726,193 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad::Matrix{ComplexF64})
     end
 end
 
+function update!(layer::BlockScalar_Layer, opt::Adam, grad)
+    if grad isa AbstractVector && !isempty(grad) && grad[1] isa CuArray
+        opt.t += 1
+        cache = layer._gpu_w_buf
+        if !(cache isa Dict) || !haskey(cache, :W)
+            error("BlockScalar_Layer GPU weights are not initialized. Run the GPU forward pass before update!.")
+        end
+        W_gpu = cache[:W]
+        grad_gpu = grad[1]
+        if !haskey(cache, :adam_m) || cache[:adam_m] === nothing || size(cache[:adam_m]) != size(W_gpu)
+            cache[:adam_m] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+            cache[:adam_v] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+        end
+        blockscalar_adam_update!(W_gpu, cache[:adam_m], cache[:adam_v], grad_gpu,
+                        opt.α, opt.β1, opt.β2, opt.ε, opt.t)
+
+
+        return layer
+    end
+    return update!(layer, opt, grad::Matrix{ComplexF64})
+end
+
 
 """
     sync_layers!(layers)
 
 저장/substitute_Layer! 전에 호출. _W_gpu → W (CPU) 동기화.
 """
+function sync_layers_to_gpu!(layers)
+    for layer in layers
+        if layer isa PTLayer && !isempty(layer.W) && layer.W[1] isa Spin_matrix_GPU
+            NW = length(layer.W)
+            NG = 4
+            if layer._W_gpu === nothing || size(layer._W_gpu, 3) != NW
+                layer._W_gpu     = CUDA.zeros(ComplexF64, NG, NG, NW)
+                layer._W_cpu_buf = Array{ComplexF64}(undef, NG, NG, NW)
+            end
+            if layer._Wadj_gpu === nothing || size(layer._Wadj_gpu, 3) != NW
+                layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+            end
+            sync_W_to_gpu!(layer._W_gpu, layer.W)
+        end
+    end
+    return layers
+end
+
+function _warm_gpu_adam!(layer::Union{DenseLinearLayer,PTLayer}, opt::Adam)
+    W_gpu = layer._W_gpu
+    W_gpu === nothing && return nothing
+    NW = size(W_gpu, 3)
+    NG = size(W_gpu, 1)
+    if layer._adam_m_gpu === nothing || size(layer._adam_m_gpu, 3) != NW
+        layer._adam_m_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+        layer._adam_v_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+    end
+    if layer._grad_gpu === nothing || size(layer._grad_gpu, 3) != NW
+        layer._grad_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+    else
+        fill!(layer._grad_gpu, 0)
+    end
+    gpu_adam_update!(W_gpu, layer._adam_m_gpu, layer._adam_v_gpu, layer._grad_gpu,
+                     opt.α, opt.β1, opt.β2, opt.ε, max(opt.t, 1))
+    fill!(layer._adam_m_gpu, 0)
+    fill!(layer._adam_v_gpu, 0)
+    fill!(layer._grad_gpu, 0)
+    return nothing
+end
+
+function _warm_blockscalar_adam!(layer::BlockScalar_Layer, opt::Adam)
+    cache = layer._gpu_w_buf
+    (!(cache isa Dict) || !haskey(cache, :W)) && return nothing
+    W_gpu = cache[:W]
+    if !haskey(cache, :adam_m) || cache[:adam_m] === nothing || size(cache[:adam_m]) != size(W_gpu)
+        cache[:adam_m] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+        cache[:adam_v] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+    end
+    if !haskey(cache, :grad) || cache[:grad] === nothing || size(cache[:grad]) != size(W_gpu)
+        cache[:grad] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+    else
+        fill!(cache[:grad], 0)
+    end
+    blockscalar_adam_update!(W_gpu, cache[:adam_m], cache[:adam_v], cache[:grad],
+                             opt.α, opt.β1, opt.β2, opt.ε, max(opt.t, 1))
+    fill!(cache[:adam_m], 0)
+    fill!(cache[:adam_v], 0)
+    fill!(cache[:grad], 0)
+    return nothing
+end
+
+function _zero_wf_grad_like(x::WF3x1)
+    g = similar(x)
+    zero_wf!(g)
+    return g
+end
+
+function _reset_wf_adam_state!(opt::Adam, xs)
+    for x in xs
+        key = objectid(x)
+        if haskey(opt.wf_state, key)
+            st = opt.wf_state[key]
+            zero_wf!(st.m)
+            zero_wf!(st.v)
+        end
+    end
+    return nothing
+end
+
+function _warm_fermionfield_update!(layer::fermionfield_Layer, opt::Adam)
+    isempty(layer.x) && return nothing
+    grad0 = [_zero_wf_grad_like(x) for x in layer.x]
+    update!(layer, opt, grad0)
+    _reset_wf_adam_state!(opt, layer.x)
+    return nothing
+end
+
+function _warm_gpu_update!(layer::Union{DenseLinearLayer,PTLayer}, opt::Adam)
+    W_gpu = layer._W_gpu
+    W_gpu === nothing && return nothing
+    NW = size(W_gpu, 3)
+    NG = size(W_gpu, 1)
+    if layer._grad_gpu === nothing || size(layer._grad_gpu, 3) != NW
+        layer._grad_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+    else
+        fill!(layer._grad_gpu, 0)
+    end
+    update!(layer, opt, [layer._grad_gpu])
+    layer._adam_m_gpu !== nothing && fill!(layer._adam_m_gpu, 0)
+    layer._adam_v_gpu !== nothing && fill!(layer._adam_v_gpu, 0)
+    fill!(layer._grad_gpu, 0)
+    return nothing
+end
+
+function _warm_blockscalar_update!(layer::BlockScalar_Layer, opt::Adam)
+    cache = layer._gpu_w_buf
+    (!(cache isa Dict) || !haskey(cache, :W)) && return nothing
+    W_gpu = cache[:W]
+    if !haskey(cache, :grad) || cache[:grad] === nothing || size(cache[:grad]) != size(W_gpu)
+        cache[:grad] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+    else
+        fill!(cache[:grad], 0)
+    end
+    update!(layer, opt, [cache[:grad]])
+    haskey(cache, :adam_m) && cache[:adam_m] !== nothing && fill!(cache[:adam_m], 0)
+    haskey(cache, :adam_v) && cache[:adam_v] !== nothing && fill!(cache[:adam_v], 0)
+    fill!(cache[:grad], 0)
+    return nothing
+end
+
+function prealloc_optimizer_state!(layers, opt::Adam)
+    t0 = opt.t
+    for layer in layers
+        if layer isa fermionfield_Layer
+            _warm_fermionfield_update!(layer, opt)
+        elseif layer isa DenseLinearLayer && layer._W_gpu !== nothing
+            _warm_gpu_adam!(layer, opt)
+            _warm_gpu_update!(layer, opt)
+        elseif layer isa PTLayer && layer._W_gpu !== nothing
+            _warm_gpu_adam!(layer, opt)
+            _warm_gpu_update!(layer, opt)
+        elseif layer isa BlockScalar_Layer && layer._gpu_w_buf isa Dict && haskey(layer._gpu_w_buf, :W)
+            _warm_blockscalar_adam!(layer, opt)
+            _warm_blockscalar_update!(layer, opt)
+        end
+    end
+    opt.t = t0
+    CUDA.synchronize()
+    return layers
+end
+
 function sync_layers!(layers)
     for layer in layers
         if layer isa PTLayer && layer._W_gpu !== nothing
-            sync_W_from_gpu!(layer.W, layer._W_gpu)
+            if layer._W_cpu_buf !== nothing
+                sync_W_from_gpu!(layer.W, layer._W_gpu, layer._W_cpu_buf)
+            else
+                layer._W_cpu_buf = Array{ComplexF64}(undef, size(layer._W_gpu)...)
+                sync_W_from_gpu!(layer.W, layer._W_gpu, layer._W_cpu_buf)
+            end
         elseif layer isa DenseLinearLayer && layer._W_gpu !== nothing
-            sync_W_from_gpu!(layer.W, layer._W_gpu)
+            if layer._W_cpu_buf !== nothing
+                sync_W_from_gpu!(layer.W, layer._W_gpu, layer._W_cpu_buf)
+            else
+                layer._W_cpu_buf = Array{ComplexF64}(undef, size(layer._W_gpu)...)
+                sync_W_from_gpu!(layer.W, layer._W_gpu, layer._W_cpu_buf)
+            end
+        elseif layer isa BlockScalar_Layer && layer._gpu_w_buf isa Dict && haskey(layer._gpu_w_buf, :W)
+            copyto!(layer.W, layer._gpu_w_buf[:W])
         end
     end
 end

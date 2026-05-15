@@ -287,6 +287,7 @@ mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
     _grad_gpu::Any        # CuArray{ComplexF64,3} (NG,NG,NW)
     _adam_m_gpu::Any
     _adam_v_gpu::Any
+    _W_cpu_buf::Any          # Array{ComplexF64,3} (NG,NG,NW) — sync_W_from_gpu! staging
 
     function DenseLinearLayer(In::Int, Out::Int, cuda::Bool, activation::ActivationFunction=Identity() )
         if cuda == true
@@ -301,7 +302,7 @@ mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
             end
         end
         return new{eltype(W)}(W, In, Out, cuda, activation, WF3x1[], WF3x1[], false, WF3x1[], false,
-                              nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+                              nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
     end
 end
 
@@ -337,6 +338,7 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
     _hop_nsteps_gpu::Any         # CuArray{Int32,1} (npaths,) step counts
     _hop_max_steps::Int          # max steps across all paths
     _inv_hop_dirs_gpu::Any       # CuArray{Int8,2} (max_steps, npaths) inverse direction table
+    _W_cpu_buf::Any              # Array{ComplexF64,3} (4,4,NW) — sync_W_from_gpu! staging
 
     function PTLayer(paths::Vector{Paths}, U::Vector{G}, Out::Int,
                      activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields}
@@ -351,7 +353,7 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
                        Paths[], WF3x1[], WF3x1[], false,
                        Spin_matrix_GPU[], Any[], Vector{WF3x1}[],
                        nothing, nothing, nothing, nothing, nothing, nothing,
-                       nothing, nothing, 0, nothing)
+                       nothing, nothing, 0, nothing, nothing)
         else
             W = Vector{Spin_matrix}(undef, length(paths)*Out)
             for i in eachindex(W)
@@ -362,70 +364,13 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
                        Paths[], WF3x1[], WF3x1[], false,
                        Spin_matrix[], Any[], Vector{WF3x1}[],
                        nothing, nothing, nothing, nothing, nothing, nothing,
-                       nothing, nothing, 0, nothing)
+                       nothing, nothing, 0, nothing, nothing)
         end
     end
 end
 
 
-# mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
-#     paths::Vector{Paths}
-#     U::Vector{G}
-#     Out::Int
-#     W::Vector{T}
-#     cache::Vector{WF3x1}
-#     activation::ActivationFunction
 
-#     function PTLayer_new(paths::Vector{Paths}, U::Vector{G}, Out::Int,
-#                      activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields}
-
-#         if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator  # ★ U는 Vector니까 eltype(U)로 체크
-#             W = Vector{Spin_matrix_GPU}(undef, length(paths)*Out)
-#             for i in eachindex(W)
-#                 W[i] = Random_SpinM_GPU("complex")
-#             end
-#             x = Initialize_pseudofermion_fields(U[1],"Wilson",nowing=true)
-#             cache = Vector{WF3x1}(undef, Out)
-#             for i in 1:Out
-#                 cache[i] = deepcopy(x)
-#             end
-
-#             return new{G, Spin_matrix_GPU}(paths, U, Out, W, cache, activation)
-#         else
-#             W = Vector{Spin_matrix}(undef, length(paths)*Out)
-#             for i in eachindex(W)
-#                 W[i] = Random_SpinM("complex")
-#             end
-#             x = Initialize_pseudofermion_fields(U[1],"Wilson",nowing=true)
-#             cache = Vector{WF3x1}(undef, Out)
-#             for i in 1:Out
-#                 cache[i] = deepcopy(x)
-#             end
-#             return new{G, Spin_matrix}(paths, U, Out, W, cache, activation)
-#         end
-#     end
-# end
-
-
-
-# mutable struct RptLayer{G<:AbstractGaugefields} <: Layer
-#     paths::Vector{Paths}
-#     U::Vector{G}
-#     W::Vector{WF3x1}
-#     activation ::ActivationFunction
-#     function RptLayer(paths::Vector{Paths}, U::Vector{G},
-#                      activation::ActivationFunction=Identity()
-#     )
-#         W = Vector{WF3x1}(undef, length(paths))
-#         x=Initialize_pseudofermion_fields(U[1],"Wilson",nowing=true)
-        
-#         for i in 1:length(W)
-#             gauss_distribution_fermion!(x)
-#             W[i] = x
-#         end
-#         new(paths, U, W, activation)
-#     end
-# end
 
 mutable struct fermionfield_Layer <: Layer
     x::Vector{WF3x1}
@@ -462,18 +407,21 @@ mutable struct Ritz_Layer <: Layer
     # --- 캐시 버퍼 (Dirac 재계산 방지) ---
     _Dz::Vector{Any}        # forward에서 D*z 캐시 → DeltaRule!에서 재사용
     _DdagDz::Vector{Any}    # D†Dz 캐시 (DeltaRule!에서 Dirac ops 절반)
-    _VD::Vector{Any}         # DeltaRule! VD 버퍼
-    _work::Vector{Any}       # DeltaRule! workspace [y, f, ψ, r]
+    _VD::Vector{Any}         # DeltaRule! VD 버퍼 (CPU path only)
+    _work::Vector{Any}       # DeltaRule! workspace [ψ, r] (CPU path only)
     _ritz_init::Bool
-    # Gram matrix + eigen 캐시 (forward→DeltaRule! 재사용)
+    # Gram matrix + eigen 캐시 — CPU path
     _A::Matrix{ComplexF64}
     _B::Matrix{ComplexF64}
+    _C::Matrix{ComplexF64}
+    _Bfac::Matrix{ComplexF64}
     _evals::Vector{Float64}
     _evecs::Matrix{ComplexF64}
     _m::Vector{ComplexF64}
     function Ritz_Layer(D::Any, activation::ActivationFunction= Identity(),Out =1)
         new(D, activation, Out,
             Any[], Any[], Any[], Any[], false,
+            Matrix{ComplexF64}(undef,0,0), Matrix{ComplexF64}(undef,0,0),
             Matrix{ComplexF64}(undef,0,0), Matrix{ComplexF64}(undef,0,0),
             Float64[], Matrix{ComplexF64}(undef,0,0), ComplexF64[])
     end
@@ -694,6 +642,7 @@ mutable struct BlockScalar_Layer <: Layer
     _grad_prod_buf::Any             # CuArray{ComplexF64,4} for gradient elementwise product
     _grad_site_buf::Any             # CuArray for site-level sum result
     _grad_site_cpu::Vector{ComplexF64}  # CPU buffer for site inner products
+    _grad_W::Matrix{ComplexF64}         # pre-allocated gradient accumulator (nblocks, n)
 
     function BlockScalar_Layer(x::WF3x1, n::Int, r::Int,
                                residual::Bool=false,
@@ -703,7 +652,7 @@ mutable struct BlockScalar_Layer <: Layer
         new(W, r, residual, activation,
             WF3x1[], Vector{WF3x1}[], Int[], Int[], nothing,
             Matrix{ComplexF64}(undef, 0, 0), false,
-            nothing, nothing, ComplexF64[])
+            nothing, nothing, ComplexF64[], Matrix{ComplexF64}(undef, 0, 0))
     end
 end
 
