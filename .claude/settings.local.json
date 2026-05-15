@@ -14,7 +14,8 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(grep -E \"^[[:print:]]+$\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\_s2220186\\Desktop\\multilowmode"
