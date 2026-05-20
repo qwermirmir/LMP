@@ -2,6 +2,7 @@ module Optimizer
 
 using LatticeDiracOperators
 using CUDA
+using JLD2
 
 import ..elementry_base: Hopping_operator, Spin_matrix, inner_product, Random_SpinM
 import ..Layer_types: CPTC_Layer, PTC_Layer, Layer, ActivationFunction, Identity,Attention_Layer,NormLayer,test_Layer,FullPTCAttention_Layer,PtcRayleighQuotient_Layer
@@ -22,6 +23,7 @@ import LatticeDiracOperators: Dirac_Operator
 abstract type Opt end
 
 export Adam, update!, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!
+export save_checkpoint, load_checkpoint!
 export Opt
 
 
@@ -915,6 +917,92 @@ function sync_layers!(layers)
             copyto!(layer.W, layer._gpu_w_buf[:W])
         end
     end
+end
+
+"""
+    save_checkpoint(path, layers, opt)
+
+Saves W + Adam GPU state + opt.t without calling substitute_Layer!.
+Layers remain on GPU throughout — no memory pool growth.
+"""
+function save_checkpoint(path::AbstractString, layers, opt::Adam)
+    sync_layers!(layers)  # _W_gpu → _W_cpu_buf + layer.W (for BlockScalar)
+    data = Dict{String,Any}("opt_t" => opt.t)
+
+    for (i, layer) in enumerate(layers)
+        if (layer isa PTLayer || layer isa DenseLinearLayer) && layer._W_gpu !== nothing
+            # _W_cpu_buf is the (NG,NG,NW) staging buffer populated by sync_layers!
+            data["layer_$(i)_W"] = layer._W_cpu_buf !== nothing ?
+                                    copy(layer._W_cpu_buf) : Array(layer._W_gpu)
+            if layer._adam_m_gpu !== nothing
+                data["layer_$(i)_adam_m"] = Array(layer._adam_m_gpu)
+                data["layer_$(i)_adam_v"] = Array(layer._adam_v_gpu)
+            end
+        elseif layer isa BlockScalar_Layer
+            # layer.W already synced from GPU by sync_layers!
+            data["layer_$(i)_W"] = copy(layer.W)
+            cache = layer._gpu_w_buf
+            if cache isa Dict && haskey(cache, :adam_m) && cache[:adam_m] !== nothing
+                data["layer_$(i)_adam_m"] = Array(cache[:adam_m])
+                data["layer_$(i)_adam_v"] = Array(cache[:adam_v])
+            end
+        end
+    end
+
+    JLD2.save(path, data)
+    return path
+end
+
+"""
+    load_checkpoint!(path, layers, opt)
+
+Restores W + Adam state into live GPU layers from a W-only checkpoint.
+No substitute_Layer! needed — layers stay on GPU.
+Falls back silently if a layer's key is absent (partial checkpoint).
+"""
+function load_checkpoint!(path::AbstractString, layers, opt::Adam)
+    data = JLD2.load(path)
+    opt.t = Int(get(data, "opt_t", 0))
+
+    for (i, layer) in enumerate(layers)
+        if (layer isa PTLayer || layer isa DenseLinearLayer) && layer._W_gpu !== nothing
+            key_W = "layer_$(i)_W"
+            if haskey(data, key_W)
+                w_arr = data[key_W]  # Array{ComplexF64,3} (NG,NG,NW)
+                copyto!(layer._W_gpu, w_arr)
+                if layer._W_cpu_buf === nothing
+                    layer._W_cpu_buf = copy(w_arr)
+                else
+                    copyto!(layer._W_cpu_buf, w_arr)
+                end
+            end
+            key_m = "layer_$(i)_adam_m"
+            if haskey(data, key_m)
+                layer._adam_m_gpu = CuArray{ComplexF64,3}(data[key_m])
+                layer._adam_v_gpu = CuArray{ComplexF64,3}(data["layer_$(i)_adam_v"])
+            end
+        elseif layer isa BlockScalar_Layer
+            key_W = "layer_$(i)_W"
+            if haskey(data, key_W)
+                copyto!(layer.W, data[key_W])
+                cache = layer._gpu_w_buf
+                if cache isa Dict && haskey(cache, :W) && cache[:W] !== nothing
+                    copyto!(cache[:W], layer.W)
+                end
+            end
+            key_m = "layer_$(i)_adam_m"
+            if haskey(data, key_m)
+                cache = layer._gpu_w_buf
+                if cache isa Dict
+                    cache[:adam_m] = CuArray{ComplexF64}(data[key_m])
+                    cache[:adam_v] = CuArray{ComplexF64}(data["layer_$(i)_adam_v"])
+                end
+            end
+        end
+    end
+
+    CUDA.synchronize()
+    return layers
 end
 
 end # module Optimizer
