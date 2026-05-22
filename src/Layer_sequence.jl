@@ -9,7 +9,7 @@ import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttenti
 import ..Layer_types: Orthogonal_Layer,LossSumLayer,Ritz_Layer
 import ..elementry_base: Hopping_operator, Spin_matrix, inner_product,g2vector_generator!,addmul!
 import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minmax,spincolortrace
-import ..Optimizer: Opt, update!, Adam, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!
+import ..Optimizer: Opt, update!, Adam, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!, save_checkpoint, load_checkpoint!
 import ..activation:  gradient, DeltaRule,DeltaRule!
 import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,Matmul_batch!
 import ..gpu: sync_W_to_gpu!,pack_fermions!,unpack_fermions!,batched_forward!,fused_hopping_gpu!,fused_wilson_mul_gpu!,batched_hopping_steps_gpu!,get_shared_buf!,get_shared_float_buf!,get_shared_matrix!,_batch_normsq!,_normalize_batch!,_batch_normsq_dot!,_backward_normalize!,ritz_gram_matrices_gpu!,_normlayer_fwd!
@@ -2812,7 +2812,10 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                epochs=100, batch=1, logfile=nothing,
                test_paths::Union{Vector{String},Nothing}=nothing, test_interval=10,
                gauge_cache=nothing, test_gauge_cache=nothing,
-               gauge_format::Symbol=:jld2) where {T<:Layer}
+               gauge_format::Symbol=:jld2,
+               epoch_offset::Int=0,
+               checkpoint_every::Int=0,
+               checkpoint_fn=nothing) where {T<:Layer}
 
     depth = length(layers)
     N = gauge_format === :raw ? length(gauge_paths) : (gauge_cache === nothing ? length(gauge_paths) : length(gauge_cache))
@@ -2985,12 +2988,13 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         end
         push!(real(loss_history), real(current_loss))
 
-        println("Epoch: $(epoch), Loss: $current_loss")
-        println(log_io, "Epoch: $(epoch), Loss: $current_loss")
+        abs_epoch = epoch_offset + epoch
+        println("Epoch: $(abs_epoch), Loss: $current_loss")
+        println(log_io, "Epoch: $(abs_epoch), Loss: $current_loss")
         flush(log_io)
         _train_dbg && _train_debug_step("epoch $epoch loss_log", _dbg_gc, _dbg_t)
 
-        if test_paths !== nothing && mod(epoch, test_interval) == 0
+        if test_paths !== nothing && mod(abs_epoch, test_interval) == 0
             if _train_dbg
                 _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
             end
@@ -3037,13 +3041,21 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             end
             test_loss /= n_test
             push!(test_loss_history, real(test_loss))
-            println("  [Test] Epoch: $(epoch), Test Loss: $test_loss")
-            println(log_io, "  [Test] Epoch: $(epoch), Test Loss: $test_loss")
+            println("  [Test] Epoch: $(abs_epoch), Test Loss: $test_loss")
+            println(log_io, "  [Test] Epoch: $(abs_epoch), Test Loss: $test_loss")
             flush(log_io)
 
             test_line !== nothing && test_line.set_xdata(test_interval:test_interval:(test_interval*length(test_loss_history)))
             test_line !== nothing && test_line.set_ydata(test_loss_history)
             _train_dbg && _train_debug_step("epoch $epoch test_log_plotdata", _dbg_gc, _dbg_t)
+        end
+
+        if checkpoint_every > 0 && checkpoint_fn !== nothing && abs_epoch % checkpoint_every == 0
+            ckpt = checkpoint_fn(abs_epoch)
+            save_checkpoint(ckpt, layers, opt)
+            println("  [Checkpoint] Saved: $ckpt")
+            println(log_io, "  [Checkpoint] Saved: $ckpt")
+            flush(log_io)
         end
 
         # Load the next epoch's U into the shared template.
