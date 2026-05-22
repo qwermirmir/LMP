@@ -11,6 +11,7 @@ include("Layer_types.jl")
 include("activation.jl")
 include("Optimizer.jl")  # ✅ Optimizer 모듈 포함
 include("Layer_sequence.jl")
+include("BatchedBufferSequence.jl")
 include("Gauge.jl")
 include("DDalphaAMG.jl")
 
@@ -21,6 +22,7 @@ using .Layer_types
 using .activation
 using .Optimizer
 using .Layer_sequence
+using .BatchedBufferSequence
 using .Gauge
 using .DDalphaAMG
 using DisplayAs
@@ -107,8 +109,11 @@ export restrict_f2c!, prolongate_c2f!, coarse_apply!
 export precompute_coarse_operator!
 export mr_smooth!, sap_smooth!
 export block_orthonormalize!,deflated_initial_guess,_to_cpu,_to_gpu,_to_cpu_gauge
+export compare_ddalphaamg_cpu_gpu
 export gamma5!, chiral_project!, gamma5_sign
 export CloverDiracOperator, compute_Fmunu, refresh_clover!
 export train_timed
+export BatchedFieldBuffer, buffer_from_fields, materialize_fields, materialize_fields!
+export dense_forward_buffer!, pt_forward_buffer!, norm_forward_buffer!, forward_buffer_segment
 end  # module LMP
 
