@@ -11,6 +11,8 @@
 \usepackage{xcolor}
 \usepackage{hyperref}
 
+\emergencystretch=3em
+
 \hypersetup{
   colorlinks=true,
   linkcolor=blue!55!black,
@@ -874,7 +876,7 @@ attention layers, while many field-valued layers default to identity.
 \begin{table}[h]
 \centering
 \small
-\begin{tabular}{@{}lll@{}}
+\begin{tabular}{@{}p{0.27\linewidth}p{0.39\linewidth}p{0.25\linewidth}@{}}
 \toprule
 Layer & Main mathematical object & Primary role \\
 \midrule
@@ -915,11 +917,11 @@ The most important conceptual point is that \LMP{} layers are not generic
 neural-network layers applied to arrays. They are physics-aware operators on
 fermion fields. The package repeatedly uses the following pattern:
 \[
-  \text{transport by gauge links}
-  \quad\longrightarrow\quad
-  \text{spin/channel mixing}
-  \quad\longrightarrow\quad
-  \text{spectral or variational objective}.
+  \begin{aligned}
+  &\text{transport by gauge links}\\
+  &\quad\longrightarrow\ \text{spin/channel mixing}\\
+  &\quad\longrightarrow\ \text{spectral or variational objective}.
+  \end{aligned}
 \]
 This pattern makes the learned maps compatible with local gauge covariance and
 connects the learned representation to LQCD solver tasks, especially low-mode
