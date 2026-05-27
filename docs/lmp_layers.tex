@@ -39,7 +39,7 @@
 \newcommand{\dd}{\mathrm{d}}
 
 \title{\LMP{} Layer Documentation\\
-\large Scientific Motivation, Mathematical Structure, and Implementation Map}
+\large Gauge-Covariant Machine-Learning Layers for Lattice QCD}
 \author{LMP project}
 \date{\today}
 
@@ -47,15 +47,40 @@
 \maketitle
 
 \begin{abstract}
-\LMP{} is a Julia package designed for machine-learning constructions on lattice
-QCD (LQCD) fermion fields. Its layer design is centered on a constraint that is
-essential in gauge theory: learned maps should respect the local gauge structure
-of fields living on a four-dimensional lattice. This document summarizes the
-main layer families currently implemented in \LMP{}, explains the scientific
-ideas behind them, and records the mathematical formulas that describe their
-forward maps. Implementation references point to the current source files in
-\code{src/}.
+\LMP{} is a Julia package for building machine-learning models directly on
+lattice QCD (LQCD) fermion fields. The package is organized around a simple
+principle: learned operations should be compatible with local gauge covariance,
+rather than treating lattice fields as ordinary dense arrays. Its main layers
+therefore combine gauge-link parallel transport, spinor-space trainable
+matrices, attention-style contractions, and Rayleigh--Ritz objectives for
+low-mode learning. This document presents the scientific motivation, the
+mathematical forward maps, and the implementation locations of the principal
+layers. It is intended as a compact technical overview for collaborators who
+know LQCD and want to understand what is being learned by the current \LMP{}
+architecture.
 \end{abstract}
+
+\section*{Executive summary}
+
+\LMP{} can be viewed as a physics-informed neural layer library for Wilson
+fermions. Its design differs from a standard neural-network package in three
+ways:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Gauge covariance is built into the feature construction.}
+        Neighboring fermion fields are not mixed directly; they are first
+        parallel-transported with the gauge links to a common site.
+  \item \textbf{Trainable parameters act primarily in spinor and channel
+        space.} This keeps the color gauge transformation law intact while
+        allowing expressive learned maps.
+  \item \textbf{Several layers optimize spectral information.} Rayleigh
+        quotients, Ritz values, orthogonalization, and blockwise amplitudes
+        target low-mode subspaces relevant to deflation and multigrid-style
+        solvers.
+\end{enumerate}
+
+The result is a collection of layers that are interpretable in LQCD language:
+parallel-transport convolutions, gauge-covariant attention mechanisms, and
+variational objectives for Dirac-operator spectra.
 
 \tableofcontents
 \newpage
@@ -69,6 +94,35 @@ with \emph{parallel-transport convolution}: nearby lattice information is first
 transported along gauge links to a common site, and only then mixed by trainable
 spin-space matrices. This makes the construction naturally compatible with the
 local gauge symmetry of LQCD.
+
+This document is written from the viewpoint of a researcher inspecting the
+architecture, not from the viewpoint of an API reference. Each layer is
+therefore described by:
+\begin{itemize}[leftmargin=*]
+  \item the physical object it manipulates;
+  \item the mathematical forward map implemented by the layer;
+  \item the reason this construction is natural for LQCD;
+  \item the source files where the implementation can be checked.
+\end{itemize}
+
+\subsection{Core design pattern}
+
+Most field-valued \LMP{} layers follow the same structural pattern:
+\[
+  \boxed{
+  \text{gauge transport}
+  \quad\longrightarrow\quad
+  \text{spin/channel mixing}
+  \quad\longrightarrow\quad
+  \text{optional spectral objective}
+  }.
+\]
+The first step ensures that all features transform in the same local color
+frame. The second step supplies learnable expressivity without violating that
+transformation law. The third step, when present, connects the learned
+representation to Dirac-operator low modes.
+
+\subsection{Current implementation map}
 
 The source layout relevant for layer documentation is:
 \begin{itemize}[leftmargin=*]
@@ -84,6 +138,23 @@ The source layout relevant for layer documentation is:
   \item \code{src/Gauge.jl}: gauge-transformation helpers.
   \item \code{src/gpu.jl}: GPU versions of spin matrices, packing routines,
         batched kernels, and GPU helper functions.
+\end{itemize}
+
+\subsection{What to focus on when presenting \LMP{}}
+
+For a short introduction to collaborators, the most important points are:
+\begin{itemize}[leftmargin=*]
+  \item \code{Hopping_operator} is the geometric backbone: it constructs
+        gauge-covariant path features.
+  \item \code{PTC_Layer}, \code{CPTC_Layer}, and \code{PTLayer} are the main
+        convolution-like layers.
+  \item The attention layers replace scalar image attention with contractions
+        of covariantly transported spinor fields.
+  \item \code{RayleighQuotient_Layer} and \code{Ritz_Layer} turn the model into
+        a variational tool for low-mode subspace learning.
+  \item \code{GramSchmidt_Layer}, \code{Orthogonal_Layer}, and
+        \code{BlockScalar_Layer} provide numerical structure needed by
+        multi-vector and domain-decomposed representations.
 \end{itemize}
 
 \section{Notation and LQCD background}
@@ -111,6 +182,26 @@ In the implementation, Wilson fermion fields are represented by
 \code{WF3x1CPU} or \code{WF3x1GPU}, type aliases for Wilson-fermion objects
 from \code{LatticeDiracOperators}. Trainable spin matrices are represented by
 \code{Spin_matrix} on CPU and \code{Spin_matrix_GPU} on GPU.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+$n\in\Lambda$ & Lattice site \\
+$\mu=1,\dots,4$ & Lattice direction \\
+$\U_\mu(n)$ & Gauge link from $n$ to $n+\hat\mu$ \\
+$\field(n)$ & Wilson fermion field with color and spin indices \\
+$W$ & Trainable $4\times4$ spin matrix \\
+$\pathop_p[\U]$ & Gauge-link transport along path $p$ \\
+$\inner{x}{y}$ & Lattice color-spin inner product \\
+$\dirac$ & Dirac-type operator used in spectral objectives \\
+\bottomrule
+\end{tabular}
+\caption{Notation used throughout the document.}
+\end{table}
 
 \subsection{Gauge transformations}
 
@@ -236,6 +327,12 @@ should be expressed in a basis natural for Dirac spinors rather than as an
 unstructured dense matrix.
 
 \section{Core convolution-like layers}
+
+The layers in this section are the most direct analogue of convolutional
+layers. Their receptive field is specified by paths on the lattice, but the
+field values collected from those paths are made comparable by gauge parallel
+transport. This is the central technical distinction between \LMP{} and an
+ordinary convolutional network.
 
 \subsection[PTC Layer: parallel-transport convolution]{\texttt{PTC\_Layer}: parallel-transport convolution}
 
@@ -368,6 +465,13 @@ the learned coefficients. Because it only mixes spin and channel indices, it
 preserves gauge covariance of each field channel.
 
 \section{Attention-style layers}
+
+The attention layers should not be read as a direct copy of transformer
+attention on token embeddings. In \LMP{}, Q/K/V features are fermion fields
+or spin matrices derived from fermion fields. Their contractions must be chosen
+so that the resulting weights are meaningful under a change of local gauge
+frame. The attention mechanism is therefore best understood as a learned
+selection among gauge-transported paths and spin channels.
 
 \subsection{General covariant attention principle}
 
@@ -520,6 +624,12 @@ contractions.
 
 \section{Spectral and variational layers}
 
+The spectral layers turn a neural network into a variational ansatz for
+Dirac-operator eigenspaces. Instead of comparing the output only to a fixed
+target field, these layers measure whether the output fields span a physically
+useful low-mode subspace. This is the part of the package most closely tied to
+deflation, multigrid setup, and solver acceleration.
+
 \subsection{Rayleigh quotient motivation}
 
 Many LQCD workflows depend on low modes of Dirac-type operators because small
@@ -616,6 +726,11 @@ For LQCD, this is useful for learning low-mode subspaces suitable for
 deflation, coarse-grid construction, or solver preconditioning.
 
 \section{Orthogonalization and normalization}
+
+The layers in this section are not primarily feature extractors. They enforce
+or encourage numerical conditions that are important when learning several
+fermion fields simultaneously. Without such structure, multiple trainable
+vectors can collapse onto the same low mode or develop inconvenient scales.
 
 \subsection[GramSchmidt Layer]{\texttt{GramSchmidt\_Layer}}
 
@@ -809,5 +924,52 @@ fermion fields. The package repeatedly uses the following pattern:
 This pattern makes the learned maps compatible with local gauge covariance and
 connects the learned representation to LQCD solver tasks, especially low-mode
 learning, deflation, and multigrid-inspired coarse representations.
+
+\section{Suggested narrative for collaborators}
+
+When introducing \LMP{} to another LQCD researcher, a concise description is:
+\begin{quote}
+\LMP{} explores neural-network layers whose elementary operation is not a
+standard array convolution, but a gauge-covariant transport-and-mix operation
+on Wilson fermion fields. A layer first gathers fields along gauge-link paths,
+parallel-transports them to a common color frame, and then applies learnable
+spin/channel matrices. On top of this feature construction, the package defines
+attention-like path selection and Rayleigh--Ritz objectives for learning
+low-mode subspaces of Dirac-type operators.
+\end{quote}
+
+This framing emphasizes that the package is not simply using machine learning
+as a black box. The learned maps are constrained by the same geometric
+structure that appears in LQCD operators. Consequently, the output fields and
+objectives have a direct interpretation in terms of gauge-covariant features,
+spinor algebra, and spectral approximation.
+
+\section{Current status and cautions}
+
+The document describes the implemented layer families as they appear in the
+current source tree. A few points are worth keeping in mind when using the
+document as research material:
+\begin{itemize}[leftmargin=*]
+  \item Several layers expose both CPU and GPU paths. The mathematical maps are
+        the same, but the implementation may use cached buffers or fused kernels
+        for performance.
+  \item The spelling \code{PrallelTransportAttention_Layer} is preserved because
+        it is the public name currently used in the source.
+  \item Some activation functions are implemented for spin matrices rather than
+        general fermion fields. In many field-valued layers the default
+        activation is identity.
+  \item The formulas here describe the forward maps and scientific intent. They
+        are not a full derivation of every gradient implementation.
+\end{itemize}
+
+\section{Concluding perspective}
+
+\LMP{} is best understood as an attempt to make neural architectures speak the
+language of lattice gauge theory. Its layers are built from parallel transport,
+spinor mixing, local contractions, and variational spectral objectives. These
+are precisely the structures that appear in Wilson-Dirac operators, deflation
+methods, and multigrid algorithms. For that reason, the package is a promising
+framework for testing whether trainable gauge-covariant maps can produce useful
+low-mode or coarse-space information for LQCD computations.
 
 \end{document}
