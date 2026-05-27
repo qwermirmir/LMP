@@ -21,7 +21,7 @@
 }
 
 \newcommand{\LMP}{\texttt{LMP}}
-\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
 \newcommand{\field}{\psi}
 \newcommand{\site}{n}
 \newcommand{\muindex}{\mu}
@@ -237,7 +237,7 @@ unstructured dense matrix.
 
 \section{Core convolution-like layers}
 
-\subsection{\code{PTC_Layer}: parallel-transport convolution}
+\subsection[PTC Layer: parallel-transport convolution]{\texttt{PTC\_Layer}: parallel-transport convolution}
 
 \paragraph{Implementation.}
 Defined in \code{src/Layer_types.jl}; forward map in
@@ -284,7 +284,7 @@ at the current site, because the two live in different local color frames.
 then learns a spin-space mixing. The result is a local, gauge-covariant
 feature extractor.
 
-\subsection{\code{CPTC_Layer}: Clifford parallel-transport convolution}
+\subsection[CPTC Layer: Clifford parallel-transport convolution]{\texttt{CPTC\_Layer}: Clifford parallel-transport convolution}
 
 \paragraph{Implementation.}
 Defined in \code{src/Layer_types.jl}; forward map in
@@ -308,7 +308,7 @@ itself is built from gamma matrices. A Clifford-structured layer biases the
 learned spin operation toward this physical algebra. It is a physics-informed
 restriction of the spin-space part of the convolution.
 
-\subsection{\code{PTLayer}: multi-input path transport layer}
+\subsection[PTLayer: multi-input path transport layer]{\texttt{PTLayer}: multi-input path transport layer}
 
 \paragraph{Implementation.}
 Defined in \code{src/Layer_types.jl}; forward map in
@@ -344,7 +344,7 @@ multi-channel fermion representation. It is useful when a model carries several
 candidate low modes, coarse vectors, or learned feature fields through a shared
 gauge background.
 
-\subsection{\code{DenseLinearLayer}: spin-matrix dense channel mixing}
+\subsection[DenseLinearLayer: spin-matrix dense channel mixing]{\texttt{DenseLinearLayer}: spin-matrix dense channel mixing}
 
 \paragraph{Implementation.}
 Defined in \code{src/Layer_types.jl}; forward map in
@@ -388,7 +388,7 @@ Gauge-invariant or spin-local scores are then made from contractions such as
 where $m$ is the layer's \code{nominator} scaling factor and $\mathcal{M}$ is
 implemented by \code{Matmul!} or \code{spincolortrace}, depending on the layer.
 
-\subsection{\code{Attention_Layer}}
+\subsection[Attention Layer]{\texttt{Attention\_Layer}}
 
 \paragraph{Implementation.}
 Defined in \code{src/Layer_types.jl}; forward map starts at
@@ -429,7 +429,7 @@ path. It can be read as a local self-attention over covariantly transported
 fermion features, where the attention weight is itself a spin matrix rather
 than a scalar probability.
 
-\subsection{\code{FullPTCAttention_Layer}}
+\subsection[FullPTCAttention Layer]{\texttt{FullPTCAttention\_Layer}}
 
 \paragraph{Forward map.}
 \code{FullPTCAttention_Layer} is similar in spirit but uses the raw PTC weights
@@ -451,7 +451,7 @@ The score and output are
 This is closer to a direct Q/K/V attention mechanism over path-transported
 features. It provides more freedom than the Clifford-restricted variant.
 
-\subsection{\code{PrallelTransportAttention_Layer}}
+\subsection[PrallelTransportAttention Layer]{\texttt{PrallelTransportAttention\_Layer}}
 
 \paragraph{Name note.}
 The public type name currently uses the spelling \code{PrallelTransport...} in
@@ -493,7 +493,7 @@ spin-channel response. The bias parameter acts as a sparsifying threshold,
 encouraging only paths with strong relative contribution to enter the value
 sum.
 
-\subsection{\code{siteweight_Layer}}
+\subsection[siteweight Layer]{\texttt{siteweight\_Layer}}
 
 \paragraph{Forward map.}
 This layer computes Q/K/V path features and uses a local color-spin contraction:
@@ -540,7 +540,7 @@ $\dirac^\dagger\dirac$ is
 Minimizing this quantity encourages $x$ to align with low singular/eigenmodes
 of the Dirac operator.
 
-\subsection{\code{RayleighQuotient_Layer}}
+\subsection[RayleighQuotient Layer]{\texttt{RayleighQuotient\_Layer}}
 
 \paragraph{Implementation.}
 Defined in \code{src/Layer_types.jl}; forward map in
@@ -554,7 +554,7 @@ For the stored field $x$ and input operator $\dirac$,
   \frac{\norm{\dirac x}^{2}}{\norm{x}^{2}}.
 \]
 
-\subsection{\code{PtcRayleighQuotient_Layer}}
+\subsection[PtcRayleighQuotient Layer]{\texttt{PtcRayleighQuotient\_Layer}}
 
 \paragraph{Forward map.}
 For a vector of fields $x_1,\dots,x_K$ and stored operator $\dirac$,
@@ -566,7 +566,7 @@ For a vector of fields $x_1,\dots,x_K$ and stored operator $\dirac$,
 \]
 This lets a multi-channel network optimize several candidate vectors.
 
-\subsection{\code{HoppingRayleighQuotient_Layer}}
+\subsection[HoppingRayleighQuotient Layer]{\texttt{HoppingRayleighQuotient\_Layer}}
 
 \paragraph{Forward map.}
 This layer first creates a sum of hopped fields
@@ -585,7 +585,7 @@ The quotient is evaluated after a gauge-covariant path expansion. This allows
 the model to assess whether transported local combinations improve alignment
 with low modes.
 
-\subsection{\code{Ritz_Layer}}
+\subsection[Ritz Layer]{\texttt{Ritz\_Layer}}
 
 \paragraph{Implementation.}
 Defined in \code{src/Layer_types.jl}; forward map in
@@ -617,7 +617,7 @@ deflation, coarse-grid construction, or solver preconditioning.
 
 \section{Orthogonalization and normalization}
 
-\subsection{\code{GramSchmidt_Layer}}
+\subsection[GramSchmidt Layer]{\texttt{GramSchmidt\_Layer}}
 
 \paragraph{Forward map.}
 The layer performs modified Gram-Schmidt orthogonalization:
@@ -636,7 +636,7 @@ Ritz and Rayleigh objectives can collapse multiple vectors toward the same
 mode. Orthogonalization keeps a set of learned vectors linearly independent,
 which is required for stable subspace learning.
 
-\subsection{\code{Orthogonal_Layer}}
+\subsection[Orthogonal Layer]{\texttt{Orthogonal\_Layer}}
 
 \paragraph{Forward map.}
 For coefficient $a$, this scalar objective is
@@ -652,7 +652,7 @@ For coefficient $a$, this scalar objective is
 This is a soft penalty that discourages non-orthogonal vectors without directly
 replacing them by an orthogonalized basis.
 
-\subsection{\code{NormLayer}}
+\subsection[NormLayer]{\texttt{NormLayer}}
 
 \paragraph{Forward map.}
 For each input field $x_i$ and scale $\alpha$,
@@ -676,7 +676,7 @@ hurt numerical stability. \code{NormLayer} explicitly fixes the field norm.
 
 \section{Block and domain-decomposition layer}
 
-\subsection{\code{BlockScalar_Layer}}
+\subsection[BlockScalar Layer]{\texttt{BlockScalar\_Layer}}
 
 \paragraph{Implementation.}
 Defined in \code{src/Layer_types.jl}; forward map in
@@ -702,7 +702,7 @@ coarse-vector corrections or block-adaptive preconditioner components.
 
 \section{Dirac and clover-related operators}
 
-\subsection{\code{Dirac_Layer}}
+\subsection[Dirac Layer]{\texttt{Dirac\_Layer}}
 
 \code{Dirac_Layer} wraps an operator and applies it to a fermion field:
 \[
