@@ -1,0 +1,813 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  citecolor=blue!55!black,
+  urlcolor=blue!55!black,
+  pdftitle={LMP Layer Documentation},
+  pdfauthor={LMP project}
+}
+
+\newcommand{\LMP}{\texttt{LMP}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\field}{\psi}
+\newcommand{\site}{n}
+\newcommand{\muindex}{\mu}
+\newcommand{\U}{U}
+\newcommand{\gauge}{g}
+\newcommand{\C}{\mathbb{C}}
+\newcommand{\Tr}{\operatorname{Tr}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\inner}[2]{\left\langle #1, #2 \right\rangle}
+\newcommand{\pathop}{\mathcal{T}}
+\newcommand{\paths}{\mathcal{P}}
+\newcommand{\spin}{\mathcal{S}}
+\newcommand{\dirac}{D}
+\newcommand{\dd}{\mathrm{d}}
+
+\title{\LMP{} Layer Documentation\\
+\large Scientific Motivation, Mathematical Structure, and Implementation Map}
+\author{LMP project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\LMP{} is a Julia package designed for machine-learning constructions on lattice
+QCD (LQCD) fermion fields. Its layer design is centered on a constraint that is
+essential in gauge theory: learned maps should respect the local gauge structure
+of fields living on a four-dimensional lattice. This document summarizes the
+main layer families currently implemented in \LMP{}, explains the scientific
+ideas behind them, and records the mathematical formulas that describe their
+forward maps. Implementation references point to the current source files in
+\code{src/}.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Purpose and high-level architecture}
+
+\LMP{} treats a neural-network layer as an operator acting on Wilson fermion
+fields, vectors of fermion fields, or scalar objective values built from such
+fields. The central design idea is to replace ordinary image-like convolution
+with \emph{parallel-transport convolution}: nearby lattice information is first
+transported along gauge links to a common site, and only then mixed by trainable
+spin-space matrices. This makes the construction naturally compatible with the
+local gauge symmetry of LQCD.
+
+The source layout relevant for layer documentation is:
+\begin{itemize}[leftmargin=*]
+  \item \code{src/LMP.jl}: top-level module, includes submodules, and exports
+        public constructors.
+  \item \code{src/Layer_types.jl}: layer structs and activation-function types.
+  \item \code{src/Layer_sequence.jl}: forward maps, normalization, objective
+        layers, sequence execution, CPU/GPU conversion helpers, and many
+        gradient/update definitions.
+  \item \code{src/elementry_base.jl}: fermion-field algebra, spin matrices,
+        path data structures, hopping/parallel transport, inner products, block
+        utilities, and clover-field utilities.
+  \item \code{src/Gauge.jl}: gauge-transformation helpers.
+  \item \code{src/gpu.jl}: GPU versions of spin matrices, packing routines,
+        batched kernels, and GPU helper functions.
+\end{itemize}
+
+\section{Notation and LQCD background}
+
+\subsection{Lattice fields}
+
+Let the four-dimensional lattice be
+\[
+  \Lambda =
+  \{(n_1,n_2,n_3,n_4) \mid 1 \le n_\mu \le N_\mu,\ \mu=1,\dots,4\}.
+\]
+The gauge links are matrices
+\[
+  \U_\mu(n) \in SU(3),
+\]
+living on links from site $n$ to site $n+\hat\mu$. A Wilson fermion field is
+represented as
+\[
+  \field(n) \in \C^{N_c} \otimes \C^{N_s},
+  \qquad N_c=3,\quad N_s=4,
+\]
+so each site carries color and spin components.
+
+In the implementation, Wilson fermion fields are represented by
+\code{WF3x1CPU} or \code{WF3x1GPU}, type aliases for Wilson-fermion objects
+from \code{LatticeDiracOperators}. Trainable spin matrices are represented by
+\code{Spin_matrix} on CPU and \code{Spin_matrix_GPU} on GPU.
+
+\subsection{Gauge transformations}
+
+A local gauge transformation is a site-wise $SU(3)$ matrix $\gauge(n)$. The
+fermion and gauge fields transform as
+\begin{align}
+  \field(n) &\mapsto \field^g(n) = \gauge(n)\field(n),\\
+  \U_\mu(n) &\mapsto \U_\mu^g(n)
+    = \gauge(n)\U_\mu(n)\gauge^\dagger(n+\hat\mu).
+\end{align}
+This exact link rule is implemented in \code{gUgshift!} in \code{src/Gauge.jl}.
+The function multiplies $\gauge(n)\U_\mu(n)$ and then right-multiplies by the
+shifted gauge transformation $\gauge^\dagger(n+\hat\mu)$.
+
+\subsection{Fermion inner product and norm}
+
+The package uses the lattice field inner product implemented through
+\code{dot(x,f)}:
+\[
+  \inner{x}{y}
+  =
+  \sum_{n\in\Lambda}
+  \sum_{c=1}^{3}
+  \sum_{\alpha=1}^{4}
+  x_{c,\alpha}(n)^{*} y_{c,\alpha}(n).
+\]
+The squared norm is
+\[
+  \norm{x}^{2} = \inner{x}{x}.
+\]
+These appear as \code{inner_product(x,f)} and \code{norm2(x)} in
+\code{src/elementry_base.jl}.
+
+\section{Gauge-covariant paths and parallel transport}
+
+\subsection{Path representation}
+
+\LMP{} uses integer directions to represent lattice paths. A direction
+$+\mu$ or $-\mu$ means a one-link displacement in the positive or negative
+lattice direction. The special direction $0$ represents the identity path.
+The relevant objects are:
+\begin{itemize}[leftmargin=*]
+  \item \code{Path}: one ordered list of steps.
+  \item \code{Paths}: a collection of paths.
+  \item \code{Onestep()}: returns the identity path and all positive/negative
+        one-hop directions.
+  \item \code{reverse_paths}: reverses a path and flips all signs, giving the
+        adjoint transport path.
+\end{itemize}
+
+\subsection{Parallel transport operator}
+
+For a path $p=(s_1,\dots,s_L)$ with $s_i\in\{0,\pm1,\dots,\pm4\}$, define the
+path-transported field
+\[
+  \pathop_p[\U]\field(n)
+  =
+  \left(\prod_{\ell\in p}^{\mathrm{path}}
+  \U_{\ell}^{(\pm)}(\cdot)\right)
+  \field(n+\Delta p),
+\]
+where $\Delta p$ is the endpoint displacement and the product uses either a
+link or its Hermitian adjoint depending on path orientation. In the code this is
+implemented by \code{Hopping_operator}.
+
+The CPU implementation in \code{src/elementry_base.jl} follows the rule:
+\begin{align}
+  s=+\mu:\quad
+  \field'(n)
+  &=
+  \U_\mu^\dagger(n-\hat\mu)\,
+  \field(n-\hat\mu),
+  \\
+  s=-\mu:\quad
+  \field'(n)
+  &=
+  \U_\mu(n)\,
+  \field(n+\hat\mu).
+\end{align}
+Boundary conditions are applied during the shift. The important property is
+gauge covariance:
+\[
+  \pathop_p[\U^g]\field^g(n)
+  =
+  \gauge(n)\,\pathop_p[\U]\field(n).
+\]
+Therefore, all path-transported features in a layer transform at the same site
+as the original field, making local spin-space mixing gauge compatible.
+
+\section{Spin matrices and Clifford basis}
+
+\subsection{Spin-space trainable weights}
+
+\code{Spin_matrix} wraps a $4\times4$ complex matrix $W\in\C^{4\times4}$. It
+acts on the spin index of a Wilson fermion field at each color and lattice site:
+\[
+  (W\field)_{c,\alpha}(n)
+  =
+  \sum_{\beta=1}^{4} W_{\alpha\beta}\field_{c,\beta}(n).
+\]
+This action does not mix color and therefore commutes with local color-gauge
+transformations:
+\[
+  W(\gauge\field)=\gauge(W\field).
+\]
+That commutation is the reason spin matrices can be learned without breaking
+gauge covariance.
+
+\subsection{Clifford-transformed weights}
+
+\code{CPTC_Layer} and several attention layers use \code{Clifford(W)}. The
+source defines a set of gamma/Clifford matrices and maps raw trainable
+spin-matrix parameters into a Clifford-structured spin operator. Abstractly,
+one may write
+\[
+  \mathcal{C}(W)
+  =
+  \sum_{a} c_a(W)\,\Gamma_a,
+\]
+where $\{\Gamma_a\}$ is a Clifford basis and $c_a(W)$ are complex coefficients
+encoded by the learnable matrix. This is useful when the learned spin operation
+should be expressed in a basis natural for Dirac spinors rather than as an
+unstructured dense matrix.
+
+\section{Core convolution-like layers}
+
+\subsection{\code{PTC_Layer}: parallel-transport convolution}
+
+\paragraph{Implementation.}
+Defined in \code{src/Layer_types.jl}; forward map in
+\code{src/Layer_sequence.jl}; functional helper \code{PTC} in
+\code{src/elementry_base.jl}.
+
+\paragraph{Inputs and parameters.}
+Let $\paths=\{p_1,\dots,p_K\}$ be the paths stored in a \code{Hopping_operator}.
+Let $W_i\in\C^{4\times4}$ be trainable spin matrices. The layer supports either
+one shared matrix $W$ or one matrix per path.
+
+\paragraph{Forward map.}
+The path-transported features are
+\[
+  h_i = \pathop_{p_i}[\U]\field.
+\]
+The layer computes
+\[
+  y
+  =
+  \sigma\left(
+  \sum_{i=1}^{K} W_i h_i
+  \right),
+\]
+or
+\[
+  y
+  =
+  \sigma\left(
+  \sum_{i=1}^{K} W h_i
+  \right)
+\]
+when a single shared weight is used. If \code{residual=true}, the output is
+\[
+  y \leftarrow y+\field.
+\]
+
+\paragraph{Scientific idea.}
+This is the LQCD analogue of a convolution. Ordinary convolution translates
+neighboring pixels to a common location and mixes them. In a gauge theory, a
+fermion value at a neighboring site cannot be directly compared with a fermion
+at the current site, because the two live in different local color frames.
+\code{PTC_Layer} first parallel-transports each neighbor to the target site,
+then learns a spin-space mixing. The result is a local, gauge-covariant
+feature extractor.
+
+\subsection{\code{CPTC_Layer}: Clifford parallel-transport convolution}
+
+\paragraph{Implementation.}
+Defined in \code{src/Layer_types.jl}; forward map in
+\code{src/Layer_sequence.jl}; helper \code{CPTC} in
+\code{src/elementry_base.jl}.
+
+\paragraph{Forward map.}
+\code{CPTC_Layer} has the same transport structure as \code{PTC_Layer}, but it
+uses Clifford-transformed weights:
+\[
+  y
+  =
+  \sigma\left(
+  \sum_{i=1}^{K} \mathcal{C}(W_i)\,\pathop_{p_i}[\U]\field
+  \right).
+\]
+
+\paragraph{Scientific idea.}
+Wilson fermions carry spinor degrees of freedom, and the Wilson-Dirac operator
+itself is built from gamma matrices. A Clifford-structured layer biases the
+learned spin operation toward this physical algebra. It is a physics-informed
+restriction of the spin-space part of the convolution.
+
+\subsection{\code{PTLayer}: multi-input path transport layer}
+
+\paragraph{Implementation.}
+Defined in \code{src/Layer_types.jl}; forward map in
+\code{src/Layer_sequence.jl}; CPU and GPU paths are both implemented.
+
+\paragraph{Inputs and parameters.}
+\code{PTLayer} acts on a vector of fermion fields
+\[
+  x=(x_1,\dots,x_K),
+\]
+where the number of inputs matches the number of paths. It has an output count
+$O$ and trainable weights $W_{j i}\in\C^{4\times4}$.
+
+\paragraph{Forward map.}
+For each input $x_i$ and path $p_i$, compute
+\[
+  h_i = \pathop_{p_i}[\U]x_i.
+\]
+Then for output channel $j$,
+\[
+  y_j
+  =
+  \sum_{i=1}^{K}
+  W_{j i} h_i,
+  \qquad j=1,\dots,O.
+\]
+The implementation stores weights in a flattened order, but the mathematical
+map is a channel-mixing operator after gauge-covariant transport.
+
+\paragraph{Scientific idea.}
+\code{PTLayer} generalizes \code{PTC_Layer} from a single input field to a
+multi-channel fermion representation. It is useful when a model carries several
+candidate low modes, coarse vectors, or learned feature fields through a shared
+gauge background.
+
+\subsection{\code{DenseLinearLayer}: spin-matrix dense channel mixing}
+
+\paragraph{Implementation.}
+Defined in \code{src/Layer_types.jl}; forward map in
+\code{src/Layer_sequence.jl}.
+
+\paragraph{Forward map.}
+For input fields $x_1,\dots,x_I$ and output fields $y_1,\dots,y_O$,
+\[
+  y_j
+  =
+  \sum_{k=1}^{I}
+  W_{j k} x_k,
+  \qquad W_{j k}\in\C^{4\times4}.
+\]
+There is no gauge-link transport in this layer; it assumes all fields already
+transform at the same lattice site.
+
+\paragraph{Scientific idea.}
+This is a dense linear layer in feature-channel space, with spin matrices as
+the learned coefficients. Because it only mixes spin and channel indices, it
+preserves gauge covariance of each field channel.
+
+\section{Attention-style layers}
+
+\subsection{General covariant attention principle}
+
+Attention in ordinary machine learning builds scores from query and key
+features, then uses those scores to weight value features. In LQCD, all of
+these features must transform coherently under local color rotations. \LMP{}
+therefore constructs Q/K/V features by applying gauge-covariant hopping and
+spin-space weights. Typical features have the form
+\[
+  Q_i = W_i^Q\,\pathop_{p_i}[\U]\field,\quad
+  K_i = W_i^K\,\pathop_{p_i}[\U]\field,\quad
+  V_i = W_i^V\,\pathop_{p_i}[\U]\field.
+\]
+Gauge-invariant or spin-local scores are then made from contractions such as
+\[
+  M_i = \frac{1}{m}\,\mathcal{M}(Q_i^\dagger,K_i),
+\]
+where $m$ is the layer's \code{nominator} scaling factor and $\mathcal{M}$ is
+implemented by \code{Matmul!} or \code{spincolortrace}, depending on the layer.
+
+\subsection{\code{Attention_Layer}}
+
+\paragraph{Implementation.}
+Defined in \code{src/Layer_types.jl}; forward map starts at
+\code{Attention_Layer} in \code{src/Layer_sequence.jl}.
+
+\paragraph{Forward map.}
+The code first Clifford-transforms the Q/K/V weights:
+\[
+  \widetilde W_i^Q=\mathcal{C}(W_i^Q),\quad
+  \widetilde W_i^K=\mathcal{C}(W_i^K),\quad
+  \widetilde W_i^V=\mathcal{C}(W_i^V).
+\]
+For each path feature $h_i=\pathop_{p_i}[\U]\field$,
+\[
+  Q_i=\widetilde W_i^Qh_i,\qquad
+  K_i=\widetilde W_i^Kh_i.
+\]
+The score is
+\[
+  S_i
+  =
+  \sigma\left(
+  \frac{\operatorname{Matmul}(Q_i^\dagger,K_i)}{m}
+  \right),
+\]
+then it is multiplied by the value spin weight and applied to $h_i$:
+\[
+  y
+  =
+  \sum_i
+  \left(S_i\widetilde W_i^V\right) h_i.
+\]
+If residual mode is enabled, $y\leftarrow y+\field$.
+
+\paragraph{Scientific idea.}
+This layer learns a spin-structured importance matrix for each transported
+path. It can be read as a local self-attention over covariantly transported
+fermion features, where the attention weight is itself a spin matrix rather
+than a scalar probability.
+
+\subsection{\code{FullPTCAttention_Layer}}
+
+\paragraph{Forward map.}
+\code{FullPTCAttention_Layer} is similar in spirit but uses the raw PTC weights
+for Q/K/V construction:
+\[
+  Q_i = W_i^Q\,\pathop_{p_i}[\U]\field,\qquad
+  K_i = W_i^K\,\pathop_{p_i}[\U]\field.
+\]
+The score and output are
+\[
+  S_i = \sigma\left(
+  \frac{\operatorname{Matmul}(Q_i^\dagger,K_i)}{m}
+  \right),
+  \qquad
+  y = \sum_i (S_i W_i^V)\,\pathop_{p_i}[\U]\field.
+\]
+
+\paragraph{Scientific idea.}
+This is closer to a direct Q/K/V attention mechanism over path-transported
+features. It provides more freedom than the Clifford-restricted variant.
+
+\subsection{\code{PrallelTransportAttention_Layer}}
+
+\paragraph{Name note.}
+The public type name currently uses the spelling \code{PrallelTransport...} in
+the source and exports. This document keeps the implementation spelling.
+
+\paragraph{Forward map.}
+The implementation builds
+\[
+  K_i = W_i^K\,\pathop_{p_i}[\U]\field,\qquad
+  h_i = \pathop_{p_i}[\U]\field.
+\]
+Using the identity-path or first hopped feature $h_1$ as a reference, it forms
+\[
+  M_i =
+  \frac{\operatorname{Matmul}(h_1^\dagger,K_i)}{m}.
+\]
+It extracts diagonal magnitudes
+\[
+  R_{i,\alpha}= |(M_i)_{\alpha\alpha}|,
+  \qquad
+  r_\alpha=\sum_i R_{i,\alpha},
+\]
+then applies a thresholded ratio with bias $b$:
+\[
+  S_{i,\alpha\alpha}
+  =
+  \max\left(\frac{R_{i,\alpha}}{r_\alpha}-b,0\right)
+  (M_i)_{\alpha\alpha}.
+\]
+The output is
+\[
+  y = \sum_i (S_i W_i^V)h_i,
+\]
+with optional residual addition.
+
+\paragraph{Scientific idea.}
+This layer selects transported paths according to their relative diagonal
+spin-channel response. The bias parameter acts as a sparsifying threshold,
+encouraging only paths with strong relative contribution to enter the value
+sum.
+
+\subsection{\code{siteweight_Layer}}
+
+\paragraph{Forward map.}
+This layer computes Q/K/V path features and uses a local color-spin contraction:
+\[
+  S_{pq}(n)
+  =
+  \frac{1}{m}
+  \operatorname{spincolortrace}
+  \left(Q_p^\dagger(n),K_q(n)\right).
+\]
+The result is assembled as
+\[
+  y(n)
+  =
+  \sum_{p,q}
+  S_{pq}(n)\,V_q(n).
+\]
+
+\paragraph{Scientific idea.}
+Unlike the spin-matrix attention variants, \code{siteweight_Layer} produces
+site-dependent scalar or tensor weights from local contractions. This is closer
+to spatial attention over the lattice while retaining gauge-compatible
+contractions.
+
+\section{Spectral and variational layers}
+
+\subsection{Rayleigh quotient motivation}
+
+Many LQCD workflows depend on low modes of Dirac-type operators because small
+eigenvalues dominate solver convergence, multigrid setup quality, and
+deflation efficiency. \LMP{} includes layers that evaluate Rayleigh-type
+objectives to train fermion fields or feature channels toward low-mode
+subspaces.
+
+For a linear operator $\dirac$, a Rayleigh quotient for the positive operator
+$\dirac^\dagger\dirac$ is
+\[
+  R(x)
+  =
+  \frac{\inner{\dirac x}{\dirac x}}{\inner{x}{x}}
+  =
+  \frac{\inner{x}{\dirac^\dagger\dirac x}}{\inner{x}{x}}.
+\]
+Minimizing this quantity encourages $x$ to align with low singular/eigenmodes
+of the Dirac operator.
+
+\subsection{\code{RayleighQuotient_Layer}}
+
+\paragraph{Implementation.}
+Defined in \code{src/Layer_types.jl}; forward map in
+\code{src/Layer_sequence.jl}.
+
+\paragraph{Forward map.}
+For the stored field $x$ and input operator $\dirac$,
+\[
+  R(x;\dirac)
+  =
+  \frac{\norm{\dirac x}^{2}}{\norm{x}^{2}}.
+\]
+
+\subsection{\code{PtcRayleighQuotient_Layer}}
+
+\paragraph{Forward map.}
+For a vector of fields $x_1,\dots,x_K$ and stored operator $\dirac$,
+\[
+  L(x_1,\dots,x_K)
+  =
+  \sum_{i=1}^{K}
+  \frac{\norm{\dirac x_i}^{2}}{\norm{x_i}^{2}}.
+\]
+This lets a multi-channel network optimize several candidate vectors.
+
+\subsection{\code{HoppingRayleighQuotient_Layer}}
+
+\paragraph{Forward map.}
+This layer first creates a sum of hopped fields
+\[
+  y = \sum_{i=1}^{K}\pathop_{p_i}[\U]x,
+\]
+then evaluates
+\[
+  R(y;\dirac)
+  =
+  \frac{\norm{\dirac y}^{2}}{\norm{y}^{2}}.
+\]
+
+\paragraph{Scientific idea.}
+The quotient is evaluated after a gauge-covariant path expansion. This allows
+the model to assess whether transported local combinations improve alignment
+with low modes.
+
+\subsection{\code{Ritz_Layer}}
+
+\paragraph{Implementation.}
+Defined in \code{src/Layer_types.jl}; forward map in
+\code{src/Layer_sequence.jl}; GPU code uses CUSOLVER for the generalized
+Hermitian eigenproblem.
+
+\paragraph{Forward map.}
+Given a set of candidate vectors $V=\{x_1,\dots,x_l\}$, the layer builds Gram
+matrices
+\begin{align}
+  A_{ij} &= \inner{\dirac x_i}{\dirac x_j},\\
+  B_{ij} &= \inner{x_i}{x_j}.
+\end{align}
+The Ritz values are obtained from the generalized eigenproblem
+\[
+  A c_k = \lambda_k B c_k.
+\]
+The layer returns the real sum
+\[
+  L_{\mathrm{Ritz}}(V)
+  =
+  \sum_{k=1}^{l}\lambda_k.
+\]
+
+\paragraph{Scientific idea.}
+The Ritz procedure optimizes an entire subspace rather than isolated vectors.
+For LQCD, this is useful for learning low-mode subspaces suitable for
+deflation, coarse-grid construction, or solver preconditioning.
+
+\section{Orthogonalization and normalization}
+
+\subsection{\code{GramSchmidt_Layer}}
+
+\paragraph{Forward map.}
+The layer performs modified Gram-Schmidt orthogonalization:
+\begin{align}
+  q_1 &= x_1,\\
+  q_i &=
+  x_i -
+  \sum_{j<i}
+  \frac{\inner{q_j}{x_i}}{\inner{q_j}{q_j}}q_j,
+  \qquad i=2,\dots,l.
+\end{align}
+It returns $(q_1,\dots,q_l)$.
+
+\paragraph{Scientific idea.}
+Ritz and Rayleigh objectives can collapse multiple vectors toward the same
+mode. Orthogonalization keeps a set of learned vectors linearly independent,
+which is required for stable subspace learning.
+
+\subsection{\code{Orthogonal_Layer}}
+
+\paragraph{Forward map.}
+For coefficient $a$, this scalar objective is
+\[
+  L_{\mathrm{orth}}(x_1,\dots,x_l)
+  =
+  a
+  \sum_{1\le j<i\le l}
+  \left|\inner{x_j}{x_i}\right|^2.
+\]
+
+\paragraph{Scientific idea.}
+This is a soft penalty that discourages non-orthogonal vectors without directly
+replacing them by an orthogonalized basis.
+
+\subsection{\code{NormLayer}}
+
+\paragraph{Forward map.}
+For each input field $x_i$ and scale $\alpha$,
+\[
+  y_i = \alpha \frac{x_i}{\sqrt{\norm{x_i}^{2}}}.
+\]
+
+\paragraph{Scientific idea.}
+Rayleigh-type losses are scale invariant, and uncontrolled vector norms can
+hurt numerical stability. \code{NormLayer} explicitly fixes the field norm.
+
+\subsection{Other normalization layers}
+
+\begin{itemize}[leftmargin=*]
+  \item \code{complexNormLayer}: subtracts the field mean,
+        $x\mapsto x-\operatorname{mean}(x)$.
+  \item \code{zscoreNormLayer}: applies standardization.
+  \item \code{minmaxNormLayer}: applies min-max scaling,
+        $x\mapsto (x-\min x)/(\max x-\min x)$.
+\end{itemize}
+
+\section{Block and domain-decomposition layer}
+
+\subsection{\code{BlockScalar_Layer}}
+
+\paragraph{Implementation.}
+Defined in \code{src/Layer_types.jl}; forward map in
+\code{src/Layer_sequence.jl}; block utilities in \code{src/elementry_base.jl}.
+
+\paragraph{Forward map.}
+The lattice is decomposed into blocks of linear size $r$. Let $b(n)$ be the
+block index containing site $n$. For each input field $x_k$, the layer has a
+complex scalar weight $w_{b,k}$ for every block. The essential operation is
+\[
+  y_k(n)
+  =
+  w_{b(n),k}\,x_k(n).
+\]
+When residual mode is enabled, the input field is added back to the output.
+
+\paragraph{Scientific idea.}
+Blockwise scalar weights are a simple local coarse representation. They are
+related to domain decomposition and multigrid ideas: local regions of the
+lattice can receive separate amplitudes while preserving the internal
+color-spin structure of the fermion field. This is useful for learning local
+coarse-vector corrections or block-adaptive preconditioner components.
+
+\section{Dirac and clover-related operators}
+
+\subsection{\code{Dirac_Layer}}
+
+\code{Dirac_Layer} wraps an operator and applies it to a fermion field:
+\[
+  y = \dirac x.
+\]
+This is useful when a model needs to insert a known physics operator as a
+non-trainable layer.
+
+\subsection{Clover Dirac support}
+
+\code{src/elementry_base.jl} also contains utilities for a clover-improved
+Dirac operator. The documented formula in the source is
+\[
+  D_{\mathrm{cl}}
+  =
+  D_{\mathrm{Wilson}}
+  +
+  i c_{\mathrm{SW}}\kappa
+  \sum_{\mu<\nu}
+  \sigma_{\mu\nu}\widehat F_{\mu\nu},
+  \qquad
+  \sigma_{\mu\nu}
+  =
+  \frac{i}{2}[\gamma_\mu,\gamma_\nu],
+\]
+with
+\[
+  \widehat F_{\mu\nu}
+  =
+  \frac{Q_{\mu\nu}-Q_{\mu\nu}^{\dagger}}{8}.
+\]
+Although this is not a trainable layer by itself, it is part of the physics
+operator infrastructure that can appear inside spectral objectives such as
+\code{Ritz_Layer}.
+
+\section{Activation functions}
+
+The layer structs store an \code{ActivationFunction}. The currently visible
+types include:
+\begin{itemize}[leftmargin=*]
+  \item \code{Identity}: returns the input.
+  \item \code{Softmax}: row-wise exponential normalization for spin matrices.
+  \item \code{ModRelu}: applies a modulus threshold to complex spin-matrix
+        entries,
+        \[
+          z \mapsto \max(|z|-0.1,0)\,e^{i\arg z}.
+        \]
+\end{itemize}
+These activations mostly act on spin matrices or spin-matrix collections in the
+attention layers, while many field-valued layers default to identity.
+
+\section{Layer summary table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Layer & Main mathematical object & Primary role \\
+\midrule
+\code{PTC_Layer} & $\sum_i W_i\pathop_{p_i}\field$ & Gauge-covariant convolution \\
+\code{CPTC_Layer} & $\sum_i \mathcal{C}(W_i)\pathop_{p_i}\field$ & Clifford-informed convolution \\
+\code{PTLayer} & $y_j=\sum_i W_{ji}\pathop_{p_i}x_i$ & Multi-channel path transport \\
+\code{DenseLinearLayer} & $y_j=\sum_k W_{jk}x_k$ & Spin/channel mixing \\
+\code{Attention_Layer} & $S_i=\sigma(Q_i^\dagger K_i/m)$ & Covariant spin attention \\
+\code{FullPTCAttention_Layer} & Raw Q/K/V PTC attention & Flexible path attention \\
+\code{PrallelTransportAttention_Layer} & Diagonal ratio-threshold scores & Sparse path selection \\
+\code{siteweight_Layer} & $\operatorname{spincolortrace}(Q^\dagger,K)$ & Site-dependent weighting \\
+\code{RayleighQuotient_Layer} & $\norm{\dirac x}^2/\norm{x}^2$ & Low-mode objective \\
+\code{Ritz_Layer} & $A c=\lambda B c$ & Subspace low-mode objective \\
+\code{GramSchmidt_Layer} & Modified Gram-Schmidt & Basis orthogonalization \\
+\code{BlockScalar_Layer} & $w_{b(n),k}x_k(n)$ & Block/domain scaling \\
+\bottomrule
+\end{tabular}
+\caption{Main layer families in \LMP{} and their scientific roles.}
+\end{table}
+
+\section{Implementation map}
+
+\begin{itemize}[leftmargin=*]
+  \item Public exports: \code{src/LMP.jl}.
+  \item Layer type definitions: \code{src/Layer_types.jl}.
+  \item Forward maps and layer sequencing: \code{src/Layer_sequence.jl}.
+  \item Path representation and hopping: \code{src/elementry_base.jl}.
+  \item Gauge transformation: \code{src/Gauge.jl}.
+  \item GPU helpers and batched kernels: \code{src/gpu.jl}.
+  \item Basic attention tests: \code{test/Attention_layer.jl} and
+        \code{test/Attention_gradient.jl}.
+  \item Hopping covariance test: \code{test/hopping_covariance_test.jl}.
+\end{itemize}
+
+\section{Practical interpretation}
+
+The most important conceptual point is that \LMP{} layers are not generic
+neural-network layers applied to arrays. They are physics-aware operators on
+fermion fields. The package repeatedly uses the following pattern:
+\[
+  \text{transport by gauge links}
+  \quad\longrightarrow\quad
+  \text{spin/channel mixing}
+  \quad\longrightarrow\quad
+  \text{spectral or variational objective}.
+\]
+This pattern makes the learned maps compatible with local gauge covariance and
+connects the learned representation to LQCD solver tasks, especially low-mode
+learning, deflation, and multigrid-inspired coarse representations.
+
+\end{document}
