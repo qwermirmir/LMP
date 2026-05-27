@@ -2838,6 +2838,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                test_paths::Union{Vector{String},Nothing}=nothing, test_interval=10,
                gauge_cache=nothing, test_gauge_cache=nothing,
                gauge_format::Symbol=:jld2,
+               gauge_preprocess! = nothing,
                epoch_offset::Int=0,
                checkpoint_every::Int=0,
                checkpoint_fn=nothing) where {T<:Layer}
@@ -2880,6 +2881,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             _fast_substitute_U!(U_template[mu], first_U[mu], _staging[mu])
         end
     end
+    gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
     # _sanitize_U!(U_template)
 
     CUDA.synchronize()
@@ -3055,6 +3057,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                         _fast_substitute_U!(U_template[mu], test_Us_cpu[tc][mu], _staging[mu])
                     end
                 end
+                gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
                 # _sanitize_U!(U_template)
                 for b in 1:batch
                     test_loss += real(forward_propagation!(layers, D, D, u))
@@ -3093,6 +3096,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                 _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
             end
             _read_raw_gauge_to_gpu!(U_template, gauge_paths[next_k], _staging, _raw_cpu_buffers)
+            gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
             _train_dbg && _train_debug_step("epoch $epoch raw_read_next_U", _dbg_gc, _dbg_t; sync_gpu=true)
         else
             _next_U = _train_dbg ? _next_U_dbg : fetch(cpu_prefetch)
@@ -3103,6 +3107,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             for mu in eachindex(U_template)
                 _fast_substitute_U!(U_template[mu], _next_U[mu], _staging[mu])
             end
+            gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
             _train_dbg && _train_debug_step("epoch $epoch substitute_next_U", _dbg_gc, _dbg_t; sync_gpu=true)
         end
         # _sanitize_U!(U_template)

@@ -946,6 +946,17 @@ function save_checkpoint(path::AbstractString, layers, opt::Adam)
                 data["layer_$(i)_adam_m"] = Array(cache[:adam_m])
                 data["layer_$(i)_adam_v"] = Array(cache[:adam_v])
             end
+        elseif layer isa fermionfield_Layer
+            for j in eachindex(layer.x)
+                x = layer.x[j]
+                data["layer_$(i)_fermion_x_$(j)"] = Array(x.f)
+                state_key = objectid(x)
+                if haskey(opt.wf_state, state_key)
+                    state = opt.wf_state[state_key]
+                    data["layer_$(i)_fermion_m_$(j)"] = Array(state.m.f)
+                    data["layer_$(i)_fermion_v_$(j)"] = Array(state.v.f)
+                end
+            end
         end
     end
 
@@ -965,16 +976,21 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
     opt.t = Int(get(data, "opt_t", 0))
 
     for (i, layer) in enumerate(layers)
-        if (layer isa PTLayer || layer isa DenseLinearLayer) && layer._W_gpu !== nothing
+        if layer isa PTLayer || layer isa DenseLinearLayer
             key_W = "layer_$(i)_W"
             if haskey(data, key_W)
                 w_arr = data[key_W]  # Array{ComplexF64,3} (NG,NG,NW)
-                copyto!(layer._W_gpu, w_arr)
+                if layer._W_gpu === nothing
+                    layer._W_gpu = CuArray{ComplexF64,3}(w_arr)
+                else
+                    copyto!(layer._W_gpu, w_arr)
+                end
                 if layer._W_cpu_buf === nothing
                     layer._W_cpu_buf = copy(w_arr)
                 else
                     copyto!(layer._W_cpu_buf, w_arr)
                 end
+                sync_W_from_gpu!(layer.W, layer._W_gpu, layer._W_cpu_buf)
             end
             key_m = "layer_$(i)_adam_m"
             if haskey(data, key_m)
@@ -998,6 +1014,22 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
                     cache[:adam_v] = CuArray{ComplexF64}(data["layer_$(i)_adam_v"])
                 end
             end
+        elseif layer isa fermionfield_Layer
+            for j in eachindex(layer.x)
+                key_x = "layer_$(i)_fermion_x_$(j)"
+                haskey(data, key_x) || continue
+                x = layer.x[j]
+                copyto!(x.f, data[key_x])
+
+                key_m = "layer_$(i)_fermion_m_$(j)"
+                if haskey(data, key_m)
+                    m = similar(x)
+                    v = similar(x)
+                    copyto!(m.f, data[key_m])
+                    copyto!(v.f, data["layer_$(i)_fermion_v_$(j)"])
+                    opt.wf_state[objectid(x)] = AdamState{WF3x1}(m, v)
+                end
+            end
         end
     end
 
@@ -1006,5 +1038,3 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
 end
 
 end # module Optimizer
-
-

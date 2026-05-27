@@ -11,7 +11,7 @@ include("Layer_types.jl")
 include("activation.jl")
 include("Optimizer.jl")  # ✅ Optimizer 모듈 포함
 include("Layer_sequence.jl")
-include("BatchedBufferSequence.jl")
+# include("BatchedBufferSequence.jl")
 include("Gauge.jl")
 include("DDalphaAMG.jl")
 
@@ -22,10 +22,11 @@ using .Layer_types
 using .activation
 using .Optimizer
 using .Layer_sequence
-using .BatchedBufferSequence
+# using .BatchedBufferSequence
 using .Gauge
 using .DDalphaAMG
 using DisplayAs
+using JLD2
 # ✅ `Optimizer`를 정확히 가져오고, 필요한 함수 import
 
 
@@ -115,5 +116,115 @@ export CloverDiracOperator, compute_Fmunu, refresh_clover!
 export train_timed
 export BatchedFieldBuffer, buffer_from_fields, materialize_fields, materialize_fields!
 export dense_forward_buffer!, pt_forward_buffer!, norm_forward_buffer!, forward_buffer_segment
-end  # module LMP
+export build_lmp_32pt_layers, load_lmp_model
 
+function _default_lmp_paths(max_len::Int=4)
+    P = Vector{Paths}(undef, 9)
+    for i in 1:9
+        if i <= 5
+            P[i] = Paths([[i - 1]])
+        else
+            P[i] = Paths([[-(i - 5)]])
+        end
+    end
+
+    dirs = [1, 2, 3, 4, -1, -2, -3, -4]
+    lengths = [2^k for k in 1:floor(Int, log2(max_len))]
+    for d in dirs, len in lengths
+        push!(P, Paths([fill(d, len)]))
+    end
+    return P
+end
+
+"""
+    build_lmp_32pt_layers(U, x, D; max_len=4, init_gpu=true)
+
+Builds the 16x32 32-PT Ritz model architecture used by `train_lmp.jl`.
+This creates the layer objects only; checkpoint weights can then be loaded into
+them with `load_lmp_model(path; U, x, D)`.
+"""
+function build_lmp_32pt_layers(U, x, D; max_len::Int=4, init_gpu::Bool=true)
+    P = _default_lmp_paths(max_len)
+    pl = length(P)
+
+    dl = DenseLinearLayer(1, 25, true)
+    PT_layers = [PTLayer(P, U, pl) for _ in 1:32]
+    PT32 = PTLayer(P, U, 4)
+
+    fe = fermionfield_Layer(x, 1)
+    bs5 = BlockScalar_Layer(x, 4, 2)
+    Norm = NormLayer()
+    Norm2 = NormLayer()
+    Ritz = Ritz_Layer(D)
+
+    layers = [
+        fe, dl,
+        PT_layers[2:17]...,
+        Norm,
+        PT_layers[18:32]...,
+        PT32, bs5, Norm2, Ritz,
+    ]
+
+    if init_gpu
+        substitute_Layer!(layers)
+        substitute_Layer!(layers)
+    end
+
+    return layers
+end
+
+"""
+    load_lmp_model(path; layers=nothing, opt=Adam(), gpu=false, U=nothing, x=nothing, D=nothing)
+
+Loads either legacy checkpoints that contain a `"layers"` key or newer W-only
+checkpoints created by `save_checkpoint`.
+
+Legacy files return their stored layers directly. W-only checkpoints need a live
+`layers` object with the same architecture, or `U`, `x`, and `D` so the standard
+32-PT Ritz architecture can be created automatically.
+"""
+function load_lmp_model(path::AbstractString;
+                        layers=nothing,
+                        opt::Adam=Adam(),
+                        gpu::Bool=false,
+                        U=nothing,
+                        x=nothing,
+                        D=nothing,
+                        max_len::Int=4)
+    keys_in_file = JLD2.jldopen(path, "r") do f
+        Set(String.(keys(f)))
+    end
+
+    if "layers" in keys_in_file
+        loaded_layers = JLD2.load(path, "layers")
+        if gpu
+            substitute_Layer!(loaded_layers)
+        end
+        return (; layers=loaded_layers, opt, format=:legacy)
+    end
+
+    if "opt_t" in keys_in_file
+        if layers === nothing
+            if U !== nothing && x !== nothing && D !== nothing
+                layers = build_lmp_32pt_layers(U, x, D; max_len=max_len)
+            else
+                ks = sort!(collect(keys_in_file))
+                preview = join(ks[1:min(end, 8)], ", ")
+                error("""
+                $path is a W-only checkpoint, so it does not contain a full `"layers"` object.
+                Pass either existing `layers`, or pass `U`, `x`, and `D` so the standard
+                32-PT model can be created automatically:
+
+                    model = load_lmp_model(path; U=U, x=x, D=D, opt=opt)
+
+                Available keys start with: $preview
+                """)
+            end
+        end
+        load_checkpoint!(path, layers, opt)
+        return (; layers, opt, format=:checkpoint)
+    end
+
+    error("Unsupported LMP checkpoint format in $path. Available keys: $(collect(keys_in_file))")
+end
+end  # module LMP
