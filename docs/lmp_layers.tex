@@ -878,20 +878,20 @@ attention layers, while many field-valued layers default to identity.
 \small
 \begin{tabular}{@{}p{0.27\linewidth}p{0.39\linewidth}p{0.25\linewidth}@{}}
 \toprule
-Layer & Main mathematical object & Primary role \\
+Layer family & Main mathematical object & Primary role \\
 \midrule
-\code{PTC_Layer} & $\sum_i W_i\pathop_{p_i}\field$ & Gauge-covariant convolution \\
-\code{CPTC_Layer} & $\sum_i \mathcal{C}(W_i)\pathop_{p_i}\field$ & Clifford-informed convolution \\
-\code{PTLayer} & $y_j=\sum_i W_{ji}\pathop_{p_i}x_i$ & Multi-channel path transport \\
-\code{DenseLinearLayer} & $y_j=\sum_k W_{jk}x_k$ & Spin/channel mixing \\
-\code{Attention_Layer} & $S_i=\sigma(Q_i^\dagger K_i/m)$ & Covariant spin attention \\
-\code{FullPTCAttention_Layer} & Raw Q/K/V PTC attention & Flexible path attention \\
-\code{PrallelTransportAttention_Layer} & Diagonal ratio-threshold scores & Sparse path selection \\
-\code{siteweight_Layer} & $\operatorname{spincolortrace}(Q^\dagger,K)$ & Site-dependent weighting \\
-\code{RayleighQuotient_Layer} & $\norm{\dirac x}^2/\norm{x}^2$ & Low-mode objective \\
-\code{Ritz_Layer} & $A c=\lambda B c$ & Subspace low-mode objective \\
-\code{GramSchmidt_Layer} & Modified Gram-Schmidt & Basis orthogonalization \\
-\code{BlockScalar_Layer} & $w_{b(n),k}x_k(n)$ & Block/domain scaling \\
+PTC & $\sum_i W_i\pathop_{p_i}\field$ & Gauge-covariant convolution \\
+CPTC & $\sum_i \mathcal{C}(W_i)\pathop_{p_i}\field$ & Clifford-informed convolution \\
+PTLayer & $y_j=\sum_i W_{ji}\pathop_{p_i}x_i$ & Multi-channel path transport \\
+Dense linear & $y_j=\sum_k W_{jk}x_k$ & Spin/channel mixing \\
+Attention & $S_i=\sigma(Q_i^\dagger K_i/m)$ & Covariant spin attention \\
+Full PTC attention & Raw Q/K/V PTC attention & Flexible path attention \\
+Transport attention & Diagonal ratio-threshold scores & Sparse path selection \\
+Site weights & $\operatorname{spincolortrace}(Q^\dagger,K)$ & Site-dependent weighting \\
+Rayleigh quotient & $\norm{\dirac x}^2/\norm{x}^2$ & Low-mode objective \\
+Ritz & $A c=\lambda B c$ & Subspace low-mode objective \\
+Gram-Schmidt & Modified Gram-Schmidt & Basis orthogonalization \\
+Block scalar & $w_{b(n),k}x_k(n)$ & Block/domain scaling \\
 \bottomrule
 \end{tabular}
 \caption{Main layer families in \LMP{} and their scientific roles.}
