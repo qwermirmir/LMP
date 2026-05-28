@@ -14,7 +14,10 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(grep -E \"^[[:print:]]+$\")",
+      "Bash(python \"c:/Users/_s2220186/Desktop/Julia/LMP/src/search_layer_seq.py\")",
+      "Bash(powershell -Command ' *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\_s2220186\\Desktop\\multilowmode"
