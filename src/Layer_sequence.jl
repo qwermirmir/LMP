@@ -2752,6 +2752,64 @@ function _checkpointed_forward_loss!(to, fwd_names, layers, D, u::Vector{Any},
     return checkpoints
 end
 
+function _checkpointed_buffer_setup!(layers, D, depth::Int)
+    u = Vector{Any}(undef, depth)
+    fill!(u, nothing)
+    u[1] = [D]
+
+    body_idx = min(4, depth)
+    body_size = nothing
+    delta_tail = Dict{Int,Any}()
+    transition_j = nothing
+    transition_input = nothing
+    delta1_buf = nothing
+
+    for i in 1:(depth-1)
+        u[i+1] = layers[i](u[i])
+
+        if i + 1 == 2
+            delta1_buf = deepcopy(u[2])
+        end
+        if i + 1 == body_idx
+            body_size = length(u[i+1])
+        end
+
+        if body_size !== nothing
+            if 3 <= i <= depth - 2 && length(u[i+1]) != body_size
+                if transition_j === nothing
+                    transition_j = i
+                    transition_input = deepcopy(u[i])
+                end
+            end
+            if transition_j !== nothing && transition_j <= i <= depth - 1
+                delta_tail[i] = deepcopy(u[i+1])
+            end
+        end
+
+        if i > 1
+            _clear_layer_forward_cache!(layers[i-1])
+            u[i] = nothing
+        end
+    end
+
+    if transition_j === nothing
+        transition_j = depth - 1
+        transition_input = deepcopy(u[depth-1])
+        delta_tail[depth-1] = deepcopy(u[depth])
+    elseif !haskey(delta_tail, depth - 1)
+        delta_tail[depth-1] = deepcopy(u[depth])
+    end
+
+    buf_a = deepcopy(transition_input)
+    buf_b = deepcopy(transition_input)
+
+    _clear_layer_forward_cache!(layers[depth-1])
+    fill!(u, nothing)
+    _force_cuda_reclaim!()
+
+    return u, delta_tail, transition_j, buf_a, buf_b, delta1_buf
+end
+
 function _recompute_checkpoint_segment!(to, layers, u::Vector{Any}, checkpoints,
                                         start_idx::Int, stop_idx::Int)
     fill!(u, nothing)
@@ -2841,7 +2899,8 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                gauge_preprocess! = nothing,
                epoch_offset::Int=0,
                checkpoint_every::Int=0,
-               checkpoint_fn=nothing) where {T<:Layer}
+               checkpoint_fn=nothing,
+               activation_checkpoint_interval::Int=0) where {T<:Layer}
 
     depth = length(layers)
     N = gauge_format === :raw ? length(gauge_paths) : (gauge_cache === nothing ? length(gauge_paths) : length(gauge_cache))
@@ -2853,6 +2912,8 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
     log_io = open(logfile, "a")
     println(log_io, "=== Training started: $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
     println(log_io, "epochs=$epochs, batch=$batch, depth=$depth, configs=$N")
+    activation_checkpoint_interval > 0 &&
+        println(log_io, "activation_checkpoint_interval=$activation_checkpoint_interval")
     flush(log_io)
 
     fig, ax = plt.subplots()
@@ -2905,38 +2966,51 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
     end
 
     sync_layers_to_gpu!(layers)
-    dummy, f = forward_propagation(layers, D, D)
-    u = dummy
+    if activation_checkpoint_interval > 0
+        u, delta_tail, transition_j, buf_a, buf_b, delta1_buf =
+            _checkpointed_buffer_setup!(layers, D, depth)
+    else
+        dummy, f = forward_propagation(layers, D, D)
+        u = dummy
 
-    # Ping-pong ---------------------------------------------------
-    # body_size: PT body length (= pl)
-    body_size = length(u[min(4, depth)])
+        # Ping-pong ---------------------------------------------------
+        # body_size: PT body length (= pl)
+        body_size = length(u[min(4, depth)])
 
-    # Tail: keep separate delta[j] buffers for layers whose size differs from body_size.
-    delta_tail = Dict{Int,Any}(depth-1 => deepcopy(u[depth]))
-    for j in 3:depth-2
-        length(u[j+1]) != body_size && (delta_tail[j] = deepcopy(u[j+1]))
+        # Tail: keep separate delta[j] buffers for layers whose size differs from body_size.
+        delta_tail = Dict{Int,Any}(depth-1 => deepcopy(u[depth]))
+        for j in 3:depth-2
+            length(u[j+1]) != body_size && (delta_tail[j] = deepcopy(u[j+1]))
+        end
+
+        # transition_j: first tail layer before body ping-pong begins.
+        transition_j = minimum(keys(delta_tail))
+
+        # Fill missing tail buffers.
+        for j in transition_j:depth-1
+            haskey(delta_tail, j) || (delta_tail[j] = deepcopy(u[j+1]))
+        end
+
+        # Two ping-pong buffers shaped like u[transition_j].
+        buf_a = deepcopy(u[transition_j])
+        buf_b = deepcopy(u[transition_j])
+
+        # Layer 1 gradient uses u[2] shape; u[1] is [D], so body ping-pong cannot reuse it.
+        delta1_buf = depth >= 2 ? deepcopy(u[2]) : nothing
     end
-
-    # transition_j: first tail layer before body ping-pong begins.
-    transition_j = minimum(keys(delta_tail))
-
-    # Fill missing tail buffers.
-    for j in transition_j:depth-1
-        haskey(delta_tail, j) || (delta_tail[j] = deepcopy(u[j+1]))
-    end
-
-    # Two ping-pong buffers shaped like u[transition_j].
-    buf_a = deepcopy(u[transition_j])
-    buf_b = deepcopy(u[transition_j])
-
-    # Layer 1 gradient uses u[2] shape; u[1] is [D], so body ping-pong cannot reuse it.
-    delta1_buf = depth >= 2 ? deepcopy(u[2]) : nothing
     # -----------------------------------------------------------------------
 
     temp = Vector{ComplexF64}(undef, batch)
     d = Vector{Any}(undef, depth)
     test_loss_history = Float64[]
+    checkpoint_timer = activation_checkpoint_interval > 0 ? TimerOutput() : nothing
+    npad = ndigits(depth)
+    fwd_names = activation_checkpoint_interval > 0 ?
+        ["fwd_" * lpad(i, npad, '0') * "_$(nameof(typeof(layers[i])))" for i in 1:depth] :
+        String[]
+    bwd_names = activation_checkpoint_interval > 0 ?
+        ["bwd_" * lpad(i, npad, '0') * "_$(nameof(typeof(layers[i])))" for i in 1:depth] :
+        String[]
 
     # D shares U_template and is updated in-place by substitute_U!.
     if layers[end] isa PtcRayleighQuotient_Layer; layers[end].D = D
@@ -2989,10 +3063,24 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         end
         fill!(d, nothing)
         for b in 1:batch
-            f = forward_propagation!(layers, D, D, u)
-            temp[b] = f
-            backward_and_gradient!(layers, u, batch, delta_tail, buf_a, buf_b,
-                                   transition_j, d, gamma, delta1_buf)
+            if activation_checkpoint_interval > 0
+                checkpoints = _checkpointed_forward_loss!(
+                    checkpoint_timer, fwd_names, layers, D, u, temp, b, depth,
+                    activation_checkpoint_interval)
+                _checkpointed_backward_timed!(
+                    checkpoint_timer, bwd_names, layers, u, checkpoints,
+                    batch, delta_tail, buf_a, buf_b, transition_j, d, gamma,
+                    delta1_buf)
+                checkpoints = nothing
+                _clear_forward_caches!(layers)
+                fill!(u, nothing)
+                _force_cuda_reclaim!()
+            else
+                f = forward_propagation!(layers, D, D, u)
+                temp[b] = f
+                backward_and_gradient!(layers, u, batch, delta_tail, buf_a, buf_b,
+                                       transition_j, d, gamma, delta1_buf)
+            end
         end
 
         _train_dbg && _train_debug_step("epoch $epoch fwd_bwd", _dbg_gc, _dbg_t; sync_gpu=true)
@@ -3060,7 +3148,19 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                 gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
                 # _sanitize_U!(U_template)
                 for b in 1:batch
-                    test_loss += real(forward_propagation!(layers, D, D, u))
+                    if activation_checkpoint_interval > 0
+                        test_temp = Vector{ComplexF64}(undef, 1)
+                        checkpoints = _checkpointed_forward_loss!(
+                            checkpoint_timer, fwd_names, layers, D, u,
+                            test_temp, 1, depth, activation_checkpoint_interval)
+                        test_loss += real(test_temp[1])
+                        checkpoints = nothing
+                        _clear_forward_caches!(layers)
+                        fill!(u, nothing)
+                        _force_cuda_reclaim!()
+                    else
+                        test_loss += real(forward_propagation!(layers, D, D, u))
+                    end
                 end
             end
             _train_dbg && _train_debug_step("epoch $epoch test_substitute_forward", _dbg_gc, _dbg_t; sync_gpu=true)

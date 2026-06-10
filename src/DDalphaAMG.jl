@@ -24,14 +24,15 @@ const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerat
 const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 
 # ==========================================
-#  邊玲ｼ蟄舌・繧ｯ繝医Ν (Coarse Grid Vector)
+#  Coarse Grid Vector
 # ==========================================
 
 """
     CoarseVector
 
-邊玲ｼ蟄蝉ｸ翫・繝吶け繝医Ν縲・
-data[(bidx-1)*Nv + v] 縺ｧ繝悶Ο繝・け bidx 縺ｮ繝・せ繝医・繧ｯ繝医Ν逡ｪ蜿ｷ v 縺ｮ謌仙・縺ｫ繧｢繧ｯ繧ｻ繧ｹ縲・
+Coarse-grid vector storing Nv components on each coarse block.
+The entry for block `bidx` and vector component `v` is
+`data[(bidx - 1) * Nv + v]`.
 """
 mutable struct CoarseVector
     data::AbstractVector{ComplexF64}
@@ -65,30 +66,30 @@ function coarse_norm(a::CoarseVector)
     return sqrt(real(dot(a.data, a.data)))
 end
 
-function coarse_axpby!(ﾎｱ, x::CoarseVector, ﾎｲ, y::CoarseVector)
+function coarse_axpby!(α, x::CoarseVector, β, y::CoarseVector)
     if y.data isa CuArray
-        y.data .= ﾎｱ .* x.data .+ ﾎｲ .* y.data
+        y.data .= α .* x.data .+ β .* y.data
         return y
     end
     @inbounds @simd for i in eachindex(y.data)
-        y.data[i] = ﾎｱ * x.data[i] + ﾎｲ * y.data[i]
+        y.data[i] = α * x.data[i] + β * y.data[i]
     end
     return y
 end
 
 
 # ==========================================
-#  繧ｻ繝・ヨ繧｢繝・・讒矩菴・(Setup Structure)
+#  Setup Structure
 # ==========================================
 
 """
     DDalphaAMG_Setup
 
-DD-ﾎｱAMG 縺ｮ繧ｻ繝・ヨ繧｢繝・・諠・ｱ繧剃ｿ晄戟縺吶ｋ讒矩菴薙・
-- test_vectors: 繝悶Ο繝・け逶ｴ莠､豁｣隕丞喧縺輔ｌ縺溘ユ繧ｹ繝医・繧ｯ繝医Ν
-- r: 蜷・婿蜷代・繝悶Ο繝・け繧ｵ繧､繧ｺ
-- Nv: 繝・せ繝医・繧ｯ繝医Ν謨ｰ
-- NBX,NBY,NBZ,NBT: 邊玲ｼ蟄舌・蜷・婿蜷代ヶ繝ｭ繝・け謨ｰ
+Container for DD-alphaAMG setup data.
+
+Fields include block-orthonormalized test vectors, block geometry, optional
+precomputed coarse operators, reusable coarse GMRES work buffers, and GPU cache
+storage.
 """
 @inline _amg_device(::WF3x1GPU) = Val(:gpu)
 @inline _amg_device(::WF3x1CPU) = Val(:cpu)
@@ -151,9 +152,9 @@ end
 
 Coarse operator stored in block-stencil form on coarse grid DOFs:
 - onsite block: self[:, :, b]
-- nearest-neighbor links: plus[:, :, b, ﾎｼ], minus[:, :, b, ﾎｼ]  (ﾎｼ=1..4)
+- nearest-neighbor links: plus[:, :, b, mu], minus[:, :, b, mu]  (mu=1..4)
 
-Each block matrix has size Nvﾃ湧v, and total coarse size is Nv*Nblocks.
+Each block matrix has size Nv x Nv, and total coarse size is Nv*Nblocks.
 """
 mutable struct CoarseStencilOperator
     Nv::Int
@@ -225,7 +226,7 @@ function apply_coarse_stencil!(out::CoarseVector, op::CoarseStencilOperator, x::
             out.data[dst_base + i] += acc
         end
 
-        # +/竏・nearest neighbors: dst = nb_plus/minus(bs, mu)
+        # +//-nearest neighbors: dst = nb_plus/minus(bs, mu)
         for mu in 1:4
             bp = op.nb_plus[bs, mu]
             bm = op.nb_minus[bs, mu]
@@ -270,7 +271,7 @@ end
 
 
 # ==========================================
-#  繝悶Ο繝・け繝ｦ繝ｼ繝・ぅ繝ｪ繝・ぅ
+#  Block utilities
 # ==========================================
 
 @inline function block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
@@ -469,12 +470,12 @@ function _amg_block_project_kernel!(x, bmap, nc_ng::Int32, total::Int32, bid_tar
     return nothing
 end
 
-function _amg_block_axpby_kernel!(y, x, bmap, nc_ng::Int32, total::Int32, bid_target::Int32, ﾎｱ, ﾎｲ)
+function _amg_block_axpby_kernel!(y, x, bmap, nc_ng::Int32, total::Int32, bid_target::Int32, α, β)
     idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if idx <= total
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         if bmap[site] == bid_target
-            @inbounds y[idx] = ﾎｱ * x[idx] + ﾎｲ * y[idx]
+            @inbounds y[idx] = α * x[idx] + β * y[idx]
         end
     end
     return nothing
@@ -1147,7 +1148,7 @@ end
 """
     block_project!(f, bx, by, bz, bt, r)
 
-繝悶Ο繝・け(bx,by,bz,bt)螟悶・蜈ｨ繧ｵ繧､繝医ｒ繧ｼ繝ｭ縺ｫ縺吶ｋ (in-place)縲・
+Keep only the selected block `(bx, by, bz, bt)` and zero all sites outside it.
 """
 function block_project!(f::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NX, NY, NZ, NT = f.NX, f.NY, f.NZ, f.NT
@@ -1180,8 +1181,8 @@ end
 """
     block_copy!(dest, src, bx, by, bz, bt, r)
 
-src 縺ｮ繝悶Ο繝・け(bx,by,bz,bt)蜀・・蛟､繧・dest 縺ｮ蜷後§菴咲ｽｮ縺ｫ繧ｳ繝斐・縺吶ｋ (in-place)縲・
-dest 縺ｮ繝悶Ο繝・け螟悶・螟画峩縺励↑縺・・
+Copy the selected block from `src` into the same block location of `dest`.
+Entries outside the selected block of `dest` are left unchanged.
 """
 function block_copy!(dest::WF3x1, src::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NC, NG = src.NC, src.NG
@@ -1208,7 +1209,7 @@ end
 """
     block_zero!(f, bx, by, bz, bt, r)
 
-f 縺ｮ繝悶Ο繝・け(bx,by,bz,bt)蜀・・蛟､繧偵ぞ繝ｭ縺ｫ縺吶ｋ (in-place)縲・
+Zero the selected block of `f` in place.
 """
 function block_zero!(f::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NC, NG = f.NC, f.NG
@@ -1233,11 +1234,11 @@ function block_zero!(f::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
 end
 
 """
-    block_axpby!(ﾎｱ, x, ﾎｲ, y, bx, by, bz, bt, r)
+    block_axpby!(α, x, β, y, bx, by, bz, bt, r)
 
-y[block] = ﾎｱ * x[block] + ﾎｲ * y[block] 繧偵ヶ繝ｭ繝・け蜀・〒縺ｮ縺ｿ螳溯｡・(in-place)縲・
+Apply `y[block] = α * x[block] + β * y[block]` only inside the selected block.
 """
-function block_axpby!(ﾎｱ, x::WF3x1, ﾎｲ, y::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
+function block_axpby!(α, x::WF3x1, β, y::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NC, NG = x.NC, x.NG
     @inbounds for lt = 1:r
         it = (bt-1)*r + lt
@@ -1250,7 +1251,7 @@ function block_axpby!(ﾎｱ, x::WF3x1, ﾎｲ, y::WF3x1, bx::Int, by::Int, bz::
                     for ig = 1:NG
                         @simd for ic = 1:NC
                             y[ic, ix, iy, iz, it, ig] =
-                                ﾎｱ * x[ic, ix, iy, iz, it, ig] + ﾎｲ * y[ic, ix, iy, iz, it, ig]
+                                α * x[ic, ix, iy, iz, it, ig] + β * y[ic, ix, iy, iz, it, ig]
                         end
                     end
                 end
@@ -1261,9 +1262,9 @@ function block_axpby!(ﾎｱ, x::WF3x1, ﾎｲ, y::WF3x1, bx::Int, by::Int, bz::
 end
 
 """
-    block_inner_product(x, y, bx, by, bz, bt, r) 竊・ComplexF64
+    block_inner_product(x, y, bx, by, bz, bt, r) -> ComplexF64
 
-繝悶Ο繝・け(bx,by,bz,bt)蜀・・縺ｿ縺ｮ蜀・ｩ・筺ｨx|y筺ｩ_B縲・
+Return the inner product restricted to the selected block.
 """
 function block_inner_product(x::WF3x1, y::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NC, NG = x.NC, x.NG
@@ -1331,13 +1332,13 @@ function block_zero!(f::WF3x1GPU, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     return f
 end
 
-function block_axpby!(ﾎｱ, x::WF3x1GPU, ﾎｲ, y::WF3x1GPU, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
+function block_axpby!(α, x::WF3x1GPU, β, y::WF3x1GPU, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     setup_like, cache = _gpu_block_context_from_field(y, r)
     nc_ng = Int32(size(y.f, 1) * size(y.f, 2))
     total = Int32(length(y.f))
     bid = _gpu_bid(setup_like, bx, by, bz, bt)
     @cuda threads=256 blocks=cld(Int(total), 256) _amg_block_axpby_kernel!(
-        reshape(y.f, :), reshape(x.f, :), cache[:bmap], nc_ng, total, bid, ﾎｱ, ﾎｲ)
+        reshape(y.f, :), reshape(x.f, :), cache[:bmap], nc_ng, total, bid, α, β)
     return y
 end
 
@@ -1353,29 +1354,32 @@ end
 
 
 # ==========================================
-#  ﾎｳ竄・繝ｦ繝ｼ繝・ぅ繝ｪ繝・ぅ (Chiral Splitting)
+#  Chiral Splitting
 # ==========================================
 
 """
-ﾎｳ竄・縺ｮ隨ｦ蜿ｷ縲ゅ％縺ｮ繧ｳ繝ｼ繝峨〒縺ｮ convention:
-  ﾎｳ竄・= diag(-1, -1, +1, +1)   (ig=1,2 竊・-1,  ig=3,4 竊・+1)
+    gamma5_sign(ig)
+
+Return the gamma5 sign for spin component `ig` using the convention
+`diag(-1, -1, +1, +1)`.
 """
 @inline gamma5_sign(ig::Int) = ig <= 2 ? -1 : 1
 
 """
     gamma5!(x::WF3x1)
 
-x 縺ｫ ﾎｳ竄・繧・in-place 縺ｧ驕ｩ逕ｨ: x 竊・ﾎｳ竄・x
+Apply gamma5 in place using the convention `diag(-1, -1, +1, +1)` for spin
+components `ig=1:4`.
 """
 function gamma5!(x::WF3x1)
     NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
     NC, NG = x.NC, x.NG
     @inbounds for it=1:NT, iz=1:NZ, iy=1:NY, ix=1:NX
         for ic=1:NC
-            # ig=1,2 竊・ﾃ・-1)
+            # ig=1,2 have gamma5 eigenvalue -1
             x[ic,ix,iy,iz,it,1] = -x[ic,ix,iy,iz,it,1]
             x[ic,ix,iy,iz,it,2] = -x[ic,ix,iy,iz,it,2]
-            # ig=3,4 縺ｯ ﾎｳ竄・+1 縺ｪ縺ｮ縺ｧ螟画峩荳崎ｦ・
+            # ig=3,4 have gamma5 eigenvalue +1 and are unchanged
         end
     end
     return x
@@ -1391,12 +1395,10 @@ end
 """
     chiral_project!(x::WF3x1, chirality::Symbol)
 
-繧ｫ繧､繝ｩ繝ｫ蟆・ｽｱ繧・in-place 縺ｧ驕ｩ逕ｨ:
-  :plus  竊・P竄・= (1+ﾎｳ竄・/2: ig=3,4 繧剃ｿ晄戟, ig=1,2 繧偵ぞ繝ｭ蛹・
-  :minus 竊・P竄・= (1-ﾎｳ竄・/2: ig=1,2 繧剃ｿ晄戟, ig=3,4 繧偵ぞ繝ｭ蛹・
+Project `x` in place onto one chiral sector.
 
-Note: ﾎｳ竄・diag(-1,-1,+1,+1) 縺ｪ縺ｮ縺ｧ
-  P竄・= diag(0,0,1,1),  P竄・= diag(1,1,0,0)
+- `:plus` keeps `ig=3,4` and zeros `ig=1,2`.
+- `:minus` keeps `ig=1,2` and zeros `ig=3,4`.
 """
 function chiral_project!(x::WF3x1, chirality::Symbol)
     NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
@@ -1404,11 +1406,11 @@ function chiral_project!(x::WF3x1, chirality::Symbol)
     @inbounds for it=1:NT, iz=1:NZ, iy=1:NY, ix=1:NX
         for ic=1:NC
             if chirality == :plus
-                # P竄・ zero out ig=1,2 (ﾎｳ竄・eigenvalue -1)
+                # P+ zeros ig=1,2 (gamma5 eigenvalue -1)
                 x[ic,ix,iy,iz,it,1] = zero(ComplexF64)
                 x[ic,ix,iy,iz,it,2] = zero(ComplexF64)
             else
-                # P竄・ zero out ig=3,4 (ﾎｳ竄・eigenvalue +1)
+                # P- zeros ig=3,4 (gamma5 eigenvalue +1)
                 x[ic,ix,iy,iz,it,3] = zero(ComplexF64)
                 x[ic,ix,iy,iz,it,4] = zero(ComplexF64)
             end
@@ -1426,14 +1428,14 @@ end
 
 
 # ==========================================
-#  繝悶Ο繝・け逶ｴ莠､豁｣隕丞喧 (Block Orthonormalization)
+#  Block Orthonormalization
 # ==========================================
 
 """
     block_orthonormalize!(vectors, r)
 
-蜷・ヶ繝ｭ繝・け蜀・〒繝・せ繝医・繧ｯ繝医Ν繧・Modified Gram-Schmidt 縺ｧ逶ｴ莠､豁｣隕丞喧縺吶ｋ縲・
-蜃ｦ逅・ｾ・ 蜷・ヶ繝ｭ繝・けB縺ｫ縺､縺・※ 筺ｨﾏ違ｵ｢|ﾏ遺ｱｼ筺ｩ_B = ﾎｴ盞｢箜ｼ
+Block-orthonormalize the test vectors with modified Gram-Schmidt.
+For each block B, enforce `<phi_i | phi_j>_B = delta_ij`.
 """
 function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
     if vectors[1] isa WF3x1GPU
@@ -1463,11 +1465,11 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
     NBX = NX ÷ r; NBY = NY ÷ r; NBZ = NZ ÷ r; NBT = NT ÷ r
     block_dof = r^4 * NC * NG
 
-    # 繝ｭ繝ｼ繧ｫ繝ｫ繝舌ャ繝輔ぃ繧剃ｺ句燕遒ｺ菫・(繝悶Ο繝・け豈弱↓蜀榊茜逕ｨ)
+    # Preallocate local buffers reused for each block.
     local_vecs = [Vector{ComplexF64}(undef, block_dof) for _ in 1:Nv]
 
     @inbounds for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
-        # 繝悶Ο繝・け蜀・ョ繝ｼ繧ｿ繧呈歓蜃ｺ
+        # Extract block-local data.
         for v = 1:Nv
             idx = 0
             for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
@@ -1494,7 +1496,7 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
             end
         end
 
-        # 譖ｸ縺肴綾縺・
+        # Write back.
         for v = 1:Nv
             idx = 0
             for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
@@ -1515,14 +1517,14 @@ end
 
 
 # ==========================================
-#  蛻ｶ髯先ｼ皮ｮ怜ｭ・(Restriction: fine 竊・coarse)
+#  Restriction: fine -> coarse
 # ==========================================
 
 """
-    restrict_f2c(setup, x) 竊・CoarseVector
+    restrict_f2c(setup, x) -> CoarseVector
 
-邏ｰ譬ｼ蟄舌・繧ｯ繝医Ν繧堤ｲ玲ｼ蟄舌↓蟆・ｽｱ:
-  v_coarse[B, i] = 筺ｨﾏ違ｵ｢|x筺ｩ_B  (繝悶Ο繝・けB蜀・・蜀・ｩ・
+Restrict a fine-grid vector to the coarse grid:
+`v_coarse[B, i] = <phi_i | x>_B`.
 """
 function restrict_f2c(setup::DDalphaAMG_Setup, x::WF3x1)
     if x isa WF3x1GPU
@@ -1557,9 +1559,9 @@ function restrict_f2c(setup::DDalphaAMG_Setup, x::WF3x1)
 end
 
 """
-    restrict_f2c!(cv, setup, x) 竊・CoarseVector
+    restrict_f2c!(cv, setup, x) -> CoarseVector
 
-restrict_f2c 縺ｮ in-place 迚医らｵ先棡繧・cv 縺ｫ譖ｸ縺崎ｾｼ繧縲・
+In-place version of `restrict_f2c`; writes the result into `cv`.
 """
 function restrict_f2c!(cv::CoarseVector, setup::DDalphaAMG_Setup, x::WF3x1)
     if x isa WF3x1GPU
@@ -1600,14 +1602,14 @@ end
 
 
 # ==========================================
-#  蟒ｶ髟ｷ貍皮ｮ怜ｭ・(Prolongation: coarse 竊・fine)
+#  Prolongation: coarse -> fine
 # ==========================================
 
 """
-    prolongate_c2f(setup, cv) 竊・WF3x1
+    prolongate_c2f(setup, cv) -> WF3x1
 
-邊玲ｼ蟄舌・繧ｯ繝医Ν繧堤ｴｰ譬ｼ蟄舌↓陬憺俣:
-  x(site) = ﾎ｣盞｢ c[B(site), i] * ﾏ違ｵ｢(site)
+Prolongate a coarse-grid vector to the fine grid:
+`x(site) = sum_i c[B(site), i] * phi_i(site)`.
 """
 function prolongate_c2f(setup::DDalphaAMG_Setup, cv::CoarseVector)
     if setup.test_vectors[1] isa WF3x1GPU
@@ -1642,9 +1644,9 @@ function prolongate_c2f(setup::DDalphaAMG_Setup, cv::CoarseVector)
 end
 
 """
-    prolongate_c2f!(f, setup, cv) 竊・WF3x1
+    prolongate_c2f!(f, setup, cv) -> WF3x1
 
-prolongate_c2f 縺ｮ in-place 迚医らｵ先棡繧・f 縺ｫ譖ｸ縺崎ｾｼ繧縲・
+In-place version of `prolongate_c2f`; writes the result into `f`.
 """
 function prolongate_c2f!(f::WF3x1, setup::DDalphaAMG_Setup, cv::CoarseVector)
     if f isa WF3x1GPU
@@ -1686,14 +1688,13 @@ end
 
 
 # ==========================================
-#  邊玲ｼ蟄先ｼ皮ｮ怜ｭ・(Coarse Grid Operator, matrix-free)
+#  Coarse Grid Operator, matrix-free
 # ==========================================
 
 """
-    coarse_apply(setup, D, cv) 竊・CoarseVector
+    coarse_apply(setup, D, cv) -> CoarseVector
 
-邊玲ｼ蟄織irac貍皮ｮ怜ｭ舌・驕ｩ逕ｨ: Dc = R ﾂｷ D ﾂｷ P
-  (Prolongate 竊・Apply D on fine grid 竊・Restrict)
+Apply the matrix-free coarse operator `Dc = R * D * P`.
 """
 function coarse_apply(setup::DDalphaAMG_Setup, D, cv::CoarseVector)
     fine_v = prolongate_c2f(setup, cv)
@@ -1703,12 +1704,10 @@ function coarse_apply(setup::DDalphaAMG_Setup, D, cv::CoarseVector)
 end
 
 """
-    coarse_apply!(result, setup, D, cv, fine_buf1, fine_buf2) 竊・CoarseVector
+    coarse_apply!(result, setup, D, cv, fine_buf1, fine_buf2) -> CoarseVector
 
-coarse_apply 縺ｮ in-place 迚医ゆｺ句燕遒ｺ菫昴＠縺・fine_buf1, fine_buf2 繧剃ｽ懈･ｭ繝舌ャ繝輔ぃ縺ｨ縺励※菴ｿ逕ｨ縺励・
-邨先棡繧・result 縺ｫ譖ｸ縺崎ｾｼ繧縲ゅΓ繝｢繝ｪ蜑ｲ繧雁ｽ薙※繧ｼ繝ｭ縲・
-  fine_buf1: prolongation 邨先棡逕ｨ
-  fine_buf2: D 驕ｩ逕ｨ邨先棡逕ｨ
+In-place coarse-operator application. `fine_buf1` stores the prolongated vector
+and `fine_buf2` stores the fine-grid Dirac application before restriction.
 """
 function coarse_apply!(result::CoarseVector, setup::DDalphaAMG_Setup, D, cv::CoarseVector,
                        fine_buf1::WF3x1, fine_buf2::WF3x1)
@@ -1720,14 +1719,15 @@ end
 
 
 # ==========================================
-#  邊玲ｼ蟄先ｼ皮ｮ怜ｭ舌・莠句燕險育ｮ・
+#  Coarse operator precomputation
 # ==========================================
 
 """
     precompute_coarse_operator!(setup, D; verbose=false, mode=:stencil)
 
-Build coarse operator in one of two forms:
-- `mode=:stencil` (default): block-stencil operator with Nvﾃ湧v couplings per block/neighbor.
+Build the coarse operator in one of two forms:
+
+- `mode=:stencil` (default): block-stencil operator with Nv x Nv couplings per block/neighbor.
 - `mode=:dense`: full dense matrix Dc (legacy path).
 """
 function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
@@ -1796,7 +1796,7 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
         if verbose
             nnz_blocks = Nblocks * (1 + 8)
             bytes_est = nnz_blocks * Nv * Nv * 16
-            println("  邊玲ｼ蟄先ｼ皮ｮ怜ｭ・stencil)繧剃ｺ句燕險育ｮ嶺ｸｭ... blocks=$(Nblocks), Nv=$(Nv), approx $(round(bytes_est/1024/1024, digits=1)) MB")
+            println("  precomputing coarse operator stencil... blocks=$(Nblocks), Nv=$(Nv), approx $(round(bytes_est/1024/1024, digits=1)) MB")
         end
 
         use_gpu = setup.test_vectors[1] isa WF3x1GPU
@@ -1862,7 +1862,7 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
         )
 
         if verbose
-            println("  邊玲ｼ蟄先ｼ皮ｮ怜ｭ・stencil)縺ｮ莠句燕險育ｮ怜ｮ御ｺ・")
+            println("  coarse operator stencil precompute done")
         end
         return setup
     elseif mode != :dense
@@ -1873,7 +1873,7 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
     end
 
     if verbose
-        println("  邊玲ｼ蟄先ｼ皮ｮ怜ｭ舌ｒ莠句燕險育ｮ嶺ｸｭ... ($(n)ﾃ・(n) 陦悟・, $(round(n*n*16/1024/1024, digits=1)) MB)")
+        println("  dense coarse operator precompute done")
     end
 
     Dc = zeros(ComplexF64, n, n)
@@ -1893,14 +1893,14 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
 
     setup.Dc_matrix = Dc
     if verbose
-        println("  邊玲ｼ蟄先ｼ皮ｮ怜ｭ舌・莠句燕險育ｮ怜ｮ御ｺ・")
+        println("  dense coarse operator precompute done")
     end
     return setup
 end
 
 
 # ==========================================
-#  繝ｩ繝ｳ繝繝繝輔ぉ繝ｫ繝溘が繝ｳ逕滓・ (Setup逕ｨ)
+#  Random fermion generation for setup
 # ==========================================
 
 function random_fermion!(x::WF3x1)
@@ -1926,15 +1926,14 @@ end
 
 
 # ==========================================
-#  繧ｹ繝繝ｼ繧ｶ繝ｼ (Smoothers)
+#  Smoothers
 # ==========================================
 
 """
     mr_smooth!(x, D, b; niter)
 
-Minimal Residual (MR) 繧ｹ繝繝ｼ繧ｶ繝ｼ縲・
-蜷・う繝・Ξ繝ｼ繧ｷ繝ｧ繝ｳ:
-  r = b - D*x,  ﾎｱ = 筺ｨD*r, r筺ｩ / 筺ｨD*r, D*r筺ｩ,  x += ﾎｱ*r
+Minimal Residual (MR) smoother. Each iteration computes
+`r = b - D*x`, `alpha = <D*r, r> / <D*r, D*r>`, then updates `x += alpha*r`.
 """
 function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4,
                     fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
@@ -1946,7 +1945,7 @@ function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4,
     for _ = 1:niter
         # r = b - D * x
         _amg_mul_dirac!(r, D, x; fine_apply_counter=fine_apply_counter)
-        axpby!(1, b, -1, r)  # r = b - D*x  竊・axpby!(1, b, -1, r) => r = 1*b + (-1)*r
+        axpby!(1, b, -1, r)  # r = b - D*x
         # Dr = D * r
         _amg_mul_dirac!(Dr, D, r; fine_apply_counter=fine_apply_counter)
         num = inner_product(Dr, r)
@@ -1954,8 +1953,8 @@ function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4,
         if abs(den) < 1e-30
             break
         end
-        ﾎｱ = num / den
-        axpby!(ﾎｱ, r, 1, x)
+        α = num / den
+        axpby!(α, r, 1, x)
     end
     return x
 end
@@ -1964,12 +1963,9 @@ end
 """
     sap_smooth!(x, D, b, setup; niter, nblock_mr)
 
-Schwarz Alternating Procedure (SAP) 繧ｹ繝繝ｼ繧ｶ繝ｼ縲・
-繝悶Ο繝・け豈弱↓繝ｭ繝ｼ繧ｫ繝ｫ Minimal Residual 繧ｹ繝・ャ繝励ｒ螳溯｡・(multiplicative Schwarz)縲・
-蜷・ヶ繝ｭ繝・け蜀・〒 Dirichlet B.C. 繧堤畑縺・．_BB * ﾎｴ 竕・r_B 繧定ｿ台ｼｼ逧・↓隗｣縺上・
-
-繝舌ャ繝輔ぃ繧剃ｺ句燕遒ｺ菫昴＠縲√ヶ繝ｭ繝・け繝ｫ繝ｼ繝怜・縺ｧ縺ｮ繝｡繝｢繝ｪ蜑ｲ繧雁ｽ薙※繧貞屓驕ｿ縲・
-蜀・ｩ阪・繝悶Ο繝・け繝ｭ繝ｼ繧ｫ繝ｫ縺ｧ險育ｮ励＠縲√ヵ繝ｫ譬ｼ蟄先ｼ皮ｮ励ｒ譛蟆丞喧縲・
+Schwarz Alternating Procedure (SAP) smoother. It sweeps over coarse blocks,
+applies local minimal-residual updates with block-local support, and accumulates
+the corrections into the fine-grid solution.
 """
 function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
                      niter::Int=1, nblock_mr::Int=4,
@@ -1983,23 +1979,23 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
     r_blk = setup.r
     NBX, NBY, NBZ, NBT = setup.NBX, setup.NBY, setup.NBZ, setup.NBT
 
-    # 繝舌ャ繝輔ぃ繧剃ｺ句燕遒ｺ菫晢ｼ医Ν繝ｼ繝怜・縺ｧ蜀榊茜逕ｨ・・
-    ﾎｴ      = similar(x)
+    # Preallocate reusable work buffers.
+    δ      = similar(x)
     local_r = similar(x)
     Alr    = similar(x)
     res    = similar(x)
 
     for _ = 1:niter
-        # 繧ｰ繝ｭ繝ｼ繝舌Ν谿句ｷｮ: res = b - D*x
+        # Global residual: res = b - D*x
         _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)           # res = D*x
-        axpby!(1, b, -1, res)     # res = b - D*x  竊・axpby!(1, b, -1, res) => res = 1*b + (-1)*res
+        axpby!(1, b, -1, res)     # res = b - D*x
 
         # Red-black SAP. Same-color blocks are independent for nearest-neighbor Wilson D.
         for color in 0:1
             for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
                 ((bx + by + bz + bt) & 1) == color || continue
 
-                block_zero!(ﾎｴ, bx, by, bz, bt, r_blk)
+                block_zero!(δ, bx, by, bz, bt, r_blk)
                 block_project!(local_r, bx, by, bz, bt, r_blk)
                 block_copy!(local_r, res, bx, by, bz, bt, r_blk)
 
@@ -2012,15 +2008,15 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
                     if abs(den) < 1e-30
                         break
                     end
-                    ﾎｱ = num / den
+                    α = num / den
 
-                    block_axpby!(ﾎｱ, local_r, 1, ﾎｴ, bx, by, bz, bt, r_blk)
-                    block_axpby!(-ﾎｱ, Alr, 1, local_r, bx, by, bz, bt, r_blk)
+                    block_axpby!(α, local_r, 1, δ, bx, by, bz, bt, r_blk)
+                    block_axpby!(-α, Alr, 1, local_r, bx, by, bz, bt, r_blk)
                 end
 
-                block_axpby!(1, ﾎｴ, 1, x, bx, by, bz, bt, r_blk)
-                block_project!(ﾎｴ, bx, by, bz, bt, r_blk)
-                _amg_mul_dirac!(Alr, D, ﾎｴ; fine_apply_counter=fine_apply_counter)
+                block_axpby!(1, δ, 1, x, bx, by, bz, bt, r_blk)
+                block_project!(δ, bx, by, bz, bt, r_blk)
+                _amg_mul_dirac!(Alr, D, δ; fine_apply_counter=fine_apply_counter)
                 axpby!(-1, Alr, 1, res)
             end
         end
@@ -2084,15 +2080,14 @@ end
 
 
 # ==========================================
-#  邊玲ｼ蟄・GMRES (Coarse Grid Solver)
+#  Coarse Grid Solver: GMRES
 # ==========================================
 
 """
-    coarse_gmres(setup, D, b_c; maxiter, restart, tol, coarse_apply_counter) 竊・CoarseVector
+    coarse_gmres(setup, D, b_c; maxiter, restart, tol, coarse_apply_counter) -> CoarseVector
 
-邊玲ｼ蟄蝉ｸ翫・ GMRES 繧ｽ繝ｫ繝舌・縲・c * x_c = b_c 繧定ｧ｣縺上・
-Dc 縺ｯ matrix-free 縺ｧ驕ｩ逕ｨ: Dc(v) = R ﾂｷ D ﾂｷ P(v)
-    coarse_apply_counter 縺梧ｸ｡縺輔ｌ縺溷ｴ蜷医∫ｲ玲ｼ蟄先ｼ皮ｮ怜ｭ・Dc 縺ｮ驕ｩ逕ｨ蝗樊焚繧貞刈邂励☆繧九・
+Solve the coarse-grid system `Dc * x_c = b_c` with GMRES. `Dc` is applied either
+through a precomputed coarse operator or matrix-free as `R * D * P`.
 """
 function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
                       maxiter::Int=50, restart::Int=20, tol::Float64=1e-1,
@@ -2106,7 +2101,7 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
     has_Dc = setup.Dc_matrix !== nothing
     has_stencil = setup.coarse_stencil !== nothing
 
-    # 莠句燕險育ｮ玲ｸ医∩陦悟・縺後↑縺・ｴ蜷医・縺ｿ邏ｰ譬ｼ蟄舌ヰ繝・ヵ繧｡繧堤｢ｺ菫・
+    # Allocate a fine-grid buffer only when no precomputed operator is available.
     local fine_buf1, fine_buf2
     if !has_Dc
         fine_buf1 = similar(setup.test_vectors[1])
@@ -2119,7 +2114,7 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
     H = setup._gmres_H
     e1 = setup._gmres_e1
 
-    # 邊玲ｼ蟄先ｼ皮ｮ怜ｭ宣←逕ｨ縺ｮ繝倥Ν繝代・
+    # Helper for coarse-operator application.
     @inline function apply_Dc!(w, v)
         if has_stencil
             apply_coarse_stencil!(w, setup.coarse_stencil, v)
@@ -2132,19 +2127,19 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
     end
 
     for _ = 1:maxiter
-        # 谿句ｷｮ: r = b - Dc*x
+        # residual: r = b - Dc*x
         r_c.data .= b_c.data
         apply_Dc!(w_c, x_c)
         coarse_axpby!(-1.0, w_c, 1.0, r_c)
 
-        ﾎｲ = coarse_norm(r_c)
-        if ﾎｲ / b_norm < tol
+        β = coarse_norm(r_c)
+        if β / b_norm < tol
             return x_c
         end
 
-        # Arnoldi 驕守ｨ・
+        # Arnoldi process
         fill!(H, zero(ComplexF64))
-        V[1].data .= r_c.data ./ ﾎｲ
+        V[1].data .= r_c.data ./ β
 
         j_final = m
         for j = 1:m
@@ -2164,16 +2159,16 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
             V[j+1].data .= w_c.data ./ H[j+1,j]
         end
 
-        # 譛蟆丈ｺ御ｹ怜撫鬘・ min ||ﾎｲ*e竄・- H*y||
+        # Least-squares solve: min ||beta*e1 - H*y||.
         fill!(e1, zero(ComplexF64))
-        e1[1] = ﾎｲ
+        e1[1] = β
         y = H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
 
         for k = 1:j_final
             coarse_axpby!(y[k], V[k], 1.0, x_c)
         end
 
-        # 蜿取據遒ｺ隱・
+        # Convergence check
         r_c.data .= b_c.data
         apply_Dc!(w_c, x_c)
         coarse_axpby!(-1.0, w_c, 1.0, r_c)
@@ -2193,13 +2188,14 @@ end
 """
     vcycle(D, b, setup; pre_smooth, post_smooth, coarse_tol, smoother)
 
-1蝗槭・繝槭Ν繝√げ繝ｪ繝・ラ V-cycle 繧貞ｮ溯｡後＠縲．*x 竕・b 縺ｮ霑台ｼｼ隗｣繧定ｿ斐☆縲・
+Apply one DD-alphaAMG V-cycle and return an approximate solution to `D*x = b`.
 
-1. Pre-smoothing (MR or SAP)
-2. 谿句ｷｮ繧堤ｲ玲ｼ蟄舌↓蟆・ｽｱ: r_c = R(b - D*x)
-3. 邊玲ｼ蟄舌〒 GMRES: Dc * e_c = r_c
-4. 陬懈ｭ｣繧堤ｴｰ譬ｼ蟄舌↓謌ｻ縺・ x += P(e_c)
-5. Post-smoothing
+Steps:
+1. Pre-smooth on the fine grid.
+2. Restrict the residual: `r_c = R * (b - D*x)`.
+3. Solve the coarse system `Dc * e_c = r_c` with GMRES.
+4. Prolongate and add the correction: `x += P * e_c`.
+5. Post-smooth on the fine grid.
 """
 function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 pre_smooth::Int=4, post_smooth::Int=4,
@@ -2224,17 +2220,17 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                    fine_apply_counter=fine_apply_counter)
     end
 
-    # 2. 谿句ｷｮ險育ｮ・竊・邊玲ｼ蟄舌↓蟆・ｽｱ
+    # 2. Compute residual and restrict it to the coarse grid.
     _amg_mul_dirac!(r_fine, D, x; fine_apply_counter=fine_apply_counter)       # r_fine = D*x
     axpby!(1, b, -1, r_fine) # r_fine = b - D*x
     restrict_f2c!(r_coarse, setup, r_fine)
 
-    # 3. 邊玲ｼ蟄先ｱりｧ｣
+    # 3. Coarse-grid solve.
     e_coarse = coarse_gmres(setup, D, r_coarse;
                             maxiter=coarse_maxiter, tol=coarse_tol,
                             coarse_apply_counter=coarse_apply_counter)
 
-    # 4. 邏ｰ譬ｼ蟄舌∈縺ｮ陬懈ｭ｣
+    # 4. Prolongate the correction to the fine grid.
     prolongate_c2f!(correction, setup, e_coarse)
     axpby!(1, correction, 1, x)
 
@@ -2252,17 +2248,15 @@ end
 
 
 # ==========================================
-#  FGMRES (Flexible GMRES) 螟夜Κ繧ｽ繝ｫ繝舌・
+#  FGMRES outer solver
 # ==========================================
 
 """
     fgmres(D, b, setup; x0, maxiter, restart, tol, verbose, smoother, ...)
 
-Flexible GMRES (V-cycle 繝励Μ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・莉倥″)縲・
-D*x = b 繧定ｧ｣縺上・
-
-FGMRES 縺ｯ蜷・う繝・Ξ繝ｼ繧ｷ繝ｧ繝ｳ縺ｧ逡ｰ縺ｪ繧九・繝ｪ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・繧定ｨｱ螳ｹ縺吶ｋ縺溘ａ縲・
-髱樒ｷ壼ｽ｢繝槭Ν繝√げ繝ｪ繝・ラ V-cycle 繧貞､牙虚繝励Μ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・縺ｨ縺励※菴ｿ逕ｨ蜿ｯ閭ｽ縲・
+Flexible GMRES outer solver for `D*x = b`, using the DD-alphaAMG V-cycle as a
+right preconditioner. Flexible GMRES allows the preconditioner to vary between
+iterations, which is useful for nonlinear or inexact V-cycles.
 """
 function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 x0::Union{Nothing,WF3x1}=nothing,
@@ -2281,21 +2275,21 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
     r = _copy_wf(b)  # r = b - D*x buffer
     zero_wf!(r)
 
-    total_coarse_gmres = 0  # coarse GMRES 蜻ｼ蜃ｺ縺怜屓謨ｰ繧ｫ繧ｦ繝ｳ繧ｿ
-    _coarse_apply_counter = Ref(0)  # 邊玲ｼ蟄先ｼ皮ｮ怜ｭ・Dc 驕ｩ逕ｨ蝗樊焚繧ｫ繧ｦ繝ｳ繧ｿ
+    total_coarse_gmres = 0  # coarse GMRES call counter
+    _coarse_apply_counter = Ref(0)  # coarse operator application counter
     _fine_apply_counter = Ref(0)
 
     for cycle = 1:maxiter
         # r = b - D * x
         _amg_mul_dirac!(r, D, x; fine_apply_counter=_fine_apply_counter)           # r = D*x
-        axpby!(1, b, -1, r)     # r = b - D*x  竊・axpby!(1, b, -1, r) => r = 1*b + (-1)*r
-        ﾎｲ = sqrt(real(inner_product(r, r)))
+        axpby!(1, b, -1, r)     # r = b - D*x
+        β = sqrt(real(inner_product(r, r)))
 
         if verbose
-            println("FGMRES cycle $cycle: relative residual = $(ﾎｲ/b_norm)")
+            println("FGMRES cycle $cycle: relative residual = $(β/b_norm)")
         end
 
-        if ﾎｲ / b_norm < tol
+        if β / b_norm < tol
             if verbose
                 println("FGMRES converged! ($(cycle) cycles)")
                 println("  Total coarse GMRES calls: $total_coarse_gmres")
@@ -2313,14 +2307,14 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         cs = zeros(ComplexF64, m)
         sn = zeros(ComplexF64, m)
         g  = zeros(ComplexF64, m + 1)
-        g[1] = ﾎｲ
+        g[1] = β
 
-        V[1] = r / ﾎｲ
+        V[1] = r / β
 
         j_final = m
         converged = false
         for j = 1:m
-            # V-cycle 繝励Μ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・: M竅ｻﾂｹ * v_j
+            # V-cycle preconditioner: apply M^{-1} * v_j.
             Z[j] = vcycle(D, V[j], setup;
                           pre_smooth=pre_smooth, post_smooth=post_smooth,
                           coarse_tol=coarse_tol, smoother=smoother,
@@ -2386,7 +2380,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
             y[i] /= H[i,i]
         end
 
-        # 隗｣縺ｮ譖ｴ譁ｰ: x += Z * y
+        # Update solution: x += Z * y.
         for k = 1:j_final
             axpby!(y[k], Z[k], 1, x)
         end
@@ -2417,37 +2411,35 @@ end
 
 
 # ==========================================
-#  繧ｻ繝・ヨ繧｢繝・・ (Full Setup)
+#  Full setup
 # ==========================================
 
 """
-    setup_DDalphaAMG(D, template, r, Nv; nsmooth, verbose, smoother, ...) 竊・DDalphaAMG_Setup
+    setup_DDalphaAMG(D, template, r, Nv; nsmooth, verbose, smoother, ...) -> DDalphaAMG_Setup
 
-DD-ﾎｱAMG 縺ｮ螳悟・繧ｻ繝・ヨ繧｢繝・・繧定｡後≧縲・
+Build a complete DD-alphaAMG setup.
 
-謇矩・
-1. 繝ｩ繝ｳ繝繝繝・せ繝医・繧ｯ繝医Ν繧・Nv 蛟狗函謌・
-2. 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｧ菴弱Δ繝ｼ繝画・蛻・ｒ蠑ｷ蛹・(D*ﾏ・竕・0 縺ｮ霑台ｼｼ豎りｧ｣)
-3. 繝悶Ο繝・け逶ｴ莠､豁｣隕丞喧
+Steps:
+1. Generate `Nv` random test vectors, unless `coarse_vectors` are provided.
+2. Smooth them so they approximate low modes (`D*psi ~= 0`).
+3. Optionally split by chirality.
+4. Block-orthonormalize the vectors.
+5. Precompute the coarse operator.
 
-蠑墓焚:
-- D: Dirac 貍皮ｮ怜ｭ・(Wilson_Dirac_operator 遲・
-- template: 譬ｼ蟄舌し繧､繧ｺ蜿ら・逕ｨ縺ｮ WF3x1
-- r: 蜷・婿蜷代・繝悶Ο繝・け繧ｵ繧､繧ｺ (NX,NY,NZ,NT 縺・r 縺ｧ蜑ｲ繧雁・繧後ｋ縺薙→)
-- Nv: 繝・せ繝医・繧ｯ繝医Ν謨ｰ (謗ｨ螂ｨ: 20縲・0)
-- nsmooth: 繧ｻ繝・ヨ繧｢繝・・繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｮ蜿榊ｾｩ謨ｰ (繝・ヵ繧ｩ繝ｫ繝・ 8)
-- smoother: :mr (繝・ヵ繧ｩ繝ｫ繝・, :sap, :vcycle
-  - :mr  窶・MR 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｮ縺ｿ
-  - :sap 窶・SAP 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｮ縺ｿ
-  - :vcycle 窶・MR 縺ｧ莠亥ｙ繧ｻ繝・ヨ繧｢繝・・蠕後〃-cycle 縺ｧ邊玲ｼ蟄先ｮ句ｷｮ謌仙・繧貞ｼｷ隱ｿ
-- nvcycle: V-cycle 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｮ蜿榊ｾｩ謨ｰ (smoother=:vcycle 譎ゅ√ョ繝輔か繝ｫ繝・ 4)
-- vcycle_pre_smooth, vcycle_post_smooth: V-cycle 蜀・・繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ蝗樊焚 (繝・ヵ繧ｩ繝ｫ繝・ 蜷・)
+Arguments:
+- `D`: Dirac operator.
+- `template`: WF3x1 field used for lattice/layout information.
+- `r`: block size in each direction.
+- `Nv`: number of test vectors.
+- `nsmooth`: setup smoothing iterations.
+- `smoother`: `:mr`, `:sap`, or `:vcycle`.
+- `nvcycle`: adaptive V-cycle setup iterations when `smoother=:vcycle`.
+- `vcycle_pre_smooth`, `vcycle_post_smooth`: V-cycle smoothing counts.
 
-菴ｿ逕ｨ萓・
+Example:
 ```julia
 setup = setup_DDalphaAMG(D, x, 2, 24; nsmooth=16)
-setup = setup_DDalphaAMG(D, x, 2, 24; smoother=:vcycle, nsmooth=8, nvcycle=4)
-x = solve_DDalphaAMG(D, b, setup; tol=1e-10)
+solution = solve_DDalphaAMG(D, b, setup; tol=1e-10)
 ```
 """
 function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
@@ -2487,7 +2479,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         println("  coarse dof: $(Nblocks * Nv)")
     end
 
-    # 1. 繝ｩ繝ｳ繝繝繝・せ繝医・繧ｯ繝医Ν逕滓・
+    # 1. Generate or load test vectors.
     if coarse_vectors !== nothing
         @assert length(coarse_vectors) == Nv "length(coarse_vectors) must match Nv"
         # Keep caller-provided vectors immutable from the setup's point of view.
@@ -2503,7 +2495,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             random_fermion!(test_vectors[v])
         end
 
-        # 2. 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ: D*ﾏ・竕・0 繧定ｿ台ｼｼ豎りｧ｣ 竊・菴弱Δ繝ｼ繝画・蛻・歓蜃ｺ
+        # 2. Smooth test vectors so they approximate low modes.
         zero_rhs = similar(template)
         zero_wf!(zero_rhs)
 
@@ -2582,7 +2574,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             if verbose
                 println("  smoothing test vectors with SAP ($nsmooth iterations)...")
             end
-            # SAP 縺ｫ縺ｯ繧ｻ繝・ヨ繧｢繝・・縺悟ｿ・ｦ・竊・縺ｾ縺壻ｻｮ繧ｻ繝・ヨ繧｢繝・・繧呈ｧ狗ｯ・
+            # SAP needs a temporary setup for block-local smoothing.
             block_orthonormalize!(test_vectors, r)
             pre_setup = DDalphaAMG_Setup{typeof(template)}(
                 test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
@@ -2593,7 +2585,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             for v in 1:Nv_smooth
                 sap_smooth!(test_vectors[v], D, zero_rhs, pre_setup; niter=1, nblock_mr=nsmooth)
             end
-        else  # :mr (繝・ヵ繧ｩ繝ｫ繝・
+        else  # :mr (default)
             if verbose
                 println("  smoothing test vectors with MR ($nsmooth iterations)...")
             end
@@ -2605,7 +2597,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
 
 
 
-    # 2.5. 繧ｫ繧､繝ｩ繝ｫ蛻・牡 (chiral splitting)
+    # 2.5. Chiral splitting
     if use_chirality && coarse_vectors === nothing
         if verbose
             println("  applying chiral split...")
@@ -2615,24 +2607,24 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         # First half -> P+ sector, second half -> P- sector.
         for v in 1:half
             chiral_vectors[v] = _copy_wf(test_vectors[v])
-            chiral_project!(chiral_vectors[v], :plus)   # ig=3,4 菫晄戟
+            chiral_project!(chiral_vectors[v], :plus)   # keep ig=3,4
         end
         for v in 1:half
             chiral_vectors[half + v] = _copy_wf(test_vectors[half + v])
-            chiral_project!(chiral_vectors[half + v], :minus)    # ig=1,2 菫晄戟
+            chiral_project!(chiral_vectors[half + v], :minus)    # keep ig=1,2
         end
         test_vectors = chiral_vectors
     end
 
-    # 3. 繝悶Ο繝・け逶ｴ莠､豁｣隕丞喧
+    # 3. Block orthonormalization
     if verbose
         println("  block orthonormalizing...")
     end
     if use_chirality
-        # P竄・縺ｨ P竄・繧ｻ繧ｯ繧ｿ繝ｼ繧貞挨縲・↓逶ｴ莠､豁｣隕丞喧 竊・繧ｫ繧､繝ｩ繝ｫ讒矩繧剃ｿ晄戟
+        # Orthonormalize the P+ and P- sectors separately to preserve chirality.
         half = Nv ÷ 2
-        plus_vectors  = test_vectors[1:half]       # P竄・(ig=3,4)
-        minus_vectors = test_vectors[half+1:end]   # P竄・(ig=1,2)
+        plus_vectors  = test_vectors[1:half]       # P±(ig=3,4)
+        minus_vectors = test_vectors[half+1:end]   # P±(ig=1,2)
         block_orthonormalize!(plus_vectors, r)
         block_orthonormalize!(minus_vectors, r)
     else
@@ -2646,7 +2638,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
     )
 
-    # 邊玲ｼ蟄先ｼ皮ｮ怜ｭ舌ｒ莠句燕險育ｮ・
+    # Precompute the coarse operator.
     precompute_coarse_operator!(setup, D; verbose=verbose, mode=:direct_stencil)
 
     if verbose
@@ -2658,29 +2650,22 @@ end
 
 
 # ==========================================
-#  螳悟・繧ｽ繝ｫ繝舌・ (Full Solve)
+#  Full solve
 # ==========================================
 
 """
     solve_DDalphaAMG(D, b, setup; x0, tol, maxiter, restart, verbose, smoother, ...)
 
-DD-ﾎｱAMG 繧堤畑縺・※ D*x = b 繧定ｧ｣縺上・
-FGMRES 螟夜Κ繧ｽ繝ｫ繝舌・ + V-cycle 繝励Μ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・繧剃ｽｿ逕ｨ縲・
+Solve `D*x = b` using DD-alphaAMG: FGMRES as the outer solver and a V-cycle as
+the preconditioner.
 
-蠑墓焚:
-- D: Dirac 貍皮ｮ怜ｭ・
-- b: 蜿ｳ霎ｺ繝吶け繝医Ν (WF3x1)
-- setup: DDalphaAMG_Setup (setup_DDalphaAMG 縺ｧ逕滓・)
-- tol: 蜿取據險ｱ螳ｹ隱､蟾ｮ (繝・ヵ繧ｩ繝ｫ繝・ 1e-10)
-- smoother: :mr (Minimal Residual, 繝・ヵ繧ｩ繝ｫ繝・ 縺ｾ縺溘・ :sap (Schwarz Alternating Procedure)
-- pre_smooth, post_smooth: 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ蜿榊ｾｩ謨ｰ (繝・ヵ繧ｩ繝ｫ繝・ 蜷・)
-
-菴ｿ逕ｨ萓・
-```julia
-setup = setup_DDalphaAMG(D, x, 2, 24)
-solution = solve_DDalphaAMG(D, b, setup; tol=1e-10, smoother=:mr)
-residual = norm2(D * solution - b)
-```
+Arguments:
+- `D`: Dirac operator.
+- `b`: right-hand side vector.
+- `setup`: `DDalphaAMG_Setup` from `setup_DDalphaAMG`.
+- `tol`: relative residual tolerance.
+- `smoother`: `:mr` or `:sap` for fine-grid smoothing.
+- `pre_smooth`, `post_smooth`: smoothing counts inside the V-cycle.
 """
 function solve_DDalphaAMG(D, b::WF3x1, setup::DDalphaAMG_Setup;
                           x0::Union{Nothing,WF3x1}=nothing,
@@ -2778,20 +2763,14 @@ end
 
 
 # ==========================================
-#  Deflation: 蛻晄悄謗ｨ螳壹・繧ｯ繝医Ν逕滓・
+#  Deflation initial guess
 # ==========================================
 """
     deflated_initial_guess(D, b, test_vectors; verbose=false)
 
-繝・せ繝医・繧ｯ繝医Ν {v_i} 縺九ｉ蟆・ｽｱ陦悟・ G[i,j] = 筺ｨv_i, D v_j筺ｩ 繧呈ｧ狗ｯ峨＠縲・
-蝗ｺ譛牙､蛻・ｧ｣ G = U ﾎ・U窶 繧定｡後▲縺ｦ縲‥eflation 蛻晄悄謗ｨ螳壹ｒ逕滓・縺吶ｋ縲・
-
-謇矩・
-1. G[i,j] = 筺ｨv_i, D v_j筺ｩ,  rhs[i] = 筺ｨv_i, b筺ｩ
-2. 蝗ｺ譛牙､蛻・ｧ｣:  G = U ﾎ・U窶
-3. 蝗ｺ譛牙､蝓ｺ蠎輔〒縺ｮ蟆・ｽｱ:  ﾎｱ_k = (U窶 rhs)_k / ﾎｻ_k
-4. 蜈・・蝓ｺ蠎輔↓謌ｻ縺・  c = U ﾎｱ
-5. x竄 = ﾎ｣_j c_j v_j
+Build a deflated initial guess from test vectors. It forms
+`G[i,j] = <v_i, D*v_j>` and `rhs[i] = <v_i, b>`, solves `G*c = rhs`, and returns
+`x0 = sum_j c_j * v_j`.
 """
 function _assert_same_wf_layout(label_a, a::WF3x1, label_b, b::WF3x1)
     typeof(a) == typeof(b) ||
@@ -2835,10 +2814,10 @@ function deflated_initial_guess(D, b::WF3x1, test_vectors::Vector{T};
         rhs[j] = inner_product(test_vectors[j], b)
     end
 
-    # G c = rhs 繧定ｧ｣縺・
+    # Solve G*c = rhs.
     c = G \ rhs
 
-    # x竄 = ﾎ｣ c_j v_j
+    # x0 = Σ c_j v_j
     x0 = similar(b)
     zero_wf!(x0)
     for j in 1:Nv

@@ -130,6 +130,9 @@ function _default_lmp_paths(max_len::Int=4)
 
     dirs = [1, 2, 3, 4, -1, -2, -3, -4]
     lengths = [2^k for k in 1:floor(Int, log2(max_len))]
+    if !(max_len in lengths)
+        push!(lengths, max_len)
+    end
     for d in dirs, len in lengths
         push!(P, Paths([fill(d, len)]))
     end
@@ -147,7 +150,7 @@ function build_lmp_32pt_layers(U, x, D; max_len::Int=4, init_gpu::Bool=true)
     P = _default_lmp_paths(max_len)
     pl = length(P)
 
-    dl = DenseLinearLayer(1, 25, true)
+    dl = DenseLinearLayer(1, pl, true)
     PT_layers = [PTLayer(P, U, pl) for _ in 1:32]
     PT32 = PTLayer(P, U, 4)
 
@@ -173,15 +176,22 @@ function build_lmp_32pt_layers(U, x, D; max_len::Int=4, init_gpu::Bool=true)
     return layers
 end
 
+function _infer_lmp_max_len_from_path(path::AbstractString, fallback::Int=4)
+    m = match(r"maxlen(\d+)", basename(path))
+    m === nothing && return fallback
+    return parse(Int, m.captures[1])
+end
+
 """
-    load_lmp_model(path; layers=nothing, opt=Adam(), gpu=false, U=nothing, x=nothing, D=nothing)
+    load_lmp_model(path; layers=nothing, opt=Adam(), gpu=false, U=nothing, x=nothing, D=nothing, max_len=nothing)
 
 Loads either legacy checkpoints that contain a `"layers"` key or newer W-only
 checkpoints created by `save_checkpoint`.
 
 Legacy files return their stored layers directly. W-only checkpoints need a live
 `layers` object with the same architecture, or `U`, `x`, and `D` so the standard
-32-PT Ritz architecture can be created automatically.
+32-PT Ritz architecture can be created automatically. If `max_len` is not given,
+W-only checkpoints infer it from filenames like `maxlen5`, falling back to 4.
 """
 function load_lmp_model(path::AbstractString;
                         layers=nothing,
@@ -190,7 +200,7 @@ function load_lmp_model(path::AbstractString;
                         U=nothing,
                         x=nothing,
                         D=nothing,
-                        max_len::Int=4)
+                        max_len=nothing)
     keys_in_file = JLD2.jldopen(path, "r") do f
         Set(String.(keys(f)))
     end
@@ -206,7 +216,8 @@ function load_lmp_model(path::AbstractString;
     if "opt_t" in keys_in_file
         if layers === nothing
             if U !== nothing && x !== nothing && D !== nothing
-                layers = build_lmp_32pt_layers(U, x, D; max_len=max_len)
+                inferred_max_len = max_len === nothing ? _infer_lmp_max_len_from_path(path) : max_len
+                layers = build_lmp_32pt_layers(U, x, D; max_len=inferred_max_len)
             else
                 ks = sort!(collect(keys_in_file))
                 preview = join(ks[1:min(end, 8)], ", ")
