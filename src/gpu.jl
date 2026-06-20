@@ -1115,8 +1115,205 @@ function blockscalar_gradient_gpu!(layer, z::AbstractVector, d::AbstractVector)
     return grad
 end
 
+function _sync_blockmatrix_W_gpu!(layer; upload::Bool=true)
+    cache = layer._gpu_w_buf
+    if !(cache isa Dict) || !haskey(cache, :W) || size(cache[:W]) != size(layer.W)
+        sites, counts = _blockscalar_sites_by_block(layer._gpu_block_map, size(layer.W, 1))
+        cache = Dict{Symbol,Any}(
+            :W => CuArray(layer.W),
+            :bmap => CuArray(Int32.(layer._gpu_block_map)),
+            :block_sites => CuArray(sites),
+            :block_counts => CuArray(counts),
+            :grad => nothing,
+            :adam_m => nothing,
+            :adam_v => nothing,
+        )
+        layer._gpu_w_buf = cache
+    elseif upload
+        copyto!(cache[:W], layer.W)
+    end
+    return cache[:W], cache[:bmap], cache
+end
+
+function _blockmatrix_apply_kernel!(
+    out::CuDeviceVector{ComplexF64},
+    xs::CuDeviceVector{ComplexF64},
+    W::CuDeviceArray{ComplexF64,3},
+    bmap::CuDeviceVector{Int32},
+    nc_ng::Int32,
+    field_len::Int32,
+    total::Int32,
+    nin::Int32,
+    o::Int32,
+    residual::Bool,
+)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if tid <= total
+        site = ((tid - Int32(1)) % field_len) ÷ nc_ng + Int32(1)
+        bid = bmap[site]
+        s = ComplexF64(0.0)
+        for i in Int32(1):nin
+            s += W[bid, o, i] * xs[(i - Int32(1)) * field_len + tid]
+        end
+        if residual && o <= nin
+            s += xs[(o - Int32(1)) * field_len + tid]
+        end
+        out[tid] = s
+    end
+    return nothing
+end
+
+function blockmatrix_apply_gpu!(out::AbstractVector, x::AbstractVector,
+                                W::CuArray{ComplexF64,3}, bmap::CuArray{Int32,1},
+                                residual::Bool)
+    nout = size(W, 2)
+    nin = size(W, 3)
+    field_len = Int32(length(x[1].f))
+    xs = CUDA.zeros(ComplexF64, Int(field_len) * nin)
+    for i in 1:nin
+        copyto!(view(xs, (i-1)*Int(field_len)+1:i*Int(field_len)), reshape(x[i].f, :))
+    end
+    total = field_len
+    for o in 1:nout
+        @cuda threads=256 blocks=cld(Int(total), 256) _blockmatrix_apply_kernel!(
+            reshape(out[o].f, :), xs, W, bmap,
+            Int32(size(x[1].f, 1) * size(x[1].f, 2)), field_len, total,
+            Int32(nin), Int32(o), residual)
+    end
+    return out
+end
+
+function _blockmatrix_delta_kernel!(
+    out::CuDeviceVector{ComplexF64},
+    ds::CuDeviceVector{ComplexF64},
+    W::CuDeviceArray{ComplexF64,3},
+    bmap::CuDeviceVector{Int32},
+    nc_ng::Int32,
+    field_len::Int32,
+    total::Int32,
+    nout::Int32,
+    i::Int32,
+    residual::Bool,
+)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if tid <= total
+        site = ((tid - Int32(1)) % field_len) ÷ nc_ng + Int32(1)
+        bid = bmap[site]
+        s = ComplexF64(0.0)
+        for o in Int32(1):nout
+            s += W[bid, o, i] * ds[(o - Int32(1)) * field_len + tid]
+        end
+        if residual && i <= nout
+            s += ds[(i - Int32(1)) * field_len + tid]
+        end
+        out[tid] = s
+    end
+    return nothing
+end
+
+function blockmatrix_delta_gpu!(out::AbstractVector, d::AbstractVector,
+                                W::CuArray{ComplexF64,3}, bmap::CuArray{Int32,1},
+                                residual::Bool)
+    nout = size(W, 2)
+    nin = size(W, 3)
+    field_len = Int32(length(d[1].f))
+    ds = CUDA.zeros(ComplexF64, Int(field_len) * nout)
+    for o in 1:nout
+        copyto!(view(ds, (o-1)*Int(field_len)+1:o*Int(field_len)), reshape(d[o].f, :))
+    end
+    total = field_len
+    for i in 1:nin
+        @cuda threads=256 blocks=cld(Int(total), 256) _blockmatrix_delta_kernel!(
+            reshape(out[i].f, :), ds, W, bmap,
+            Int32(size(d[1].f, 1) * size(d[1].f, 2)), field_len, total,
+            Int32(nout), Int32(i), residual)
+    end
+    return out
+end
+
+function _blockmatrix_grad_by_block_kernel!(
+    grad::CuDeviceArray{ComplexF64,3},
+    z::CuDeviceVector{ComplexF64},
+    d::CuDeviceVector{ComplexF64},
+    block_sites::CuDeviceMatrix{Int32},
+    block_counts::CuDeviceVector{Int32},
+    nc_ng::Int32,
+    o_arg::Int32,
+    i_arg::Int32,
+)
+    bid = Int32(blockIdx().x)
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
+
+    s = ComplexF64(0.0)
+    count = block_counts[bid]
+    p = tid
+    while p <= count
+        site = block_sites[p, bid]
+        base = (site - Int32(1)) * nc_ng
+        for j in Int32(1):nc_ng
+            @inbounds s += d[base + j] * z[base + j]
+        end
+        p += bsz
+    end
+    @inbounds sh[tid] = s
+    sync_threads()
+
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            @inbounds sh[tid] += sh[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+
+    if tid == Int32(1)
+        @inbounds grad[bid, o_arg, i_arg] = conj(sh[Int32(1)])
+    end
+    return nothing
+end
+
+function blockmatrix_gradient_gpu!(layer, z::AbstractVector, d::AbstractVector)
+    cache = layer._gpu_w_buf
+    if !(cache isa Dict) || !haskey(cache, :bmap)
+        sites, counts = _blockscalar_sites_by_block(layer._gpu_block_map, size(layer.W, 1))
+        cache = Dict{Symbol,Any}(
+            :W => CuArray(layer.W),
+            :bmap => CuArray(Int32.(layer._gpu_block_map)),
+            :block_sites => CuArray(sites),
+            :block_counts => CuArray(counts),
+            :grad => nothing,
+            :adam_m => nothing,
+            :adam_v => nothing,
+        )
+        layer._gpu_w_buf = cache
+    end
+    nblocks, nout, nin = size(layer.W)
+    if !haskey(cache, :block_sites) || cache[:block_sites] === nothing || size(cache[:block_sites], 2) != nblocks
+        sites, counts = _blockscalar_sites_by_block(layer._gpu_block_map, nblocks)
+        cache[:block_sites] = CuArray(sites)
+        cache[:block_counts] = CuArray(counts)
+    end
+    if !haskey(cache, :grad) || cache[:grad] === nothing || size(cache[:grad]) != (nblocks, nout, nin)
+        cache[:grad] = CUDA.zeros(ComplexF64, nblocks, nout, nin)
+    end
+    grad = cache[:grad]
+
+    fref = z[1].f
+    nc_ng = Int32(size(fref, 1) * size(fref, 2))
+    for o in 1:nout, i in 1:nin
+        @cuda threads=256 blocks=(nblocks, 1) shmem=(256 * sizeof(ComplexF64)) _blockmatrix_grad_by_block_kernel!(
+            grad, reshape(z[i].f, :), reshape(d[o].f, :),
+            cache[:block_sites], cache[:block_counts], nc_ng, Int32(o), Int32(i))
+    end
+    return grad
+end
+
 export _build_block_weight_gpu, _init_gpu_block_cache!, _update_block_weight_gpu!
 export _sync_blockscalar_W_gpu!, blockscalar_apply_gpu!, blockscalar_gradient_gpu!
+export _sync_blockmatrix_W_gpu!, blockmatrix_apply_gpu!, blockmatrix_delta_gpu!, blockmatrix_gradient_gpu!
 
 
 # ============================================================

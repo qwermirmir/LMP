@@ -9,7 +9,7 @@ import ..Layer_types: CPTC_Layer, PTC_Layer, Layer, ActivationFunction, Identity
 import ..elementry_base: AbstractSpinMatrix
 import ..Layer_types: PrallelTransportAttention_Layer,siteweight_Layer,Dirac_Layer,RayleighQuotient_Layer,HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer
 import ..Layer_types: fermionfield_Layer
-import ..Layer_types: BlockScalar_Layer
+import ..Layer_types: BlockScalar_Layer, BlockMatrix_Layer
 
 import ..gpu: gpu_adam_update!, blockscalar_adam_update!, sync_W_from_gpu!, sync_W_to_gpu!, Spin_matrix_GPU, zero_wf!
 
@@ -750,6 +750,55 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad)
     return update!(layer, opt, grad::Matrix{ComplexF64})
 end
 
+function update!(layer::BlockMatrix_Layer, opt::Adam, grad::Array{ComplexF64,3})
+    opt.t += 1
+    for idx in eachindex(layer.W)
+        re_key = objectid(layer) + UInt(2idx - 1)
+        st_re = get!(opt.scalar_state, re_key) do
+            AdamState{Float64}(0.0, 0.0)
+        end
+        g_re = real(grad[idx])
+        st_re.m = opt.β1 * st_re.m + (1 - opt.β1) * g_re
+        st_re.v = opt.β2 * st_re.v + (1 - opt.β2) * g_re^2
+        m_hat_re = st_re.m / (1 - opt.β1^opt.t)
+        v_hat_re = st_re.v / (1 - opt.β2^opt.t)
+        Δ_re = opt.α * m_hat_re / (sqrt(v_hat_re) + opt.ε)
+
+        im_key = objectid(layer) + UInt(2idx)
+        st_im = get!(opt.scalar_state, im_key) do
+            AdamState{Float64}(0.0, 0.0)
+        end
+        g_im = imag(grad[idx])
+        st_im.m = opt.β1 * st_im.m + (1 - opt.β1) * g_im
+        st_im.v = opt.β2 * st_im.v + (1 - opt.β2) * g_im^2
+        m_hat_im = st_im.m / (1 - opt.β1^opt.t)
+        v_hat_im = st_im.v / (1 - opt.β2^opt.t)
+        Δ_im = opt.α * m_hat_im / (sqrt(v_hat_im) + opt.ε)
+
+        layer.W[idx] -= complex(Δ_re, Δ_im)
+    end
+end
+
+function update!(layer::BlockMatrix_Layer, opt::Adam, grad)
+    if grad isa AbstractVector && !isempty(grad) && grad[1] isa CuArray
+        opt.t += 1
+        cache = layer._gpu_w_buf
+        if !(cache isa Dict) || !haskey(cache, :W)
+            error("BlockMatrix_Layer GPU weights are not initialized. Run the GPU forward pass before update!.")
+        end
+        W_gpu = cache[:W]
+        grad_gpu = grad[1]
+        if !haskey(cache, :adam_m) || cache[:adam_m] === nothing || size(cache[:adam_m]) != size(W_gpu)
+            cache[:adam_m] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+            cache[:adam_v] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+        end
+        blockscalar_adam_update!(W_gpu, cache[:adam_m], cache[:adam_v], grad_gpu,
+                                 opt.α, opt.β1, opt.β2, opt.ε, opt.t)
+        return layer
+    end
+    return update!(layer, opt, grad::Array{ComplexF64,3})
+end
+
 
 """
     sync_layers!(layers)
@@ -797,6 +846,27 @@ function _warm_gpu_adam!(layer::Union{DenseLinearLayer,PTLayer}, opt::Adam)
 end
 
 function _warm_blockscalar_adam!(layer::BlockScalar_Layer, opt::Adam)
+    cache = layer._gpu_w_buf
+    (!(cache isa Dict) || !haskey(cache, :W)) && return nothing
+    W_gpu = cache[:W]
+    if !haskey(cache, :adam_m) || cache[:adam_m] === nothing || size(cache[:adam_m]) != size(W_gpu)
+        cache[:adam_m] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+        cache[:adam_v] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+    end
+    if !haskey(cache, :grad) || cache[:grad] === nothing || size(cache[:grad]) != size(W_gpu)
+        cache[:grad] = CUDA.zeros(ComplexF64, size(W_gpu)...)
+    else
+        fill!(cache[:grad], 0)
+    end
+    blockscalar_adam_update!(W_gpu, cache[:adam_m], cache[:adam_v], cache[:grad],
+                             opt.α, opt.β1, opt.β2, opt.ε, max(opt.t, 1))
+    fill!(cache[:adam_m], 0)
+    fill!(cache[:adam_v], 0)
+    fill!(cache[:grad], 0)
+    return nothing
+end
+
+function _warm_blockmatrix_adam!(layer::BlockMatrix_Layer, opt::Adam)
     cache = layer._gpu_w_buf
     (!(cache isa Dict) || !haskey(cache, :W)) && return nothing
     W_gpu = cache[:W]
@@ -890,6 +960,8 @@ function prealloc_optimizer_state!(layers, opt::Adam)
         elseif layer isa BlockScalar_Layer && layer._gpu_w_buf isa Dict && haskey(layer._gpu_w_buf, :W)
             _warm_blockscalar_adam!(layer, opt)
             _warm_blockscalar_update!(layer, opt)
+        elseif layer isa BlockMatrix_Layer && layer._gpu_w_buf isa Dict && haskey(layer._gpu_w_buf, :W)
+            _warm_blockmatrix_adam!(layer, opt)
         end
     end
     opt.t = t0
@@ -914,6 +986,8 @@ function sync_layers!(layers)
                 sync_W_from_gpu!(layer.W, layer._W_gpu, layer._W_cpu_buf)
             end
         elseif layer isa BlockScalar_Layer && layer._gpu_w_buf isa Dict && haskey(layer._gpu_w_buf, :W)
+            copyto!(layer.W, layer._gpu_w_buf[:W])
+        elseif layer isa BlockMatrix_Layer && layer._gpu_w_buf isa Dict && haskey(layer._gpu_w_buf, :W)
             copyto!(layer.W, layer._gpu_w_buf[:W])
         end
     end
@@ -940,6 +1014,13 @@ function save_checkpoint(path::AbstractString, layers, opt::Adam)
             end
         elseif layer isa BlockScalar_Layer
             # layer.W already synced from GPU by sync_layers!
+            data["layer_$(i)_W"] = copy(layer.W)
+            cache = layer._gpu_w_buf
+            if cache isa Dict && haskey(cache, :adam_m) && cache[:adam_m] !== nothing
+                data["layer_$(i)_adam_m"] = Array(cache[:adam_m])
+                data["layer_$(i)_adam_v"] = Array(cache[:adam_v])
+            end
+        elseif layer isa BlockMatrix_Layer
             data["layer_$(i)_W"] = copy(layer.W)
             cache = layer._gpu_w_buf
             if cache isa Dict && haskey(cache, :adam_m) && cache[:adam_m] !== nothing
@@ -980,6 +1061,11 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
             key_W = "layer_$(i)_W"
             if haskey(data, key_W)
                 w_arr = data[key_W]  # Array{ComplexF64,3} (NG,NG,NW)
+                expected = layer._W_gpu === nothing ? size(w_arr) : size(layer._W_gpu)
+                if expected != size(w_arr)
+                    @warn "Skipping checkpoint weight with incompatible shape" layer=i key=key_W expected got=size(w_arr)
+                    continue
+                end
                 if layer._W_gpu === nothing
                     layer._W_gpu = CuArray{ComplexF64,3}(w_arr)
                 else
@@ -993,13 +1079,17 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
                 sync_W_from_gpu!(layer.W, layer._W_gpu, layer._W_cpu_buf)
             end
             key_m = "layer_$(i)_adam_m"
-            if haskey(data, key_m)
+            if haskey(data, key_m) && size(data[key_m]) == size(layer._W_gpu)
                 layer._adam_m_gpu = CuArray{ComplexF64,3}(data[key_m])
                 layer._adam_v_gpu = CuArray{ComplexF64,3}(data["layer_$(i)_adam_v"])
             end
         elseif layer isa BlockScalar_Layer
             key_W = "layer_$(i)_W"
             if haskey(data, key_W)
+                if size(layer.W) != size(data[key_W])
+                    @warn "Skipping checkpoint BlockScalar weight with incompatible shape" layer=i key=key_W expected=size(layer.W) got=size(data[key_W])
+                    continue
+                end
                 copyto!(layer.W, data[key_W])
                 cache = layer._gpu_w_buf
                 if cache isa Dict && haskey(cache, :W) && cache[:W] !== nothing
@@ -1007,7 +1097,28 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
                 end
             end
             key_m = "layer_$(i)_adam_m"
-            if haskey(data, key_m)
+            if haskey(data, key_m) && size(data[key_m]) == size(layer.W)
+                cache = layer._gpu_w_buf
+                if cache isa Dict
+                    cache[:adam_m] = CuArray{ComplexF64}(data[key_m])
+                    cache[:adam_v] = CuArray{ComplexF64}(data["layer_$(i)_adam_v"])
+                end
+            end
+        elseif layer isa BlockMatrix_Layer
+            key_W = "layer_$(i)_W"
+            if haskey(data, key_W)
+                if size(layer.W) != size(data[key_W])
+                    @warn "Skipping checkpoint BlockMatrix weight with incompatible shape" layer=i key=key_W expected=size(layer.W) got=size(data[key_W])
+                    continue
+                end
+                copyto!(layer.W, data[key_W])
+                cache = layer._gpu_w_buf
+                if cache isa Dict && haskey(cache, :W) && cache[:W] !== nothing
+                    copyto!(cache[:W], layer.W)
+                end
+            end
+            key_m = "layer_$(i)_adam_m"
+            if haskey(data, key_m) && size(data[key_m]) == size(layer.W)
                 cache = layer._gpu_w_buf
                 if cache isa Dict
                     cache[:adam_m] = CuArray{ComplexF64}(data[key_m])

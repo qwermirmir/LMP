@@ -14,9 +14,9 @@ using StaticArrays
 import ..elementry_base: Spin_matrix, inner_product, Clifford, reverse_paths,Hopping_operator,norm2,mean,minmax,spincolortrace,addmul!,substitute_fermion!
 import ..Layer_types: CPTC_Layer, PTC_Layer, Layer,ActivationFunction,Identity ,Attention_Layer,Softmax,NormLayer,test_Layer,complexNormLayer,minmaxNormLayer,zscoreNormLayer,siteweight_Layer
 import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,ModRelu,RayleighQuotient_Layer,PtcRayleighQuotient_Layer
-import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer,BlockScalar_Layer
+import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer,BlockScalar_Layer,BlockMatrix_Layer
 import ..elementry_base: blockize, unblockize
-import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,Matmul_batch!,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,blockscalar_gradient_gpu!
+import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,Matmul_batch!,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,blockscalar_gradient_gpu!,_sync_blockmatrix_W_gpu!,blockmatrix_apply_gpu!,blockmatrix_gradient_gpu!,blockmatrix_delta_gpu!
 import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!,get_shared_buf!,get_shared_float_buf!,batched_hopping_steps_gpu!,_batch_normsq_dot!,_backward_normalize!,_sum_spin_color!,inplace_conj!,_normlayer_bwd!
 
 export gradient, DeltaRule,DeltaRule!
@@ -3286,11 +3286,26 @@ end
 
 
 # 출력층 DeltaRule: 각 loss의 델타를 더하면 됨 (∇(w1 f + w2 g) = w1∇f + w2∇g)
-function DeltaRule(L::LossSumLayer,  ::Identity, z::Vector{WF3x1}, batch::Int)
+function DeltaRule(L::LossSumLayer,  ::Identity, z::Vector{<:WF3x1}, batch::Int)
     d1 = DeltaRule(L.l1, L.l1.activation, z, batch)
     d2 = DeltaRule(L.l2, L.l2.activation, z, batch)
     @assert length(d1) == length(d2) "DeltaRule outputs from loss layers must have the same length."
-    return d1 + d2
+    result = similar(d1)
+    for i in eachindex(d1)
+        result[i] = similar(d1[i])
+        axpby!(L.w1, d1[i], 0, result[i])
+        axpby!(L.w2, d2[i], 1, result[i])
+    end
+    return result
+end
+
+function DeltaRule!(L::LossSumLayer, ::Identity, z::Vector{<:WF3x1}, delta::Vector, batch::Int)
+    d = DeltaRule(L, L.activation, z, batch)
+    @assert length(delta) == length(d) "DeltaRule! output buffer has wrong length."
+    for i in eachindex(d)
+        axpby!(1, d[i], 0, delta[i])
+    end
+    return delta
 end
 
 
@@ -3535,7 +3550,7 @@ end
 
 
 # --- BlockScalar_Layer ---
-function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, γ::Vector{Spin_matrix}) where T<:WF3x1
+function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{<:WF3x1}, d::Vector{T}, γ::Vector{Spin_matrix}) where T<:WF3x1
     if z[1] isa WF3x1GPU
         return [blockscalar_gradient_gpu!(layer, z, d)]
     end
@@ -3602,7 +3617,7 @@ function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{WF3x1}, d::Vec
 end
 
 function DeltaRule(layer::BlockScalar_Layer, ::Identity,
-                   z::Vector{WF3x1}, d::Vector{T}) where T<:WF3x1
+                   z::Vector{<:WF3x1}, d::Vector{T}) where T<:WF3x1
     n = length(d)
     nblocks = size(layer.W, 1)
     r = layer.r
@@ -3666,7 +3681,7 @@ function DeltaRule(layer::BlockScalar_Layer, ::Identity,
 end
 
 function DeltaRule!(layer::BlockScalar_Layer, ::Identity,
-                    z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
+                    z::Vector{<:WF3x1}, d::Vector{T}, delta::Vector{<:WF3x1}) where T<:WF3x1
     n = length(d)
     nblocks = size(layer.W, 1)
     r = layer.r
@@ -3703,11 +3718,149 @@ function DeltaRule!(layer::BlockScalar_Layer, ::Identity,
     end
 end
 
+# --- BlockMatrix_Layer ---
+function gradient(layer::BlockMatrix_Layer, ::Identity, z::Vector{<:WF3x1}, d::Vector{T}, γ::Vector{Spin_matrix}) where T<:WF3x1
+    if z[1] isa WF3x1GPU
+        return [blockmatrix_gradient_gpu!(layer, z, d)]
+    end
+
+    nblocks, nout, nin = size(layer.W)
+    length(z) == nin || error("BlockMatrix_Layer gradient expected $nin input vectors, got $(length(z))")
+    length(d) == nout || error("BlockMatrix_Layer gradient expected $nout output deltas, got $(length(d))")
+    if size(layer._grad_W) != (nblocks, nout, nin)
+        layer._grad_W = zeros(ComplexF64, nblocks, nout, nin)
+    else
+        fill!(layer._grad_W, zero(ComplexF64))
+    end
+    grad_W = layer._grad_W
+
+    NC, NG = z[1].NC, z[1].NG
+    NX, NY, NZ, NT = z[1].NX, z[1].NY, z[1].NZ, z[1].NT
+    bmap = layer._block_map
+
+    @inbounds for o in 1:nout
+        do_ = d[o]
+        for i in 1:nin
+            zi = z[i]
+            site = 0
+            for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                site += 1
+                bid = bmap[site]
+                s = zero(ComplexF64)
+                for ig in 1:NG
+                    @simd for ic in 1:NC
+                        s += do_[ic, ix, iy, iz, it, ig] * zi[ic, ix, iy, iz, it, ig]
+                    end
+                end
+                grad_W[bid, o, i] += conj(s)
+            end
+        end
+    end
+
+    return grad_W
+end
+
+function DeltaRule(layer::BlockMatrix_Layer, ::Identity,
+                   z::Vector{<:WF3x1}, d::Vector{T}) where T<:WF3x1
+    nblocks, nout, nin = size(layer.W)
+    length(d) == nout || error("BlockMatrix_Layer DeltaRule expected $nout output deltas, got $(length(d))")
+    r = layer.r
+
+    if !layer._initialized || length(layer._result) != nin || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(d[1]))
+        layer._result = Vector{WF3x1}(undef, nin)
+        for i in 1:nin
+            layer._result[i] = deepcopy(d[min(i, nout)])
+        end
+        if d[1] isa WF3x1GPU
+            _init_gpu_block_cache!(layer, d[1])
+        elseif isempty(layer._block_map)
+            NX, NY, NZ, NT = d[1].NX, d[1].NY, d[1].NZ, d[1].NT
+            NBX = NX÷r; NBY = NY÷r; NBZ = NZ÷r; NBT = NT÷r
+            nsites = NX * NY * NZ * NT
+            layer._block_map = Vector{Int}(undef, nsites)
+            idx = 0
+            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                idx += 1
+                bx = (ix-1)÷r + 1; by = (iy-1)÷r + 1
+                bz = (iz-1)÷r + 1; bt = (it-1)÷r + 1
+                layer._block_map[idx] = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
+            end
+        end
+        layer._initialized = true
+    end
+    result = layer._result
+
+    if d[1] isa WF3x1GPU
+        W_gpu, bmap_gpu, _ = _sync_blockmatrix_W_gpu!(layer; upload=false)
+        blockmatrix_delta_gpu!(result, d, W_gpu, bmap_gpu, layer.residual)
+    else
+        NC, NG = d[1].NC, d[1].NG
+        NX, NY, NZ, NT = d[1].NX, d[1].NY, d[1].NZ, d[1].NT
+        bmap = layer._block_map
+        W = layer.W
+
+        @inbounds for i in 1:nin
+            ri = result[i]
+            site = 0
+            for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                site += 1
+                bid = bmap[site]
+                for ig in 1:NG
+                    @simd for ic in 1:NC
+                        s = zero(ComplexF64)
+                        for o in 1:nout
+                            s += W[bid, o, i] * d[o][ic, ix, iy, iz, it, ig]
+                        end
+                        if layer.residual && i <= nout
+                            s += d[i][ic, ix, iy, iz, it, ig]
+                        end
+                        ri[ic, ix, iy, iz, it, ig] = s
+                    end
+                end
+            end
+        end
+    end
+    return result
+end
+
+function DeltaRule!(layer::BlockMatrix_Layer, ::Identity,
+                    z::Vector{<:WF3x1}, d::Vector{T}, delta::Vector{<:WF3x1}) where T<:WF3x1
+    nblocks, nout, nin = size(layer.W)
+    length(delta) == nin || error("BlockMatrix_Layer DeltaRule! expected $nin input delta buffers, got $(length(delta))")
+    length(d) == nout || error("BlockMatrix_Layer DeltaRule! expected $nout output deltas, got $(length(d))")
+
+    if d[1] isa WF3x1GPU
+        W_gpu, bmap_gpu, _ = _sync_blockmatrix_W_gpu!(layer; upload=false)
+        blockmatrix_delta_gpu!(delta, d, W_gpu, bmap_gpu, layer.residual)
+    else
+        NC, NG = d[1].NC, d[1].NG
+        NX, NY, NZ, NT = d[1].NX, d[1].NY, d[1].NZ, d[1].NT
+        bmap = layer._block_map
+        W = layer.W
+
+        @inbounds for i in 1:nin
+            ri = delta[i]
+            site = 0
+            for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                site += 1
+                bid = bmap[site]
+                for ig in 1:NG
+                    @simd for ic in 1:NC
+                        s = zero(ComplexF64)
+                        for o in 1:nout
+                            s += W[bid, o, i] * d[o][ic, ix, iy, iz, it, ig]
+                        end
+                        if layer.residual && i <= nout
+                            s += d[i][ic, ix, iy, iz, it, ig]
+                        end
+                        ri[ic, ix, iy, iz, it, ig] = s
+                    end
+                end
+            end
+        end
+    end
+end
+
 
 end # module activation
-
-
-
-
-
 

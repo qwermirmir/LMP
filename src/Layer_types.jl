@@ -36,6 +36,7 @@ export Orthogonal_Layer
 export Ritz_Layer  
 export GramSchmidt_Layer
 export BlockScalar_Layer
+export BlockMatrix_Layer
 
 struct Identity <: ActivationFunction end
 
@@ -654,6 +655,53 @@ mutable struct BlockScalar_Layer <: Layer
             Matrix{ComplexF64}(undef, 0, 0), false,
             nothing, nothing, ComplexF64[], Matrix{ComplexF64}(undef, 0, 0))
     end
+end
+
+"""
+    BlockMatrix_Layer(x, n, r; residual=false, activation=Identity())
+    BlockMatrix_Layer(x, nin, nout, r; residual=false, activation=Identity())
+
+Block-local complex matrix mixing layer for a vector of fermion fields.
+
+For each coarse block `B`, this applies
+
+```julia
+y[o]|_B = sum_i W[B, o, i] * x[i]|_B
+```
+
+The default square constructor initializes each block matrix to the identity.
+"""
+mutable struct BlockMatrix_Layer <: Layer
+    W::Array{ComplexF64,3}   # (nblocks, nout, nin)
+    r::Int
+    residual::Bool
+    activation::ActivationFunction
+    _result::Vector{WF3x1}
+    _block_map::Vector{Int}
+    _gpu_block_map::Vector{Int}
+    _gpu_w_buf::Any
+    _gpu_w_cpu::Matrix{ComplexF64}
+    _initialized::Bool
+    _grad_W::Array{ComplexF64,3}
+
+    function BlockMatrix_Layer(x::WF3x1, nin::Int, nout::Int, r::Int,
+                               residual::Bool=false,
+                               activation::ActivationFunction=Identity())
+        nblocks = (x.NX ÷ r) * (x.NY ÷ r) * (x.NZ ÷ r) * (x.NT ÷ r)
+        W = zeros(ComplexF64, nblocks, nout, nin)
+        @inbounds for b in 1:nblocks, i in 1:min(nin, nout)
+            W[b, i, i] = 1 + 0im
+        end
+        new(W, r, residual, activation,
+            WF3x1[], Int[], Int[], nothing, Matrix{ComplexF64}(undef, 0, 0), false,
+            Array{ComplexF64,3}(undef, 0, 0, 0))
+    end
+end
+
+function BlockMatrix_Layer(x::WF3x1, n::Int, r::Int,
+                           residual::Bool=false,
+                           activation::ActivationFunction=Identity())
+    return BlockMatrix_Layer(x, n, n, r, residual, activation)
 end
 
 

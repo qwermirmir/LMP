@@ -14,7 +14,7 @@ export mr_smooth!, sap_smooth!
 export block_orthonormalize!
 export deflated_initial_guess
 export precompute_coarse_operator!
-export gamma5!, chiral_project!, gamma5_sign
+export gamma5!, chiral_project!
 export compare_ddalphaamg_cpu_gpu
 
 
@@ -388,7 +388,8 @@ function _amg_restrict_kernel!(out, tv, x, block_sites, block_counts, nc_ng::Int
     return nothing
 end
 
-function _amg_restrict_one_kernel!(out, tv, x, block_sites, block_counts, nc_ng::Int32, Nv::Int32, v::Int32)
+function _amg_restrict_one_kernel!(out, tv, x, block_sites, block_counts,
+                                   nc::Int32, nc_ng::Int32, Nv::Int32, v::Int32)
     bid = Int32(blockIdx().x)
     tid = Int32(threadIdx().x)
     bsz = Int32(blockDim().x)
@@ -1426,6 +1427,19 @@ function chiral_project!(x::WF3x1GPU, chirality::Symbol)
     return x
 end
 
+function _chiral_split_vectors(vectors::Vector{T}) where {T<:WF3x1}
+    split_vectors = Vector{T}(undef, 2 * length(vectors))
+    for i in eachindex(vectors)
+        plus = _copy_wf(vectors[i])
+        minus = _copy_wf(vectors[i])
+        chiral_project!(plus, :plus)
+        chiral_project!(minus, :minus)
+        split_vectors[2 * i - 1] = plus
+        split_vectors[2 * i] = minus
+    end
+    return split_vectors
+end
+
 
 # ==========================================
 #  Block Orthonormalization
@@ -1515,6 +1529,15 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
     return vectors
 end
 
+function _block_orthonormalize_chiral_split!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
+    @assert iseven(length(vectors)) "chiral split vectors must come in plus/minus pairs"
+    plus_vectors = vectors[1:2:end]
+    minus_vectors = vectors[2:2:end]
+    block_orthonormalize!(plus_vectors, r)
+    block_orthonormalize!(minus_vectors, r)
+    return vectors
+end
+
 
 # ==========================================
 #  Restriction: fine -> coarse
@@ -1547,7 +1570,8 @@ function restrict_f2c(setup::DDalphaAMG_Setup, x::WF3x1)
                 iy = (by-1)*r + ly; ix = (bx-1)*r + lx
                 for ig = 1:NG
                     for ic = 1:NC
-                        val += conj(tv[ic, ix, iy, iz, it, ig]) * x[ic, ix, iy, iz, it, ig]
+                        val += conj(tv[ic, ix, iy, iz, it, ig]) *
+                               x[ic, ix, iy, iz, it, ig]
                     end
                 end
             end
@@ -1566,12 +1590,13 @@ In-place version of `restrict_f2c`; writes the result into `cv`.
 function restrict_f2c!(cv::CoarseVector, setup::DDalphaAMG_Setup, x::WF3x1)
     if x isa WF3x1GPU
         cache = _ensure_gpu_cache!(setup)
+        nc = Int32(size(x.f, 1))
         nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
         fill!(cv.data, zero(ComplexF64))
         for v in 1:setup.Nv
             @cuda threads=256 blocks=setup.Nblocks shmem=(256 * sizeof(ComplexF64)) _amg_restrict_one_kernel!(
                 cv.data, reshape(setup.test_vectors[v].f, :), reshape(x.f, :),
-                cache[:block_sites], cache[:block_counts], nc_ng, Int32(setup.Nv), Int32(v))
+                cache[:block_sites], cache[:block_counts], nc, nc_ng, Int32(setup.Nv), Int32(v))
         end
         return cv
     end
@@ -1589,7 +1614,8 @@ function restrict_f2c!(cv::CoarseVector, setup::DDalphaAMG_Setup, x::WF3x1)
                 iy = (by-1)*r + ly; ix = (bx-1)*r + lx
                 for ig = 1:NG
                     for ic = 1:NC
-                        val += conj(tv[ic, ix, iy, iz, it, ig]) * x[ic, ix, iy, iz, it, ig]
+                        val += conj(tv[ic, ix, iy, iz, it, ig]) *
+                               x[ic, ix, iy, iz, it, ig]
                     end
                 end
             end
@@ -1695,6 +1721,8 @@ end
     coarse_apply(setup, D, cv) -> CoarseVector
 
 Apply the matrix-free coarse operator `Dc = R * D * P`.
+The restriction is `R = P'`. For paper chiral coarsening, the prolongator
+already contains separately coarsened chiral sectors.
 """
 function coarse_apply(setup::DDalphaAMG_Setup, D, cv::CoarseVector)
     fine_v = prolongate_c2f(setup, cv)
@@ -1775,7 +1803,7 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
         end
 
         if verbose
-            println("  coarse operator direct GPU stencil assembly... blocks=$(Nblocks), Nv=$(Nv)")
+            println("  coarse operator direct GPU stencil assembly... blocks=$(Nblocks), Nv=$(Nv), R=P'")
         end
         threads = 128
         @cuda threads=threads blocks=(Nblocks, Nv, Nv) shmem=(9 * threads * sizeof(ComplexF64)) _amg_direct_wilson_stencil_kernel!(
@@ -2422,9 +2450,8 @@ Build a complete DD-alphaAMG setup.
 Steps:
 1. Generate `Nv` random test vectors, unless `coarse_vectors` are provided.
 2. Smooth them so they approximate low modes (`D*psi ~= 0`).
-3. Optionally split by chirality.
-4. Block-orthonormalize the vectors.
-5. Precompute the coarse operator.
+3. Block-orthonormalize the vectors.
+4. Precompute the coarse operator.
 
 Arguments:
 - `D`: Dirac operator.
@@ -2435,6 +2462,12 @@ Arguments:
 - `smoother`: `:mr`, `:sap`, or `:vcycle`.
 - `nvcycle`: adaptive V-cycle setup iterations when `smoother=:vcycle`.
 - `vcycle_pre_smooth`, `vcycle_post_smooth`: V-cycle smoothing counts.
+- `use_chirality`: follow the paper's chiral coarsening: split each prototype
+  into upper/lower chiral components, yielding `2*Nv` coarse vectors. In this
+  basis `P' * gamma5 = sigma3 * P'`, so the gamma5 factors cancel in the
+  correction and the implemented restriction remains `R = P'`.
+- `precompute_coarse`: precompute the coarse operator stencil. Solves need this,
+  but matrix-free training losses can disable it.
 
 Example:
 ```julia
@@ -2450,7 +2483,8 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                           vcycle_pre_smooth::Int=4, vcycle_post_smooth::Int=4,
                           setup_smoother::Symbol=:mr,
                           vcycle_update_smoother::Symbol=:sap,
-                          use_chirality::Bool=false)
+                          use_chirality::Bool=false,
+                          precompute_coarse::Bool=true)
     NX, NY, NZ, NT = template.NX, template.NY, template.NZ, template.NT
     NC, NG = template.NC, template.NG
 
@@ -2459,12 +2493,6 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
     @assert NZ % r == 0 "NZ=$NZ must be divisible by r=$r"
     @assert NT % r == 0 "NT=$NT must be divisible by r=$r"
 
-    if use_chirality
-        @assert Nv % 2 == 0 "Nv must be even when use_chirality=true (Nv=$Nv)"
-    end
-    # Chiral setup also smooths Nv independent vectors.
-    # We then assign independent halves to P+ and P- sectors,
-    # instead of splitting each single vector into plus/minus copies.
     Nv_smooth = Nv
 
     NBX = NX ÷ r; NBY = NY ÷ r; NBZ = NZ ÷ r; NBT = NT ÷ r
@@ -2475,8 +2503,9 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         println("  fine lattice: $(NX)x$(NY)x$(NZ)x$(NT)")
         println("  block size: $(r)^4")
         println("  coarse lattice: $(NBX)x$(NBY)x$(NBZ)x$(NBT) = $(Nblocks) blocks")
-        println("  test vectors: $Nv", use_chirality ? " (chiral split: $(Nv_smooth) -> Nv)" : "")
-        println("  coarse dof: $(Nblocks * Nv)")
+        println("  test vectors: $Nv", use_chirality ? " prototypes -> $(2 * Nv) chiral coarse vectors" : "")
+        println("  coarse dof: $(Nblocks * (use_chirality ? 2 * Nv : Nv))")
+        println("  restriction: R = P'")
     end
 
     # 1. Generate or load test vectors.
@@ -2532,18 +2561,24 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
 
             r_fine = _copy_wf(zero_rhs)
             correction = _copy_wf(zero_rhs)
-            r_coarse = _coarse_vector(Nv_smooth, Nblocks, template)
 
             for iter in 1:nvcycle
                 cur_vectors = _copy_wf_vector(test_vectors)
-                block_orthonormalize!(cur_vectors, r)
+                if use_chirality
+                    cur_vectors = _chiral_split_vectors(cur_vectors)
+                    _block_orthonormalize_chiral_split!(cur_vectors, r)
+                else
+                    block_orthonormalize!(cur_vectors, r)
+                end
+                cur_Nv = length(cur_vectors)
                 cur_setup = DDalphaAMG_Setup{typeof(template)}(
-                    cur_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
+                    cur_vectors, r, cur_Nv, NX, NY, NZ, NT, NC, NG,
                     NBX, NBY, NBZ, NBT, Nblocks, nothing,
                     nothing,
                     CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
                 )
                 precompute_coarse_operator!(cur_setup, D; mode=:direct_stencil)
+                r_coarse = _coarse_vector(cur_Nv, Nblocks, template)
 
                 for v in 1:Nv_smooth
                     _amg_mul_dirac!(r_fine, D, test_vectors[v];
@@ -2595,51 +2630,36 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         end
     end
 
-
-
-    # 2.5. Chiral splitting
-    if use_chirality && coarse_vectors === nothing
+    if use_chirality
+        test_vectors = _chiral_split_vectors(test_vectors)
         if verbose
-            println("  applying chiral split...")
+            println("  chiral split: $Nv prototypes -> $(length(test_vectors)) coarse vectors")
         end
-        chiral_vectors = Vector{typeof(template)}(undef, Nv)
-        half = Nv ÷ 2
-        # First half -> P+ sector, second half -> P- sector.
-        for v in 1:half
-            chiral_vectors[v] = _copy_wf(test_vectors[v])
-            chiral_project!(chiral_vectors[v], :plus)   # keep ig=3,4
-        end
-        for v in 1:half
-            chiral_vectors[half + v] = _copy_wf(test_vectors[half + v])
-            chiral_project!(chiral_vectors[half + v], :minus)    # keep ig=1,2
-        end
-        test_vectors = chiral_vectors
     end
+    Nv_setup = length(test_vectors)
 
     # 3. Block orthonormalization
     if verbose
         println("  block orthonormalizing...")
     end
     if use_chirality
-        # Orthonormalize the P+ and P- sectors separately to preserve chirality.
-        half = Nv ÷ 2
-        plus_vectors  = test_vectors[1:half]       # P±(ig=3,4)
-        minus_vectors = test_vectors[half+1:end]   # P±(ig=1,2)
-        block_orthonormalize!(plus_vectors, r)
-        block_orthonormalize!(minus_vectors, r)
+        _block_orthonormalize_chiral_split!(test_vectors, r)
     else
         block_orthonormalize!(test_vectors, r)
     end
 
     setup = DDalphaAMG_Setup{typeof(template)}(
-        test_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
+        test_vectors, r, Nv_setup, NX, NY, NZ, NT, NC, NG,
         NBX, NBY, NBZ, NBT, Nblocks, nothing,
         nothing,
         CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
     )
 
-    # Precompute the coarse operator.
-    precompute_coarse_operator!(setup, D; verbose=verbose, mode=:direct_stencil)
+    # Precompute the coarse operator for AMG solves. Matrix-free training losses
+    # can skip this expensive assembly.
+    if precompute_coarse
+        precompute_coarse_operator!(setup, D; verbose=verbose, mode=:direct_stencil)
+    end
 
     if verbose
         println("  setup done")
@@ -2709,7 +2729,7 @@ function compare_ddalphaamg_cpu_gpu(Dcpu, Dgpu,
                                     setup_gpu::DDalphaAMG_Setup;
                                     pre_smooth::Int=4,
                                     post_smooth::Int=4,
-                                    coarse_tol::Float64=1e-1,
+                                    coarse_tol::Float64=1e-2,
                                     coarse_maxiter::Int=50)
     rows = NamedTuple[]
     println("CPU b size = ", size(bcpu.f))
