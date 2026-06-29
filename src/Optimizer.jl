@@ -1031,6 +1031,9 @@ function save_checkpoint(path::AbstractString, layers, opt::Adam)
             for j in eachindex(layer.x)
                 x = layer.x[j]
                 data["layer_$(i)_fermion_x_$(j)"] = Array(x.f)
+                if x isa WF3x1GPU
+                    data["layer_$(i)_fermion_blocks_$(j)"] = Tuple(Int.(x.blockinfo.blocks))
+                end
                 state_key = objectid(x)
                 if haskey(opt.wf_state, state_key)
                     state = opt.wf_state[state_key]
@@ -1043,6 +1046,177 @@ function save_checkpoint(path::AbstractString, layers, opt::Adam)
 
     JLD2.save(path, data)
     return path
+end
+
+_blocks_tuple(x) = (Int(x[1]), Int(x[2]), Int(x[3]), Int(x[4]))
+
+function _checkpoint_source_blocks(data, key::String)
+    meta_key = replace(key, "_x_" => "_blocks_")
+    haskey(data, meta_key) || return nothing
+    return _blocks_tuple(data[meta_key])
+end
+
+@inline _ckpt_cvt(x, xd, xd_s) = mod(div(x - 1, xd_s), xd)
+
+function _checkpoint_layout_copy_kernel!(
+    dest, src, total::Int,
+    sb1::Int, sb2::Int, sb3::Int, sb4::Int,
+    db1::Int, db2::Int, db3::Int, db4::Int,
+    NX::Int, NY::Int, NZ::Int, NT::Int,
+    sb_s1::Int, sb_s2::Int, sb_s3::Int, sb_s4::Int,
+    sr_s1::Int, sr_s2::Int, sr_s3::Int, sr_s4::Int,
+    db_s1::Int, db_s2::Int, db_s3::Int, db_s4::Int,
+    dr_s1::Int, dr_s2::Int, dr_s3::Int, dr_s4::Int,
+    drn1::Int, drn2::Int, drn3::Int, drn4::Int,
+)
+    idx = (CUDA.blockIdx().x - 1) * CUDA.blockDim().x + CUDA.threadIdx().x
+    if idx <= total
+        t = idx - 1
+        c = (t % 3) + 1
+        t = div(t, 3)
+        a = (t % 4) + 1
+        t = div(t, 4)
+        bd = (t % (db1 * db2 * db3 * db4)) + 1
+        rd = div(t, db1 * db2 * db3 * db4) + 1
+
+        ix0 = _ckpt_cvt(bd, db1, db_s1) + _ckpt_cvt(rd, drn1, dr_s1) * db1
+        iy0 = _ckpt_cvt(bd, db2, db_s2) + _ckpt_cvt(rd, drn2, dr_s2) * db2
+        iz0 = _ckpt_cvt(bd, db3, db_s3) + _ckpt_cvt(rd, drn3, dr_s3) * db3
+        it0 = _ckpt_cvt(bd, db4, db_s4) + _ckpt_cvt(rd, drn4, dr_s4) * db4
+
+        bs = 1 +
+             (ix0 % sb1) * sb_s1 +
+             (iy0 % sb2) * sb_s2 +
+             (iz0 % sb3) * sb_s3 +
+             (it0 % sb4) * sb_s4
+        rs = 1 +
+             div(ix0, sb1) * sr_s1 +
+             div(iy0, sb2) * sr_s2 +
+             div(iz0, sb3) * sr_s3 +
+             div(it0, sb4) * sr_s4
+
+        @inbounds dest[c, a, bd, rd] = src[c, a, bs, rs]
+    end
+    return nothing
+end
+
+function _checkpoint_linear_canonical_copy_kernel!(
+    dest, src, total::Int,
+    db1::Int, db2::Int, db3::Int, db4::Int,
+    NX::Int, NY::Int, NZ::Int, NT::Int,
+    db_s1::Int, db_s2::Int, db_s3::Int, db_s4::Int,
+    dr_s1::Int, dr_s2::Int, dr_s3::Int, dr_s4::Int,
+    drn1::Int, drn2::Int, drn3::Int, drn4::Int,
+)
+    idx = (CUDA.blockIdx().x - 1) * CUDA.blockDim().x + CUDA.threadIdx().x
+    if idx <= total
+        t = idx - 1
+        c = (t % 3) + 1
+        t = div(t, 3)
+        a = (t % 4) + 1
+        t = div(t, 4)
+        bd = (t % (db1 * db2 * db3 * db4)) + 1
+        rd = div(t, db1 * db2 * db3 * db4) + 1
+
+        ix0 = _ckpt_cvt(bd, db1, db_s1) + _ckpt_cvt(rd, drn1, dr_s1) * db1
+        iy0 = _ckpt_cvt(bd, db2, db_s2) + _ckpt_cvt(rd, drn2, dr_s2) * db2
+        iz0 = _ckpt_cvt(bd, db3, db_s3) + _ckpt_cvt(rd, drn3, dr_s3) * db3
+        it0 = _ckpt_cvt(bd, db4, db_s4) + _ckpt_cvt(rd, drn4, dr_s4) * db4
+        site = 1 + ix0 + iy0 * NX + iz0 * NX * NY + it0 * NX * NY * NZ
+        src_idx = c + 3 * (a - 1) + 12 * (site - 1)
+
+        @inbounds dest[c, a, bd, rd] = src[src_idx]
+    end
+    return nothing
+end
+
+function _copy_checkpoint_fermion_linear_canonical!(x::WF3x1GPU, arr)
+    length(arr) == length(x.f) || error("Checkpoint fermion length mismatch: checkpoint has $(length(arr)), field has $(length(x.f)).")
+    src = CuArray{ComplexF64}(reshape(arr, :))
+    dst_blocks = _blocks_tuple(x.blockinfo.blocks)
+    db1, db2, db3, db4 = dst_blocks
+    NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT
+    drn1, drn2, drn3, drn4 = NX ÷ db1, NY ÷ db2, NZ ÷ db3, NT ÷ db4
+    total = length(x.f)
+    threads = 256
+    blocks = cld(total, threads)
+    CUDA.@cuda threads=threads blocks=blocks _checkpoint_linear_canonical_copy_kernel!(
+        x.f, src, total,
+        db1, db2, db3, db4,
+        NX, NY, NZ, NT,
+        1, db1, db1 * db2, db1 * db2 * db3,
+        1, drn1, drn1 * drn2, drn1 * drn2 * drn3,
+        drn1, drn2, drn3, drn4,
+    )
+    return x
+end
+
+function _copy_checkpoint_fermion_array!(x::WF3x1GPU, arr, src_blocks::NTuple{4,Int})
+    dst_blocks = _blocks_tuple(x.blockinfo.blocks)
+    if src_blocks == dst_blocks && size(arr) == size(x.f)
+        copyto!(x.f, arr)
+        return x
+    end
+
+    NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT
+    src_blocksize = prod(src_blocks)
+    src_rsize = (NX * NY * NZ * NT) ÷ src_blocksize
+    if size(arr, 3) != src_blocksize || size(arr, 4) != src_rsize
+        error("Checkpoint fermion layout mismatch: source blocks=$src_blocks imply f size " *
+              "(3,4,$src_blocksize,$src_rsize), but checkpoint has $(size(arr)).")
+    end
+
+    sb1, sb2, sb3, sb4 = src_blocks
+    db1, db2, db3, db4 = dst_blocks
+    srn1, srn2, srn3, srn4 = NX ÷ sb1, NY ÷ sb2, NZ ÷ sb3, NT ÷ sb4
+    drn1, drn2, drn3, drn4 = NX ÷ db1, NY ÷ db2, NZ ÷ db3, NT ÷ db4
+    src = CuArray{ComplexF64,4}(arr)
+    total = length(x.f)
+    threads = 256
+    blocks = cld(total, threads)
+    CUDA.@cuda threads=threads blocks=blocks _checkpoint_layout_copy_kernel!(
+        x.f, src, total,
+        sb1, sb2, sb3, sb4,
+        db1, db2, db3, db4,
+        NX, NY, NZ, NT,
+        1, sb1, sb1 * sb2, sb1 * sb2 * sb3,
+        1, srn1, srn1 * srn2, srn1 * srn2 * srn3,
+        1, db1, db1 * db2, db1 * db2 * db3,
+        1, drn1, drn1 * drn2, drn1 * drn2 * drn3,
+        drn1, drn2, drn3, drn4,
+    )
+    return x
+end
+
+function _copy_checkpoint_fermion_array!(x::WF3x1CPU, arr, src_blocks)
+    size(arr) == size(x.f) || error("Cannot layout-convert fermion checkpoint into CPU field without CPU canonical conversion.")
+    copyto!(x.f, arr)
+    return x
+end
+
+function _load_checkpoint_fermion_field!(x::WF3x1GPU, data, key::String)
+    arr = data[key]
+    src_blocks = _checkpoint_source_blocks(data, key)
+    if src_blocks === nothing
+        return _copy_checkpoint_fermion_linear_canonical!(x, arr)
+    end
+    return _copy_checkpoint_fermion_array!(x, arr, src_blocks)
+end
+
+function _load_checkpoint_fermion_field!(x::WF3x1CPU, data, key::String)
+    return _copy_checkpoint_fermion_array!(x, data[key], nothing)
+end
+
+function _load_checkpoint_fermion_adam_field!(x::WF3x1GPU, arr, data, key_x::String)
+    src_blocks = _checkpoint_source_blocks(data, key_x)
+    if src_blocks === nothing
+        return _copy_checkpoint_fermion_linear_canonical!(x, arr)
+    end
+    return _copy_checkpoint_fermion_array!(x, arr, src_blocks)
+end
+
+function _load_checkpoint_fermion_adam_field!(x::WF3x1CPU, arr, data, key_x::String)
+    return _copy_checkpoint_fermion_array!(x, arr, nothing)
 end
 
 """
@@ -1130,14 +1304,14 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
                 key_x = "layer_$(i)_fermion_x_$(j)"
                 haskey(data, key_x) || continue
                 x = layer.x[j]
-                copyto!(x.f, data[key_x])
+                _load_checkpoint_fermion_field!(x, data, key_x)
 
                 key_m = "layer_$(i)_fermion_m_$(j)"
                 if haskey(data, key_m)
                     m = similar(x)
                     v = similar(x)
-                    copyto!(m.f, data[key_m])
-                    copyto!(v.f, data["layer_$(i)_fermion_v_$(j)"])
+                    _load_checkpoint_fermion_adam_field!(m, data[key_m], data, key_x)
+                    _load_checkpoint_fermion_adam_field!(v, data["layer_$(i)_fermion_v_$(j)"], data, key_x)
                     opt.wf_state[objectid(x)] = AdamState{WF3x1}(m, v)
                 end
             end

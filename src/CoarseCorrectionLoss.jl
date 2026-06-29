@@ -1,6 +1,7 @@
 using LinearAlgebra
 using CUDA
 using LatticeDiracOperators
+using Random
 
 import .Layer_types: Layer, Identity, ActivationFunction
 import .activation
@@ -20,14 +21,20 @@ const CCL_WF3x1 = Union{CCL_WF3x1CPU, CCL_WF3x1GPU}
 
 mutable struct CCL_ErrorCache
     error::Any
+    smooth_error::Any
     y::Any
     bc::Any
     Ae::Any
     r::Any
+    post_r::Any
     Ar::Any
     tmp::Any
     tmp2::Any
     lambda::Any
+    mr_s::Vector{Any}
+    mr_t::Vector{Any}
+    mr_alpha::Vector{ComplexF64}
+    mr_den::Vector{Float64}
     denominator::Float64
     objective_grad_scale::Float64
     loss::Float64
@@ -37,8 +44,8 @@ mutable struct CCL_ErrorCache
 end
 
 function CCL_ErrorCache(error)
-    return CCL_ErrorCache(error, nothing, nothing, nothing, nothing, nothing,
-                          nothing, nothing, nothing, NaN, 1.0,
+    return CCL_ErrorCache(error, nothing, nothing, nothing, nothing, nothing, nothing,
+                          nothing, nothing, nothing, nothing, Any[], Any[], ComplexF64[], Float64[], NaN, 1.0,
                           NaN, NaN, NaN, Inf)
 end
 
@@ -54,10 +61,15 @@ mutable struct CoarseCorrectionLoss_Layer <: Layer
     operator::Symbol
     objective::Symbol
     gain_eps::Float64
+    objective_scale::Float64
     tangent_project::Bool
     orthonormalization_pullback::Bool
     refresh_error::Bool
     error_smooth_steps::Int
+    cycle_smoother::Symbol
+    cycle_omega::Float64
+    cycle_pre_smooth_steps::Int
+    cycle_post_smooth_steps::Int
     activation::ActivationFunction
     target::Any
 
@@ -81,6 +93,11 @@ mutable struct CoarseCorrectionLoss_Layer <: Layer
     _one_split_grad::Vector{Any}
     _delta::Vector{Any}
     _error_caches::Vector{Any}
+    _replay_buffer::Vector{Any}
+    _replay_next::Int
+    _replay_filled::Int
+    replay_used::Int
+    replay_stored::Int
 
     function CoarseCorrectionLoss_Layer(D, error_vector;
                                         block_size::Int=4,
@@ -92,42 +109,81 @@ mutable struct CoarseCorrectionLoss_Layer <: Layer
                                         operator::Symbol=:dirac,
                                         objective::Symbol=:ratio,
                                         gain_eps::Real=1e-12,
+                                        objective_scale::Real=1.0,
                                         tangent_project::Bool=true,
                                         orthonormalization_pullback::Bool=true,
                                         refresh_error::Bool=false,
                                         error_smooth_steps::Int=16,
+                                        cycle_smoother::Symbol=:mr,
+                                        cycle_omega::Real=0.05,
+                                        cycle_pre_smooth_steps::Int=0,
+                                        cycle_post_smooth_steps::Int=0,
                                         activation::ActivationFunction=Identity())
-        operator in (:dirac, :normal) ||
-            throw(ArgumentError("operator must be :dirac or :normal, got $operator"))
-        objective in (:ratio, :negloggain) ||
-            throw(ArgumentError("objective must be :ratio or :negloggain, got $objective"))
+        operator in (:dirac, :normal, :gamma5dirac) ||
+            throw(ArgumentError("operator must be :dirac, :normal, or :gamma5dirac, got $operator"))
+        objective in (:ratio, :negloggain, :hutchinson, :frobenius) ||
+            throw(ArgumentError("objective must be :ratio, :negloggain, :hutchinson, or :frobenius, got $objective"))
+        cycle_smoother in (:mr, :richardson) ||
+            throw(ArgumentError("cycle_smoother must be :mr or :richardson, got $cycle_smoother"))
         new(D, error_vector, block_size, nsmooth, use_chirality,
             Float64(coarse_tol), coarse_maxiter, coarse_restart, operator,
-            objective, Float64(gain_eps),
+            objective, Float64(gain_eps), Float64(objective_scale),
             tangent_project, orthonormalization_pullback,
-            refresh_error, error_smooth_steps, activation,
+            refresh_error, error_smooth_steps,
+            cycle_smoother, Float64(cycle_omega),
+            cycle_pre_smooth_steps, cycle_post_smooth_steps,
+            activation,
             nothing, nothing, nothing, nothing, Inf, NaN, NaN, NaN, 1.0,
             nothing, nothing, nothing, nothing, nothing, nothing,
-            Any[], Any[], Any[], Any[], Any[], Any[])
+            Any[], Any[], Any[], Any[], Any[], Any[],
+            Any[], 1, 0, 0, 0)
     end
 end
 
 _field_norm2(x) = real(inner_product(x, x))
 _field_norm(x) = sqrt(max(_field_norm2(x), 0.0))
 
+function _z4_probe_array!(a::AbstractArray{ComplexF64}, rng::AbstractRNG=Random.default_rng())
+    @inbounds for i in eachindex(a)
+        r = rand(rng, UInt8) & 0x03
+        a[i] = r == 0x00 ? 1.0 + 0.0im :
+               r == 0x01 ? -1.0 + 0.0im :
+               r == 0x02 ? 0.0 + 1.0im :
+                            0.0 - 1.0im
+    end
+    return a
+end
+
+function _z4_probe!(x::CCL_WF3x1, rng::AbstractRNG=Random.default_rng())
+    if x.f isa CuArray
+        host = Array{ComplexF64}(undef, size(x.f))
+        _z4_probe_array!(host, rng)
+        copyto!(x.f, host)
+    else
+        _z4_probe_array!(x.f, rng)
+    end
+    return x
+end
+
 function refresh_error_vector!(layer::CoarseCorrectionLoss_Layer, D_new=layer.D)
     errors = _error_vectors(layer)
     isempty(errors) && return layer
 
     for e in errors
-        gauss_distribution_fermion!(e)
-        if layer.error_smooth_steps > 0
+        if layer.objective == :hutchinson
+            _z4_probe!(e)
+        else
+            gauss_distribution_fermion!(e)
+        end
+        if layer.objective != :hutchinson && layer.error_smooth_steps > 0
             zero_rhs = similar(e)
             zero_wf!(zero_rhs)
             mr_smooth!(e, D_new, zero_rhs; niter=layer.error_smooth_steps)
         end
-        nrm = _field_norm(e)
-        nrm > eps(Float64) && axpby!(1 / nrm, e, 0, e)
+        if layer.objective != :hutchinson
+            nrm = _field_norm(e)
+            nrm > eps(Float64) && axpby!(1 / nrm, e, 0, e)
+        end
     end
     return layer
 end
@@ -222,6 +278,25 @@ end
 
 _field_array_cpu(x) = x.f isa CuArray ? Array(x.f) : copy(x.f)
 
+@inline function _site_component_linear(site::Int, a::Int,
+                                        NX::Int, NY::Int, NZ::Int, NT::Int,
+                                        NC::Int, NG::Int)
+    site0 = site - 1
+    ic = mod(a - 1, NC) + 1
+    ig = (a - 1) ÷ NC + 1
+    volume = NX * NY * NZ * NT
+    return ic + NC * site0 + NC * volume * (ig - 1)
+end
+
+@inline function _field_component_linear(a::AbstractArray, site::Int, comp::Int,
+                                         NX::Int, NY::Int, NZ::Int, NT::Int,
+                                         NC::Int, NG::Int)
+    if ndims(a) == 4
+        return (site - 1) * NC * NG + comp
+    end
+    return _site_component_linear(site, comp, NX, NY, NZ, NT, NC, NG)
+end
+
 function _copy_field_array_to_wf!(x, a)
     if x.f isa CuArray
         copyto!(x.f, CuArray(reshape(a, size(x.f))))
@@ -238,21 +313,57 @@ function _zero_wf_vector!(xs)
     return xs
 end
 
-function _qr_q_pullback_block(X::Matrix{ComplexF64}, Q::Matrix{ComplexF64},
-                              GQ::Matrix{ComplexF64})
-    R = Q' * X
-    C = Q' * GQ
-    n = size(C, 1)
-    M = zeros(ComplexF64, n, n)
-    @inbounds begin
-        for i in 1:n
-            M[i, i] = im * imag(C[i, i])
-            for j in 1:(i - 1)
-                M[i, j] = C[i, j] - conj(C[j, i])
-            end
+function _mgs_q_pullback_block(X::Matrix{ComplexF64}, GQ::Matrix{ComplexF64})
+    m, nv = size(X)
+    qcols = zeros(ComplexF64, m, nv)
+    pre_norm = Vector{Vector{ComplexF64}}(undef, nv)
+    norms = zeros(Float64, nv)
+    before_proj = [Vector{Vector{ComplexF64}}(undef, max(v - 1, 0)) for v in 1:nv]
+    alphas = [Vector{ComplexF64}(undef, max(v - 1, 0)) for v in 1:nv]
+
+    @inbounds for v in 1:nv
+        w = copy(view(X, :, v))
+        for u in 1:(v - 1)
+            before_proj[v][u] = copy(w)
+            alpha = dot(view(qcols, :, u), w)
+            alphas[v][u] = alpha
+            w .-= alpha .* view(qcols, :, u)
+        end
+        pre_norm[v] = copy(w)
+        nrm = norm(w)
+        norms[v] = nrm
+        if nrm > 1e-14
+            qcols[:, v] .= w ./ nrm
+        else
+            qcols[:, v] .= w
         end
     end
-    return (GQ - Q * (C - M)) / R'
+
+    adj_q = copy(GQ)
+    GX = zeros(ComplexF64, m, nv)
+    @inbounds for v in nv:-1:1
+        qv = view(qcols, :, v)
+        gv = copy(view(adj_q, :, v))
+        nrm = norms[v]
+        gw = if nrm > 1e-14
+            c = real(dot(qv, gv))
+            (gv .- c .* qv) ./ nrm
+        else
+            gv
+        end
+
+        for u in (v - 1):-1:1
+            qu = view(qcols, :, u)
+            w_before = before_proj[v][u]
+            alpha = alphas[v][u]
+            beta = dot(gw, qu)
+
+            adj_q[:, u] .+= .-conj(alpha) .* gw .- beta .* w_before
+            gw .-= conj(beta) .* qu
+        end
+        GX[:, v] .+= gw
+    end
+    return GX
 end
 
 function _orthonormalization_pullback_group!(out_grads::Vector, q_grads::Vector,
@@ -278,28 +389,30 @@ function _orthonormalization_pullback_group!(out_grads::Vector, q_grads::Vector,
         row = 0
         for p in 1:nsites
             site = Int(block_sites[p, bid])
-            base = (site - 1) * nc_ng
             for a in 1:nc_ng
                 row += 1
-                lin = base + a
+                lin = _field_component_linear(raw_arrays[1], site, a,
+                                              setup.NX, setup.NY, setup.NZ,
+                                              setup.NT, setup.NC, setup.NG)
                 for j in 1:nv
                     X[row, j] = raw_arrays[j][lin]
                     Q[row, j] = q_arrays[j][lin]
-                    G[row, j] = g_arrays[j][lin]
+                    G[row, j] = conj(g_arrays[j][lin])
                 end
             end
         end
 
-        GX = _qr_q_pullback_block(X, Q, G)
+        GX = _mgs_q_pullback_block(X, G)
         row = 0
         for p in 1:nsites
             site = Int(block_sites[p, bid])
-            base = (site - 1) * nc_ng
             for a in 1:nc_ng
                 row += 1
-                lin = base + a
+                lin = _field_component_linear(raw_arrays[1], site, a,
+                                              setup.NX, setup.NY, setup.NZ,
+                                              setup.NT, setup.NC, setup.NG)
                 for j in 1:nv
-                    out_arrays[j][lin] = GX[row, j]
+                    out_arrays[j][lin] = conj(GX[row, j])
                 end
             end
         end
@@ -361,9 +474,8 @@ function _project_bilinear_block_span!(grads::Vector, z::Vector{T}, r::Int) wher
         S = zeros(ComplexF64, n, n)
         B = zeros(ComplexF64, n, n)
         for site in sites
-            base = (site - 1) * nc_ng
             for a in 1:nc_ng
-                lin = base + a
+                lin = _field_component_linear(z_arrays[1], site, a, NX, NY, NZ, NT, NC, NG)
                 for k in 1:n
                     zk = z_arrays[k][lin]
                     for i in 1:n
@@ -382,9 +494,8 @@ function _project_bilinear_block_span!(grads::Vector, z::Vector{T}, r::Int) wher
             pinv(S) * B
         end
         for site in sites
-            base = (site - 1) * nc_ng
             for a in 1:nc_ng
-                lin = base + a
+                lin = _field_component_linear(z_arrays[1], site, a, NX, NY, NZ, NT, NC, NG)
                 for j in 1:n
                     corr = zero(ComplexF64)
                     for i in 1:n
@@ -405,6 +516,24 @@ end
 function _apply_dagdiracdirac!(out, D, tmp, x)
     mul!(tmp, D, x)
     mul!(out, D', tmp)
+    return out
+end
+
+struct CCL_Gamma5DiracOperator{TD}
+    D::TD
+end
+
+Base.adjoint(A::CCL_Gamma5DiracOperator) = A
+
+function LinearAlgebra.mul!(out, A::CCL_Gamma5DiracOperator, x)
+    mul!(out, A.D, x)
+    DDalphaAMG.gamma5!(out)
+    return out
+end
+
+function _apply_gamma5dirac!(out, D, x)
+    mul!(out, D, x)
+    DDalphaAMG.gamma5!(out)
     return out
 end
 
@@ -518,19 +647,188 @@ function _coarse_gmres_matrixfree(setup::DDalphaAMG_Setup, Dop, b_c::CoarseVecto
 end
 
 function _ensure_cache_buffers!(cache::CCL_ErrorCache, e)
+    cache.smooth_error = cache.smooth_error === nothing || typeof(cache.smooth_error) != typeof(e) ? similar(e) : cache.smooth_error
     cache.Ae = cache.Ae === nothing || typeof(cache.Ae) != typeof(e) ? similar(e) : cache.Ae
     cache.r  = cache.r  === nothing || typeof(cache.r)  != typeof(e) ? similar(e) : cache.r
+    cache.post_r = cache.post_r === nothing || typeof(cache.post_r) != typeof(e) ? similar(e) : cache.post_r
     cache.Ar = cache.Ar === nothing || typeof(cache.Ar) != typeof(e) ? similar(e) : cache.Ar
     cache.tmp = cache.tmp === nothing || typeof(cache.tmp) != typeof(e) ? similar(e) : cache.tmp
     cache.tmp2 = cache.tmp2 === nothing || typeof(cache.tmp2) != typeof(e) ? similar(e) : cache.tmp2
     return cache
 end
 
+function _apply_linear_cycle_smoother!(out, layer::CoarseCorrectionLoss_Layer, input, work1, work2, steps::Int; adjoint::Bool=false)
+    _copyto_wf!(out, input)
+    steps <= 0 && return out
+    ω = layer.cycle_omega
+    for _ in 1:steps
+        if layer.operator == :dirac
+            mul!(work1, adjoint ? layer.D' : layer.D, out)
+        elseif layer.operator == :gamma5dirac
+            _apply_gamma5dirac!(work1, layer.D, out)
+        else
+            _apply_dagdiracdirac!(work1, layer.D, work2, out)
+        end
+        axpby!(-ω, work1, 1, out)
+    end
+    return out
+end
+
+function _apply_post_smoother_adjoint!(out, layer::CoarseCorrectionLoss_Layer, input, work1, work2)
+    _copyto_wf!(out, input)
+    if layer.cycle_post_smooth_steps <= 0
+        return out
+    elseif layer.cycle_smoother == :richardson
+        ω = layer.cycle_omega
+        for _ in 1:layer.cycle_post_smooth_steps
+            if layer.operator == :dirac
+                mul!(work1, layer.D', out)
+            elseif layer.operator == :gamma5dirac
+                _apply_gamma5dirac!(work1, layer.D, out)
+            else
+                _apply_dagdiracdirac!(work1, layer.D, work2, out)
+            end
+            axpby!(-ω, work1, 1, out)
+        end
+        return out
+    else
+        error("exact adjoint for cycle_smoother=$(layer.cycle_smoother) post smoothing is not implemented")
+    end
+end
+
+function _ensure_mr_records!(cache::CCL_ErrorCache, template, nsteps::Int)
+    if length(cache.mr_s) != nsteps || (nsteps > 0 && typeof(cache.mr_s[1]) != typeof(template))
+        cache.mr_s = Any[similar(template) for _ in 1:nsteps]
+        cache.mr_t = Any[similar(template) for _ in 1:nsteps]
+        cache.mr_alpha = zeros(ComplexF64, nsteps)
+        cache.mr_den = zeros(Float64, nsteps)
+    end
+    return cache
+end
+
+function _mr_zero_smooth_with_records!(out, layer::CoarseCorrectionLoss_Layer, input, cache::CCL_ErrorCache)
+    nsteps = layer.cycle_post_smooth_steps
+    _copyto_wf!(out, input)
+    _ensure_mr_records!(cache, input, nsteps)
+    for k in 1:nsteps
+        s = cache.mr_s[k]
+        t = cache.mr_t[k]
+        mul!(s, layer.D, out)
+        axpby!(-1, s, 0, s)       # s = -D*out, i.e. b-Dx with b=0.
+        mul!(t, layer.D, s)
+        num = inner_product(t, s)
+        den = real(inner_product(t, t))
+        if abs(den) < 1e-30
+            cache.mr_alpha[k] = 0
+            cache.mr_den[k] = den
+        else
+            α = num / den
+            cache.mr_alpha[k] = ComplexF64(α)
+            cache.mr_den[k] = Float64(den)
+            axpby!(α, s, 1, out)
+        end
+    end
+    return out
+end
+
+function _apply_mr_post_smoother_adjoint!(out, layer::CoarseCorrectionLoss_Layer,
+                                          input_bar, cache::CCL_ErrorCache)
+    nsteps = layer.cycle_post_smooth_steps
+    _copyto_wf!(out, input_bar)
+    nsteps <= 0 && return out
+
+    gs = cache.tmp
+    gt = cache.tmp2
+    work = cache.Ae
+    work2 = cache.smooth_error
+    for k in nsteps:-1:1
+        den = cache.mr_den[k]
+        α = cache.mr_alpha[k]
+        if abs(den) < 1e-30
+            continue
+        end
+        s = cache.mr_s[k]
+        t = cache.mr_t[k]
+
+        c = inner_product(out, s)
+        β = c / den
+        γ = -c * α / den
+
+        # gs is the adjoint wrt s in y = x + alpha*s.
+        _copyto_wf!(gs, out)
+        axpby!(conj(α), gs, 0, gs)
+        axpby!(conj(β), t, 1, gs)
+
+        # gt is the adjoint wrt t from alpha=<t,s>/<t,t>.
+        axpby!(β, s, 0, gt)
+        axpby!(2real(γ), t, 1, gt)
+
+        # xbar = ybar - D' * gs - D' * D' * gt.
+        mul!(work, layer.D', gs)
+        axpby!(-1, work, 1, out)
+        mul!(work, layer.D', gt)
+        mul!(work2, layer.D', work)
+        axpby!(-1, work2, 1, out)
+    end
+    return out
+end
+
+function _smooth_error_for_cycle!(layer::CoarseCorrectionLoss_Layer, cache::CCL_ErrorCache)
+    e = cache.error
+    if layer.cycle_pre_smooth_steps <= 0
+        _copyto_wf!(cache.smooth_error, e)
+    elseif layer.cycle_smoother == :richardson
+        _apply_linear_cycle_smoother!(cache.smooth_error, layer, e, cache.tmp, cache.tmp2,
+                                      layer.cycle_pre_smooth_steps; adjoint=false)
+    else
+        _copyto_wf!(cache.smooth_error, e)
+        zero_wf!(cache.tmp)
+        mr_smooth!(cache.smooth_error, layer.D, cache.tmp; niter=layer.cycle_pre_smooth_steps)
+    end
+    return cache.smooth_error
+end
+
+function _post_smooth_residual_for_cycle!(layer::CoarseCorrectionLoss_Layer, cache::CCL_ErrorCache)
+    if layer.cycle_post_smooth_steps <= 0
+        _copyto_wf!(cache.post_r, cache.r)
+    elseif layer.cycle_smoother == :richardson
+        _apply_linear_cycle_smoother!(cache.post_r, layer, cache.r, cache.tmp, cache.tmp2,
+                                      layer.cycle_post_smooth_steps; adjoint=false)
+    else
+        _mr_zero_smooth_with_records!(cache.post_r, layer, cache.r, cache)
+    end
+    return cache.post_r
+end
+
 function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
                                               setup::DDalphaAMG_Setup,
                                               cache::CCL_ErrorCache)
-    e = cache.error
-    _ensure_cache_buffers!(cache, e)
+    e0 = cache.error
+    _ensure_cache_buffers!(cache, e0)
+    full_cycle_objective = layer.objective in (:hutchinson, :frobenius)
+
+    # Hutchinson/Frobenius mode estimates the full error-propagation operator norm:
+    #     ||A E e0||^2 / ||A e0||^2,
+    # where A is D, gamma5*D, or D'D depending on `operator`.
+    #
+    # The older :ratio objective keeps the conditional denominator after
+    # pre-smoothing:
+    #     ||A E e0||^2 / ||A S_pre e0||^2.
+    initial_denominator = NaN
+    if full_cycle_objective
+        if layer.operator == :dirac
+            mul!(cache.tmp, layer.D, e0)
+            initial_denominator = max(real(inner_product(cache.tmp, cache.tmp)), eps(Float64))
+        elseif layer.operator == :gamma5dirac
+            _apply_gamma5dirac!(cache.tmp, layer.D, e0)
+            initial_denominator = max(real(inner_product(cache.tmp, cache.tmp)), eps(Float64))
+        else
+            _apply_dagdiracdirac!(cache.tmp, layer.D, cache.tmp2, e0)
+            initial_denominator = max(real(inner_product(e0, cache.tmp)), eps(Float64))
+        end
+    end
+
+    e = _smooth_error_for_cycle!(layer, cache)
     if layer.operator == :dirac
         mul!(cache.Ae, layer.D, e)  # De: the fine residual induced by error e.
         bc = restrict_f2c(setup, cache.Ae)
@@ -538,6 +836,13 @@ function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
                                     maxiter=layer.coarse_maxiter,
                                     restart=layer.coarse_restart,
                                     tol=layer.coarse_tol)
+    elseif layer.operator == :gamma5dirac
+        _apply_gamma5dirac!(cache.Ae, layer.D, e)  # He with H = gamma5 D.
+        bc = restrict_f2c(setup, cache.Ae)
+        y = _coarse_gmres_matrixfree(setup, CCL_Gamma5DiracOperator(layer.D), bc;
+                                     maxiter=layer.coarse_maxiter,
+                                     restart=layer.coarse_restart,
+                                     tol=layer.coarse_tol)
     else
         _apply_dagdiracdirac!(cache.Ae, layer.D, cache.tmp, e)
         bc = restrict_f2c(setup, cache.Ae)
@@ -551,19 +856,33 @@ function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
     prolongate_c2f!(cache.tmp2, setup, y)
     _copyto_wf!(cache.r, e)
     axpby!(-1, cache.tmp2, 1, cache.r)
+    q = _post_smooth_residual_for_cycle!(layer, cache)
 
     local numerator, denominator, opt
     if layer.operator == :dirac
-        mul!(cache.tmp, layer.D, cache.r)       # Dr
-        mul!(cache.Ar, layer.D', cache.tmp)     # D' D r, needed for d ||Dr||^2 / dP.
+        mul!(cache.tmp, layer.D, q)             # Dq
+        mul!(cache.Ar, layer.D', cache.tmp)     # D' D q
         numerator = real(inner_product(cache.tmp, cache.tmp))
         denominator = max(real(inner_product(cache.Ae, cache.Ae)), eps(Float64))
         opt = restrict_f2c(setup, cache.tmp)     # P' D r, should be small after Dc solve.
+    elseif layer.operator == :gamma5dirac
+        _apply_gamma5dirac!(cache.tmp, layer.D, q)       # Hq
+        _apply_gamma5dirac!(cache.Ar, layer.D, cache.tmp) # H'Hq = H^2 q
+        numerator = real(inner_product(cache.tmp, cache.tmp))
+        denominator = max(real(inner_product(cache.Ae, cache.Ae)), eps(Float64))
+        opt = restrict_f2c(setup, cache.tmp)     # P' H r, should be small after Hc solve.
     else
-        _apply_dagdiracdirac!(cache.Ar, layer.D, cache.tmp, cache.r)
-        numerator = real(inner_product(cache.r, cache.Ar))
+        _apply_dagdiracdirac!(cache.Ar, layer.D, cache.tmp, q)
+        numerator = real(inner_product(q, cache.Ar))
         denominator = max(real(inner_product(e, cache.Ae)), eps(Float64))
         opt = restrict_f2c(setup, cache.Ar)
+    end
+    if layer.cycle_post_smooth_steps > 0 && layer.cycle_smoother == :richardson
+        _copyto_wf!(cache.tmp2, cache.Ar)
+        _apply_post_smoother_adjoint!(cache.Ar, layer, cache.tmp2, cache.tmp, cache.Ae)
+    elseif layer.cycle_post_smooth_steps > 0 && layer.cycle_smoother == :mr
+        _copyto_wf!(cache.tmp2, cache.Ar)
+        _apply_mr_post_smoother_adjoint!(cache.Ar, layer, cache.tmp2, cache)
     end
     ratio = numerator / denominator
     gain = 1.0 - ratio
@@ -574,9 +893,17 @@ function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
         effective_gain = max(gain, layer.gain_eps)
         loss = -log(effective_gain)
         grad_scale = 1.0 / effective_gain
+    elseif full_cycle_objective
+        denominator = initial_denominator
+        ratio = numerator / denominator
+        gain = 1.0 - ratio
+        loss = ratio
+        grad_scale = 1.0
     else
         error("unsupported coarse correction objective: $(layer.objective)")
     end
+    loss *= layer.objective_scale
+    grad_scale *= layer.objective_scale
 
     orth_residual = sqrt(max(real(DDalphaAMG.coarse_dot(opt, opt)), 0.0)) /
                     max(sqrt(max(real(DDalphaAMG.coarse_dot(bc, bc)), 0.0)), eps(Float64))
@@ -587,6 +914,85 @@ function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
     cache.gain = gain
     cache.orth_residual = orth_residual
     return loss
+end
+
+_replay_buffer_size() = parse(Int, get(ENV, "COARSE_LOSS_REPLAY_BUFFER_SIZE", "0"))
+_replay_errors_per_forward() = parse(Int, get(ENV, "COARSE_LOSS_REPLAY_ERRORS_PER_FORWARD", "0"))
+_replay_store_per_forward() = parse(Int, get(ENV, "COARSE_LOSS_REPLAY_STORE_PER_FORWARD",
+                                            get(ENV, "COARSE_LOSS_REPLAY_ERRORS_PER_FORWARD", "0")))
+_allow_approx_post_smooth_backward() =
+    lowercase(get(ENV, "COARSE_LOSS_ALLOW_APPROX_POST_SMOOTH_BACKWARD", "false")) in ("1", "true", "yes", "on")
+
+function _ensure_replay_buffer!(layer::CoarseCorrectionLoss_Layer, template)
+    nbuf = _replay_buffer_size()
+    if nbuf <= 0
+        empty!(layer._replay_buffer)
+        layer._replay_next = 1
+        layer._replay_filled = 0
+        return layer._replay_buffer
+    end
+    if length(layer._replay_buffer) != nbuf ||
+       (!isempty(layer._replay_buffer) && typeof(layer._replay_buffer[1]) != typeof(template))
+        layer._replay_buffer = Any[similar(template) for _ in 1:nbuf]
+        layer._replay_next = 1
+        layer._replay_filled = 0
+    end
+    return layer._replay_buffer
+end
+
+function _mix_replay_errors!(layer::CoarseCorrectionLoss_Layer, errors)
+    layer.replay_used = 0
+    isempty(errors) && return 0
+    nbuf = _replay_buffer_size()
+    nreq = _replay_errors_per_forward()
+    (nbuf <= 0 || nreq <= 0) && return 0
+    _ensure_replay_buffer!(layer, errors[1])
+    layer._replay_filled <= 0 && return 0
+
+    # Keep slot 1 fresh. Replay slots are chronological:
+    #   errors[2] <- residual after one correction,
+    #   errors[3] <- residual after two corrections, ...
+    # This is an age queue, not hard-negative sampling.
+    nuse = min(nreq, layer._replay_filled, max(length(errors) - 1, 0))
+    nuse <= 0 && return 0
+    for i in 1:nuse
+        _copyto_wf!(errors[i + 1], layer._replay_buffer[i])
+        layer.replay_used += 1
+    end
+    return layer.replay_used
+end
+
+_is_good_replay_norm(nrm::Real) = isfinite(nrm) && nrm > sqrt(eps(Float64))
+
+function _store_replay_errors!(layer::CoarseCorrectionLoss_Layer, caches)
+    layer.replay_stored = 0
+    isempty(caches) && return 0
+    nbuf = _replay_buffer_size()
+    nstore = _replay_store_per_forward()
+    (nbuf <= 0 || nstore <= 0) && return 0
+    _ensure_replay_buffer!(layer, caches[1].error)
+
+    # Store the remaining error after correction/post-smoothing as detached data.
+    # This is intentionally a replay buffer, not backpropagation through past steps.
+    # Preserve time/order: cache 1 is the fresh error after one correction,
+    # cache 2 is the previous age-1 error after another correction, and so on.
+    n = min(nstore, length(caches), nbuf)
+    good_stored = 0
+    for i in 1:n
+        cache = caches[i]
+        (isfinite(cache.loss) && isfinite(cache.ratio) && isfinite(cache.gain)) || continue
+        src = cache.post_r !== nothing ? cache.post_r : cache.r
+        src === nothing && continue
+        dst = layer._replay_buffer[i]
+        _copyto_wf!(dst, src)
+        nrm = _field_norm(dst)
+        _is_good_replay_norm(nrm) || continue
+        axpby!(1 / nrm, dst, 0, dst)
+        layer.replay_stored += 1
+        good_stored = i
+    end
+    layer._replay_filled = max(layer._replay_filled, good_stored)
+    return layer.replay_stored
 end
 
 function coarse_correction_loss_forward!(layer::CoarseCorrectionLoss_Layer,
@@ -611,6 +1017,7 @@ function coarse_correction_loss_forward!(layer::CoarseCorrectionLoss_Layer,
     layer.setup = setup
 
     caches = _ensure_error_caches!(layer, errors)
+    _mix_replay_errors!(layer, errors)
     total_loss = 0.0
     total_ratio = 0.0
     total_gain = 0.0
@@ -621,6 +1028,7 @@ function coarse_correction_loss_forward!(layer::CoarseCorrectionLoss_Layer,
         total_gain += cache.gain
         total_orth += cache.orth_residual
     end
+    _store_replay_errors!(layer, caches)
 
     invn = 1 / length(caches)
     layer.loss_value = total_loss * invn
@@ -665,7 +1073,7 @@ function _ccl_basis_gradient_kernel!(g, Ar, y, bmap, nc_ng::Int32, total::Int32,
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         bid = bmap[site]
         coeff = y[(bid - Int32(1)) * Nv + j]
-        @inbounds g[idx] = scale * Ar[idx] * conj(coeff)
+        @inbounds g[idx] = scale * conj(Ar[idx]) * coeff
     end
     return nothing
 end
@@ -677,7 +1085,7 @@ function _ccl_basis_gradient_add_kernel!(g, Ar, y, bmap, nc_ng::Int32, total::In
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         bid = bmap[site]
         coeff = y[(bid - Int32(1)) * Nv + j]
-        @inbounds g[idx] += scale * Ar[idx] * conj(coeff)
+        @inbounds g[idx] += scale * conj(Ar[idx]) * coeff
     end
     return nothing
 end
@@ -703,14 +1111,14 @@ function _fill_basis_gradient!(g, Ar, coeffs, setup::DDalphaAMG_Setup, j::Int, s
 
     @inbounds for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
         bidx = DDalphaAMG.block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
-        c = scale * conj(coeff_cpu[(bidx - 1) * Nv + j])
+        c = scale * coeff_cpu[(bidx - 1) * Nv + j]
         for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
             it = (bt - 1) * r + lt
             iz = (bz - 1) * r + lz
             iy = (by - 1) * r + ly
             ix = (bx - 1) * r + lx
             for ig in 1:NG, ic in 1:NC
-                g[ic, ix, iy, iz, it, ig] = c * Ar[ic, ix, iy, iz, it, ig]
+                g[ic, ix, iy, iz, it, ig] = c * conj(Ar[ic, ix, iy, iz, it, ig])
             end
         end
     end
@@ -737,14 +1145,14 @@ function _add_basis_gradient!(g, Ar, coeffs, setup::DDalphaAMG_Setup, j::Int, sc
 
     @inbounds for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
         bidx = DDalphaAMG.block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
-        c = scale * conj(coeff_cpu[(bidx - 1) * Nv + j])
+        c = scale * coeff_cpu[(bidx - 1) * Nv + j]
         for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
             it = (bt - 1) * r + lt
             iz = (bz - 1) * r + lz
             iy = (by - 1) * r + ly
             ix = (bx - 1) * r + lx
             for ig in 1:NG, ic in 1:NC
-                g[ic, ix, iy, iz, it, ig] += c * Ar[ic, ix, iy, iz, it, ig]
+                g[ic, ix, iy, iz, it, ig] += c * conj(Ar[ic, ix, iy, iz, it, ig])
             end
         end
     end
@@ -962,6 +1370,7 @@ function activation.DeltaRule!(layer::CoarseCorrectionLoss_Layer, ::Identity,
             lambda_coeffs = lambda
 
             # +(Dr)*lambda'
+            mul!(cache.tmp, layer.D, cache.r)
             for j in 1:nP
                 _add_basis_gradient!(layer._one_split_grad[j], cache.tmp, lambda_coeffs, setup, j, 1.0)
             end
@@ -972,10 +1381,66 @@ function activation.DeltaRule!(layer::CoarseCorrectionLoss_Layer, ::Identity,
             for j in 1:nP
                 _add_basis_gradient!(layer._one_split_grad[j], cache.Ae, coeffs, setup, j, -1.0)
             end
+        elseif layer.operator == :gamma5dirac
+            denom = cache.denominator
+
+            # Explicit term from r = e - P*y: -g_r*y', where g_r = 2H'Hr / ||He||^2
+            # and H = gamma5*D is Hermitian.
+            for j in 1:nP
+                _fill_basis_gradient!(layer._one_split_grad[j], cache.Ar, coeffs, setup, j, -2.0 / denom)
+            end
+
+            # Implicit terms from y(P) with H_c*y = P'He.
+            # Since H_c is Hermitian, the adjoint equation uses the same coarse operator.
+            axpby!(2.0 / denom, cache.Ar, 0, cache.tmp2)
+            ybar = restrict_f2c(setup, cache.tmp2)
+            ybar.data .*= -1
+            lambda = _coarse_gmres_matrixfree(setup, CCL_Gamma5DiracOperator(layer.D), ybar;
+                                              maxiter=layer.coarse_maxiter,
+                                              restart=layer.coarse_restart,
+                                              tol=layer.coarse_tol)
+            cache.lambda = lambda
+            layer._lambda = lambda
+            lambda_coeffs = lambda
+
+            # +(Hr)*lambda'
+            _apply_gamma5dirac!(cache.tmp, layer.D, cache.r)
+            for j in 1:nP
+                _add_basis_gradient!(layer._one_split_grad[j], cache.tmp, lambda_coeffs, setup, j, 1.0)
+            end
+
+            # -(H*P*lambda)*y'
+            prolongate_c2f!(cache.tmp2, setup, lambda)
+            _apply_gamma5dirac!(cache.Ae, layer.D, cache.tmp2)
+            for j in 1:nP
+                _add_basis_gradient!(layer._one_split_grad[j], cache.Ae, coeffs, setup, j, -1.0)
+            end
         else
             scale = -2.0 / cache.denominator
             for j in 1:nP
                 _fill_basis_gradient!(layer._one_split_grad[j], cache.Ar, coeffs, setup, j, scale)
+            end
+            if layer.cycle_post_smooth_steps > 0
+                axpby!(2.0 / cache.denominator, cache.Ar, 0, cache.tmp2)
+                ybar = restrict_f2c(setup, cache.tmp2)
+                ybar.data .*= -1
+                lambda, _, _ = _coarse_cg_A(setup, layer.D, ybar;
+                                            tol=layer.coarse_tol,
+                                            maxiter=layer.coarse_maxiter)
+                cache.lambda = lambda
+                layer._lambda = lambda
+                lambda_coeffs = lambda
+
+                _apply_dagdiracdirac!(cache.tmp, layer.D, cache.tmp2, cache.r)
+                for j in 1:nP
+                    _add_basis_gradient!(layer._one_split_grad[j], cache.tmp, lambda_coeffs, setup, j, 1.0)
+                end
+
+                prolongate_c2f!(cache.tmp2, setup, lambda)
+                _apply_dagdiracdirac!(cache.Ae, layer.D, cache.tmp, cache.tmp2)
+                for j in 1:nP
+                    _add_basis_gradient!(layer._one_split_grad[j], cache.Ae, coeffs, setup, j, -1.0)
+                end
             end
         end
 
@@ -989,11 +1454,9 @@ function activation.DeltaRule!(layer::CoarseCorrectionLoss_Layer, ::Identity,
         if length(layer._orth_split_grad) != nP || (!isempty(layer._orth_split_grad) && typeof(layer._orth_split_grad[1]) != typeof(setup.test_vectors[1]))
             layer._orth_split_grad = Any[similar(setup.test_vectors[i]) for i in 1:nP]
         end
-        _project_horizontal!(layer._split_grad, setup)
         _orthonormalization_pullback!(layer._orth_split_grad, layer._split_grad,
                                       layer._raw_setup_vectors, setup, layer.use_chirality)
         _merge_chiral_gradient!(delta, layer._orth_split_grad, layer.use_chirality)
-        _project_bilinear_block_span!(delta, z, setup.r)
     else
         layer.tangent_project && _project_tangent!(layer._split_grad, setup)
         _merge_chiral_gradient!(delta, layer._split_grad, layer.use_chirality)
@@ -1024,4 +1487,22 @@ function Layer_sequence._refresh_layer!(layer::CoarseCorrectionLoss_Layer, D_new
     end
     empty!(layer._raw_setup_vectors)
     return layer
+end
+
+function Layer_sequence._refresh_forward_error!(layer::CoarseCorrectionLoss_Layer, D_new)
+    layer.refresh_error || return nothing
+    layer.D = D_new
+    refresh_error_vector!(layer, D_new)
+    layer.setup = nothing
+    layer.y = nothing
+    layer.bc = nothing
+    for cache in layer._error_caches
+        if cache isa CCL_ErrorCache
+            cache.y = nothing
+            cache.bc = nothing
+            cache.lambda = nothing
+        end
+    end
+    empty!(layer._raw_setup_vectors)
+    return nothing
 end

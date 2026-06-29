@@ -14,7 +14,7 @@ using StaticArrays
 import ..elementry_base: Spin_matrix, inner_product, Clifford, reverse_paths,Hopping_operator,norm2,mean,minmax,spincolortrace,addmul!,substitute_fermion!
 import ..Layer_types: CPTC_Layer, PTC_Layer, Layer,ActivationFunction,Identity ,Attention_Layer,Softmax,NormLayer,test_Layer,complexNormLayer,minmaxNormLayer,zscoreNormLayer,siteweight_Layer
 import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,ModRelu,RayleighQuotient_Layer,PtcRayleighQuotient_Layer
-import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,GramSchmidt_Layer,BlockScalar_Layer,BlockMatrix_Layer
+import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,ZeroMode_Layer,GramSchmidt_Layer,BlockScalar_Layer,BlockMatrix_Layer
 import ..elementry_base: blockize, unblockize
 import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,Matmul_batch!,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,blockscalar_gradient_gpu!,_sync_blockmatrix_W_gpu!,blockmatrix_apply_gpu!,blockmatrix_gradient_gpu!,blockmatrix_delta_gpu!
 import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!,get_shared_buf!,get_shared_float_buf!,batched_hopping_steps_gpu!,_batch_normsq_dot!,_backward_normalize!,_sum_spin_color!,inplace_conj!,_normlayer_bwd!
@@ -2554,6 +2554,25 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
 end
 
 
+function DeltaRule(layer::ZeroMode_Layer, ::Identity, z::AbstractVector{<:WF3x1}, batch::Int)
+    result = similar(z)
+    for i in eachindex(z)
+        result[i] = similar(z[i])
+    end
+    return DeltaRule!(layer, layer.activation, z, result, batch)
+end
+
+function DeltaRule!(layer::ZeroMode_Layer, ::Identity, z::AbstractVector{<:WF3x1}, delta::AbstractVector{<:WF3x1}, batch::Int)
+    l = length(z)
+    length(layer._DdagDz) == l || error("ZeroMode_Layer forward must run before backward")
+    for i in eachindex(delta)
+        conj!(delta[i], layer._DdagDz[i])
+        delta[i].f .= (2 / l) .* delta[i].f
+    end
+    return delta
+end
+
+
 
 
 
@@ -3863,4 +3882,3 @@ end
 
 
 end # module activation
-

@@ -2118,7 +2118,7 @@ Solve the coarse-grid system `Dc * x_c = b_c` with GMRES. `Dc` is applied either
 through a precomputed coarse operator or matrix-free as `R * D * P`.
 """
 function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
-                      maxiter::Int=50, restart::Int=20, tol::Float64=1e-1,
+                      maxiter::Int=500, restart::Int=20, tol::Float64=1e-2,
                       coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing)
     x_c = similar(b_c)
     zero!(x_c)
@@ -2154,7 +2154,7 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
     end
 
-    for _ = 1:maxiter
+    for iter = 1:maxiter
         # residual: r = b - Dc*x
         r_c.data .= b_c.data
         apply_Dc!(w_c, x_c)
@@ -2200,7 +2200,8 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         r_c.data .= b_c.data
         apply_Dc!(w_c, x_c)
         coarse_axpby!(-1.0, w_c, 1.0, r_c)
-        if coarse_norm(r_c) / b_norm < tol
+        res = coarse_norm(r_c) / b_norm
+        if res < tol
             return x_c
         end
     end
@@ -2227,7 +2228,7 @@ Steps:
 """
 function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 pre_smooth::Int=4, post_smooth::Int=4,
-                coarse_maxiter::Int=50, coarse_tol::Float64=1e-1,
+                coarse_maxiter::Int=50, coarse_tol::Float64=1e-2,
                 smoother::Symbol=:mr,
                 coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                 fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
@@ -2349,6 +2350,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                           coarse_apply_counter=_coarse_apply_counter,
                           fine_apply_counter=_fine_apply_counter)
             total_coarse_gmres += 1
+            println("restart:$(m)","coarse_gmres:$(total_coarse_gmres)")
 
             w = similar(b)
             _amg_mul_dirac!(w, D, Z[j]; fine_apply_counter=_fine_apply_counter)
@@ -2586,7 +2588,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                     axpby!(1, test_vectors[v], -1, r_fine)
                     restrict_f2c!(r_coarse, cur_setup, r_fine)
                     e_coarse = coarse_gmres(cur_setup, D, r_coarse;
-                                            maxiter=50, tol=1e-1)
+                                            maxiter=50, tol=1e-2)
                     prolongate_c2f!(correction, cur_setup, e_coarse)
                     if vcycle_update_smoother == :sap
                         sap_smooth!(correction, D, r_fine, cur_setup;

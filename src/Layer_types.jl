@@ -33,7 +33,8 @@ export DenseLinearLayer
 export PTLayer
 export fermionfield_Layer
 export Orthogonal_Layer
-export Ritz_Layer  
+export Ritz_Layer
+export ZeroMode_Layer
 export GramSchmidt_Layer
 export BlockScalar_Layer
 export BlockMatrix_Layer
@@ -429,6 +430,22 @@ mutable struct Ritz_Layer <: Layer
 end 
 
 
+mutable struct ZeroMode_Layer <: Layer
+    D::Any
+    activation::ActivationFunction
+    Out::Int
+    _Dz::Vector{Any}
+    _DdagDz::Vector{Any}
+    _delta::Vector{Any}
+    _losses::Vector{Float64}
+    _denoms::Vector{Float64}
+    _zeromode_init::Bool
+    function ZeroMode_Layer(D::Any, activation::ActivationFunction=Identity(), Out=1)
+        new(D, activation, Out, Any[], Any[], Any[], Float64[], Float64[], false)
+    end
+end
+
+
 mutable struct GramSchmidt_Layer <: Layer
     x::Vector{WF3x1}           # forward에서 직교화 결과 캐시 (backward에서 재사용)
     activation::ActivationFunction
@@ -718,6 +735,10 @@ end
 # --- CuArray 표시 시 CUDA context 에러 방지 ---
 function Base.show(io::IO, layer::Ritz_Layer)
     print(io, "Ritz_Layer(Out=$(layer.Out))")
+end
+
+function Base.show(io::IO, layer::ZeroMode_Layer)
+    print(io, "ZeroMode_Layer(Out=$(layer.Out))")
 end
 
 function Base.show(io::IO, layer::PTLayer)

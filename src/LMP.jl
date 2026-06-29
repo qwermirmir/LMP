@@ -91,6 +91,7 @@ export fermionfield_Layer
 export Orthogonal_Layer
 export LossSumLayer
 export Ritz_Layer
+export ZeroMode_Layer
 export Convertsm
 export substitute_fermion!
 export gpuaddmul!
@@ -149,7 +150,7 @@ Builds the 16x32 32-PT Ritz model architecture used by `train_lmp.jl`.
 This creates the layer objects only; checkpoint weights can then be loaded into
 them with `load_lmp_model(path; U, x, D)`.
 """
-function build_lmp_32pt_layers(U, x, D; max_len::Int=4, num_eig::Int=4, init_gpu::Bool=true)
+function build_lmp_32pt_layers(U, x, D; max_len::Int=4, num_eig::Int=4, block_r::Int=4, init_gpu::Bool=true)
     P = _default_lmp_paths(max_len)
     pl = length(P)
 
@@ -158,7 +159,7 @@ function build_lmp_32pt_layers(U, x, D; max_len::Int=4, num_eig::Int=4, init_gpu
     PT32 = PTLayer(P, U, num_eig)
 
     fe = fermionfield_Layer(x, 1)
-    bs5 = BlockScalar_Layer(x, num_eig, 2)
+    bs5 = BlockScalar_Layer(x, num_eig, block_r)
     Norm = NormLayer()
     Norm2 = NormLayer()
     Ritz = Ritz_Layer(D)
