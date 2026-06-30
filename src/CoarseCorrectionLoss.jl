@@ -70,6 +70,7 @@ mutable struct CoarseCorrectionLoss_Layer <: Layer
     cycle_omega::Float64
     cycle_pre_smooth_steps::Int
     cycle_post_smooth_steps::Int
+    block_normalize::Bool
     activation::ActivationFunction
     target::Any
 
@@ -118,11 +119,12 @@ mutable struct CoarseCorrectionLoss_Layer <: Layer
                                         cycle_omega::Real=0.05,
                                         cycle_pre_smooth_steps::Int=0,
                                         cycle_post_smooth_steps::Int=0,
+                                        block_normalize::Bool=true,
                                         activation::ActivationFunction=Identity())
         operator in (:dirac, :normal, :gamma5dirac) ||
             throw(ArgumentError("operator must be :dirac, :normal, or :gamma5dirac, got $operator"))
-        objective in (:ratio, :negloggain, :hutchinson, :frobenius) ||
-            throw(ArgumentError("objective must be :ratio, :negloggain, :hutchinson, or :frobenius, got $objective"))
+        objective in (:ratio, :negloggain, :hutchinson, :hutchinson_abs, :frobenius) ||
+            throw(ArgumentError("objective must be :ratio, :negloggain, :hutchinson, :hutchinson_abs, or :frobenius, got $objective"))
         cycle_smoother in (:mr, :richardson) ||
             throw(ArgumentError("cycle_smoother must be :mr or :richardson, got $cycle_smoother"))
         new(D, error_vector, block_size, nsmooth, use_chirality,
@@ -132,6 +134,7 @@ mutable struct CoarseCorrectionLoss_Layer <: Layer
             refresh_error, error_smooth_steps,
             cycle_smoother, Float64(cycle_omega),
             cycle_pre_smooth_steps, cycle_post_smooth_steps,
+            block_normalize,
             activation,
             nothing, nothing, nothing, nothing, Inf, NaN, NaN, NaN, 1.0,
             nothing, nothing, nothing, nothing, nothing, nothing,
@@ -165,22 +168,24 @@ function _z4_probe!(x::CCL_WF3x1, rng::AbstractRNG=Random.default_rng())
     return x
 end
 
+_uses_hutchinson_probe(objective::Symbol) = objective in (:hutchinson, :hutchinson_abs)
+
 function refresh_error_vector!(layer::CoarseCorrectionLoss_Layer, D_new=layer.D)
     errors = _error_vectors(layer)
     isempty(errors) && return layer
 
     for e in errors
-        if layer.objective == :hutchinson
+        if _uses_hutchinson_probe(layer.objective)
             _z4_probe!(e)
         else
             gauss_distribution_fermion!(e)
         end
-        if layer.objective != :hutchinson && layer.error_smooth_steps > 0
+        if !_uses_hutchinson_probe(layer.objective) && layer.error_smooth_steps > 0
             zero_rhs = similar(e)
             zero_wf!(zero_rhs)
             mr_smooth!(e, D_new, zero_rhs; niter=layer.error_smooth_steps)
         end
-        if layer.objective != :hutchinson
+        if !_uses_hutchinson_probe(layer.objective)
             nrm = _field_norm(e)
             nrm > eps(Float64) && axpby!(1 / nrm, e, 0, e)
         end
@@ -313,27 +318,36 @@ function _zero_wf_vector!(xs)
     return xs
 end
 
-function _mgs_q_pullback_block(X::Matrix{ComplexF64}, GQ::Matrix{ComplexF64})
+function _mgs_q_pullback_block(X::Matrix{ComplexF64}, GQ::Matrix{ComplexF64};
+                               normalize::Bool=true)
     m, nv = size(X)
     qcols = zeros(ComplexF64, m, nv)
     pre_norm = Vector{Vector{ComplexF64}}(undef, nv)
     norms = zeros(Float64, nv)
     before_proj = [Vector{Vector{ComplexF64}}(undef, max(v - 1, 0)) for v in 1:nv]
     alphas = [Vector{ComplexF64}(undef, max(v - 1, 0)) for v in 1:nv]
+    proj_denoms = [Vector{Float64}(undef, max(v - 1, 0)) for v in 1:nv]
 
     @inbounds for v in 1:nv
         w = copy(view(X, :, v))
         for u in 1:(v - 1)
             before_proj[v][u] = copy(w)
-            alpha = dot(view(qcols, :, u), w)
+            qu = view(qcols, :, u)
+            den = real(dot(qu, qu))
+            proj_denoms[v][u] = den
+            alpha = normalize || den <= 1e-28 ? dot(qu, w) : dot(qu, w) / den
             alphas[v][u] = alpha
-            w .-= alpha .* view(qcols, :, u)
+            w .-= alpha .* qu
         end
-        pre_norm[v] = copy(w)
-        nrm = norm(w)
-        norms[v] = nrm
-        if nrm > 1e-14
-            qcols[:, v] .= w ./ nrm
+        if normalize
+            pre_norm[v] = copy(w)
+            nrm = norm(w)
+            norms[v] = nrm
+            if nrm > 1e-14
+                qcols[:, v] .= w ./ nrm
+            else
+                qcols[:, v] .= w
+            end
         else
             qcols[:, v] .= w
         end
@@ -344,12 +358,15 @@ function _mgs_q_pullback_block(X::Matrix{ComplexF64}, GQ::Matrix{ComplexF64})
     @inbounds for v in nv:-1:1
         qv = view(qcols, :, v)
         gv = copy(view(adj_q, :, v))
-        nrm = norms[v]
-        gw = if nrm > 1e-14
-            c = real(dot(qv, gv))
-            (gv .- c .* qv) ./ nrm
-        else
-            gv
+        gw = gv
+        if normalize
+            nrm = norms[v]
+            gw = if nrm > 1e-14
+                c = real(dot(qv, gv))
+                (gv .- c .* qv) ./ nrm
+            else
+                gv
+            end
         end
 
         for u in (v - 1):-1:1
@@ -358,8 +375,21 @@ function _mgs_q_pullback_block(X::Matrix{ComplexF64}, GQ::Matrix{ComplexF64})
             alpha = alphas[v][u]
             beta = dot(gw, qu)
 
-            adj_q[:, u] .+= .-conj(alpha) .* gw .- beta .* w_before
-            gw .-= conj(beta) .* qu
+            if normalize
+                adj_q[:, u] .+= .-conj(alpha) .* gw .- beta .* w_before
+                gw .-= conj(beta) .* qu
+            else
+                den = proj_denoms[v][u]
+                if den <= 1e-28
+                    adj_q[:, u] .+= .-conj(alpha) .* gw .- beta .* w_before
+                    gw .-= conj(beta) .* qu
+                else
+                    adj_q[:, u] .+= .-conj(alpha) .* gw .-
+                                     (beta / den) .* w_before .+
+                                     (2real(beta * alpha) / den) .* qu
+                    gw .-= (conj(beta) / den) .* qu
+                end
+            end
         end
         GX[:, v] .+= gw
     end
@@ -370,7 +400,8 @@ function _orthonormalization_pullback_group!(out_grads::Vector, q_grads::Vector,
                                              raw_vectors::Vector, q_vectors::Vector,
                                              setup::DDalphaAMG_Setup,
                                              group::Vector{Int},
-                                             block_sites, block_counts)
+                                             block_sites, block_counts,
+                                             normalize::Bool)
     isempty(group) && return out_grads
     nv = length(group)
     nc_ng = setup.NC * setup.NG
@@ -402,7 +433,7 @@ function _orthonormalization_pullback_group!(out_grads::Vector, q_grads::Vector,
             end
         end
 
-        GX = _mgs_q_pullback_block(X, G)
+        GX = _mgs_q_pullback_block(X, G; normalize=normalize)
         row = 0
         for p in 1:nsites
             site = Int(block_sites[p, bid])
@@ -426,7 +457,7 @@ end
 
 function _orthonormalization_pullback!(out_grads::Vector, q_grads::Vector,
                                        raw_vectors::Vector, setup::DDalphaAMG_Setup,
-                                       use_chirality::Bool)
+                                       use_chirality::Bool, normalize::Bool)
     length(raw_vectors) == setup.Nv || error("raw setup vector count does not match setup.Nv")
     length(q_grads) == setup.Nv || error("q gradient count does not match setup.Nv")
     _zero_wf_vector!(out_grads)
@@ -436,14 +467,17 @@ function _orthonormalization_pullback!(out_grads::Vector, q_grads::Vector,
         minus_group = collect(2:2:setup.Nv)
         _orthonormalization_pullback_group!(out_grads, q_grads, raw_vectors,
                                             setup.test_vectors, setup,
-                                            plus_group, block_sites, block_counts)
+                                            plus_group, block_sites, block_counts,
+                                            normalize)
         _orthonormalization_pullback_group!(out_grads, q_grads, raw_vectors,
                                             setup.test_vectors, setup,
-                                            minus_group, block_sites, block_counts)
+                                            minus_group, block_sites, block_counts,
+                                            normalize)
     else
         _orthonormalization_pullback_group!(out_grads, q_grads, raw_vectors,
                                             setup.test_vectors, setup,
-                                            collect(1:setup.Nv), block_sites, block_counts)
+                                            collect(1:setup.Nv), block_sites, block_counts,
+                                            normalize)
     end
     return out_grads
 end
@@ -805,7 +839,7 @@ function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
                                               cache::CCL_ErrorCache)
     e0 = cache.error
     _ensure_cache_buffers!(cache, e0)
-    full_cycle_objective = layer.objective in (:hutchinson, :frobenius)
+    full_cycle_objective = layer.objective in (:hutchinson, :hutchinson_abs, :frobenius)
 
     # Hutchinson/Frobenius mode estimates the full error-propagation operator norm:
     #     ||A E e0||^2 / ||A e0||^2,
@@ -893,6 +927,12 @@ function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
         effective_gain = max(gain, layer.gain_eps)
         loss = -log(effective_gain)
         grad_scale = 1.0 / effective_gain
+    elseif layer.objective == :hutchinson_abs
+        denominator = 1.0
+        ratio = numerator / initial_denominator
+        gain = 1.0 - ratio
+        loss = numerator
+        grad_scale = 1.0
     elseif full_cycle_objective
         denominator = initial_denominator
         ratio = numerator / denominator
@@ -1013,7 +1053,8 @@ function coarse_correction_loss_forward!(layer::CoarseCorrectionLoss_Layer,
                             verbose=false,
                             coarse_vectors=collect(z),
                             use_chirality=layer.use_chirality,
-                            precompute_coarse=false)
+                            precompute_coarse=false,
+                            block_normalize=layer.block_normalize)
     layer.setup = setup
 
     caches = _ensure_error_caches!(layer, errors)
@@ -1455,7 +1496,8 @@ function activation.DeltaRule!(layer::CoarseCorrectionLoss_Layer, ::Identity,
             layer._orth_split_grad = Any[similar(setup.test_vectors[i]) for i in 1:nP]
         end
         _orthonormalization_pullback!(layer._orth_split_grad, layer._split_grad,
-                                      layer._raw_setup_vectors, setup, layer.use_chirality)
+                                      layer._raw_setup_vectors, setup, layer.use_chirality,
+                                      layer.block_normalize)
         _merge_chiral_gradient!(delta, layer._orth_split_grad, layer.use_chirality)
     else
         layer.tangent_project && _project_tangent!(layer._split_grad, setup)

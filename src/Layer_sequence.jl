@@ -113,6 +113,7 @@ function _coarse_loss_summary(layer)
         "cycle_omega=$(getproperty(layer, :cycle_omega))",
         "cycle_pre_smooth_steps=$(getproperty(layer, :cycle_pre_smooth_steps))",
         "cycle_post_smooth_steps=$(getproperty(layer, :cycle_post_smooth_steps))",
+        "block_normalize=$(getproperty(layer, :block_normalize))",
         "tangent_project=$(getproperty(layer, :tangent_project))",
         "orth_pullback=$(getproperty(layer, :orthonormalization_pullback))",
     ]

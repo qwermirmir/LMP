@@ -513,33 +513,41 @@ function _amg_block_inner_kernel!(out, x, y, block_sites, block_counts, nc_ng::I
     return nothing
 end
 
-function _amg_orthogonalize_kernel!(v, u, block_sites, block_counts, coeffs, nc_ng::Int32)
+function _amg_orthogonalize_kernel!(v, u, block_sites, block_counts, coeffs, nc_ng::Int32,
+                                    normalize::Bool)
     bid = Int32(blockIdx().x)
     tid = Int32(threadIdx().x)
     bsz = Int32(blockDim().x)
-    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
+    sh = CUDA.@cuDynamicSharedMem(ComplexF64, 2Int(bsz))
     total = block_counts[bid] * nc_ng
     acc = ComplexF64(0.0)
+    den = 0.0
     p = tid
     while p <= total
         site_pos = (p - Int32(1)) ÷ nc_ng + Int32(1)
         comp = (p - Int32(1)) % nc_ng + Int32(1)
         site = block_sites[site_pos, bid]
         fidx = (site - Int32(1)) * nc_ng + comp
-        @inbounds acc += conj(u[fidx]) * v[fidx]
+        @inbounds begin
+            acc += conj(u[fidx]) * v[fidx]
+            den += abs2(u[fidx])
+        end
         p += bsz
     end
     sh[tid] = acc
+    sh[tid + bsz] = ComplexF64(den)
     sync_threads()
     half = bsz >> Int32(1)
     while half > Int32(0)
         if tid <= half
             sh[tid] += sh[tid + half]
+            sh[tid + bsz] += sh[tid + bsz + half]
         end
         sync_threads()
         half = half >> Int32(1)
     end
-    coeff = sh[Int32(1)]
+    den_block = real(sh[Int32(1) + bsz])
+    coeff = normalize || den_block <= 1e-28 ? sh[Int32(1)] : sh[Int32(1)] / den_block
     if tid == Int32(1)
         coeffs[bid] = coeff
     end
@@ -1446,12 +1454,13 @@ end
 # ==========================================
 
 """
-    block_orthonormalize!(vectors, r)
+    block_orthonormalize!(vectors, r; normalize=true)
 
-Block-orthonormalize the test vectors with modified Gram-Schmidt.
-For each block B, enforce `<phi_i | phi_j>_B = delta_ij`.
+Block-orthogonalize the test vectors with modified Gram-Schmidt.
+For each block B, enforce `<phi_i | phi_j>_B = 0` for `i != j`.
+When `normalize=true`, also enforce `<phi_i | phi_i>_B = 1`.
 """
-function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
+function block_orthonormalize!(vectors::Vector{T}, r::Int; normalize::Bool=true) where {T<:WF3x1}
     if vectors[1] isa WF3x1GPU
         v1 = vectors[1]
         setup_like = (; r=r, NBX=v1.NX ÷ r, NBY=v1.NY ÷ r, NBZ=v1.NZ ÷ r, NBT=v1.NT ÷ r,
@@ -1463,12 +1472,14 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
         norms = CUDA.zeros(Float64, setup_like.Nblocks)
         for v in 1:length(vectors)
             for u in 1:(v-1)
-                @cuda threads=256 blocks=setup_like.Nblocks shmem=(256 * sizeof(ComplexF64)) _amg_orthogonalize_kernel!(
+                @cuda threads=256 blocks=setup_like.Nblocks shmem=(2 * 256 * sizeof(ComplexF64)) _amg_orthogonalize_kernel!(
                     reshape(vectors[v].f, :), reshape(vectors[u].f, :),
-                    cache[:block_sites], cache[:block_counts], coeffs, nc_ng)
+                    cache[:block_sites], cache[:block_counts], coeffs, nc_ng, normalize)
             end
-            @cuda threads=256 blocks=setup_like.Nblocks shmem=(256 * sizeof(Float64)) _amg_normalize_kernel!(
-                reshape(vectors[v].f, :), cache[:block_sites], cache[:block_counts], norms, nc_ng)
+            if normalize
+                @cuda threads=256 blocks=setup_like.Nblocks shmem=(256 * sizeof(Float64)) _amg_normalize_kernel!(
+                    reshape(vectors[v].f, :), cache[:block_sites], cache[:block_counts], norms, nc_ng)
+            end
         end
         return vectors
     end
@@ -1501,12 +1512,17 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
         # Modified Gram-Schmidt
         for v = 1:Nv
             for u = 1:(v-1)
-                proj = dot(local_vecs[u], local_vecs[v])
+                den = dot(local_vecs[u], local_vecs[u])
+                proj = normalize || real(den) <= 1e-28 ?
+                       dot(local_vecs[u], local_vecs[v]) :
+                       dot(local_vecs[u], local_vecs[v]) / den
                 local_vecs[v] .-= proj .* local_vecs[u]
             end
-            nrm = norm(local_vecs[v])
-            if nrm > 1e-14
-                local_vecs[v] ./= nrm
+            if normalize
+                nrm = norm(local_vecs[v])
+                if nrm > 1e-14
+                    local_vecs[v] ./= nrm
+                end
             end
         end
 
@@ -1529,12 +1545,12 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
     return vectors
 end
 
-function _block_orthonormalize_chiral_split!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
+function _block_orthonormalize_chiral_split!(vectors::Vector{T}, r::Int; normalize::Bool=true) where {T<:WF3x1}
     @assert iseven(length(vectors)) "chiral split vectors must come in plus/minus pairs"
     plus_vectors = vectors[1:2:end]
     minus_vectors = vectors[2:2:end]
-    block_orthonormalize!(plus_vectors, r)
-    block_orthonormalize!(minus_vectors, r)
+    block_orthonormalize!(plus_vectors, r; normalize=normalize)
+    block_orthonormalize!(minus_vectors, r; normalize=normalize)
     return vectors
 end
 
@@ -2486,7 +2502,8 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                           setup_smoother::Symbol=:mr,
                           vcycle_update_smoother::Symbol=:sap,
                           use_chirality::Bool=false,
-                          precompute_coarse::Bool=true)
+                          precompute_coarse::Bool=true,
+                          block_normalize::Bool=true)
     NX, NY, NZ, NT = template.NX, template.NY, template.NZ, template.NT
     NC, NG = template.NC, template.NG
 
@@ -2568,9 +2585,9 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                 cur_vectors = _copy_wf_vector(test_vectors)
                 if use_chirality
                     cur_vectors = _chiral_split_vectors(cur_vectors)
-                    _block_orthonormalize_chiral_split!(cur_vectors, r)
+                    _block_orthonormalize_chiral_split!(cur_vectors, r; normalize=block_normalize)
                 else
-                    block_orthonormalize!(cur_vectors, r)
+                    block_orthonormalize!(cur_vectors, r; normalize=block_normalize)
                 end
                 cur_Nv = length(cur_vectors)
                 cur_setup = DDalphaAMG_Setup{typeof(template)}(
@@ -2612,7 +2629,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                 println("  smoothing test vectors with SAP ($nsmooth iterations)...")
             end
             # SAP needs a temporary setup for block-local smoothing.
-            block_orthonormalize!(test_vectors, r)
+            block_orthonormalize!(test_vectors, r; normalize=block_normalize)
             pre_setup = DDalphaAMG_Setup{typeof(template)}(
                 test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
                 NBX, NBY, NBZ, NBT, Nblocks, nothing,
@@ -2640,14 +2657,14 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
     end
     Nv_setup = length(test_vectors)
 
-    # 3. Block orthonormalization
+    # 3. Block orthogonalization / orthonormalization
     if verbose
-        println("  block orthonormalizing...")
+        println(block_normalize ? "  block orthonormalizing..." : "  block orthogonalizing without normalization...")
     end
     if use_chirality
-        _block_orthonormalize_chiral_split!(test_vectors, r)
+        _block_orthonormalize_chiral_split!(test_vectors, r; normalize=block_normalize)
     else
-        block_orthonormalize!(test_vectors, r)
+        block_orthonormalize!(test_vectors, r; normalize=block_normalize)
     end
 
     setup = DDalphaAMG_Setup{typeof(template)}(
