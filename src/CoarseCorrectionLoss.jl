@@ -123,8 +123,8 @@ mutable struct CoarseCorrectionLoss_Layer <: Layer
                                         activation::ActivationFunction=Identity())
         operator in (:dirac, :normal, :gamma5dirac) ||
             throw(ArgumentError("operator must be :dirac, :normal, or :gamma5dirac, got $operator"))
-        objective in (:ratio, :negloggain, :hutchinson, :hutchinson_abs, :frobenius) ||
-            throw(ArgumentError("objective must be :ratio, :negloggain, :hutchinson, :hutchinson_abs, or :frobenius, got $objective"))
+        objective in (:ratio, :negloggain, :hutchinson, :hutchinson_abs, :frobenius, :cycle_frobenius) ||
+            throw(ArgumentError("objective must be :ratio, :negloggain, :hutchinson, :hutchinson_abs, :frobenius, or :cycle_frobenius, got $objective"))
         cycle_smoother in (:mr, :richardson) ||
             throw(ArgumentError("cycle_smoother must be :mr or :richardson, got $cycle_smoother"))
         new(D, error_vector, block_size, nsmooth, use_chirality,
@@ -168,7 +168,7 @@ function _z4_probe!(x::CCL_WF3x1, rng::AbstractRNG=Random.default_rng())
     return x
 end
 
-_uses_hutchinson_probe(objective::Symbol) = objective in (:hutchinson, :hutchinson_abs)
+_uses_hutchinson_probe(objective::Symbol) = objective in (:hutchinson, :hutchinson_abs, :cycle_frobenius)
 
 function refresh_error_vector!(layer::CoarseCorrectionLoss_Layer, D_new=layer.D)
     errors = _error_vectors(layer)
@@ -482,71 +482,6 @@ function _orthonormalization_pullback!(out_grads::Vector, q_grads::Vector,
     return out_grads
 end
 
-function _project_bilinear_block_span!(grads::Vector, z::Vector{T}, r::Int) where {T<:CCL_WF3x1}
-    n = length(z)
-    n == length(grads) || error("gradient/vector count mismatch in block span projection")
-    isempty(z) && return grads
-    NX, NY, NZ, NT = z[1].NX, z[1].NY, z[1].NZ, z[1].NT
-    NC, NG = z[1].NC, z[1].NG
-    NBX = NX ÷ r; NBY = NY ÷ r; NBZ = NZ ÷ r; NBT = NT ÷ r
-    nc_ng = NC * NG
-
-    z_arrays = [_field_array_cpu(v) for v in z]
-    g_arrays = [_field_array_cpu(g) for g in grads]
-
-    @inbounds for bt in 1:NBT, bz in 1:NBZ, by in 1:NBY, bx in 1:NBX
-        sites = Int[]
-        sizehint!(sites, r^4)
-        for lt in 1:r, lz in 1:r, ly in 1:r, lx in 1:r
-            it = (bt - 1) * r + lt
-            iz = (bz - 1) * r + lz
-            iy = (by - 1) * r + ly
-            ix = (bx - 1) * r + lx
-            push!(sites, ix + NX * ((iy - 1) + NY * ((iz - 1) + NZ * (it - 1))))
-        end
-
-        S = zeros(ComplexF64, n, n)
-        B = zeros(ComplexF64, n, n)
-        for site in sites
-            for a in 1:nc_ng
-                lin = _field_component_linear(z_arrays[1], site, a, NX, NY, NZ, NT, NC, NG)
-                for k in 1:n
-                    zk = z_arrays[k][lin]
-                    for i in 1:n
-                        S[k, i] += z_arrays[i][lin] * zk
-                    end
-                    for j in 1:n
-                        B[k, j] += g_arrays[j][lin] * zk
-                    end
-                end
-            end
-        end
-
-        A = try
-            S \ B
-        catch
-            pinv(S) * B
-        end
-        for site in sites
-            for a in 1:nc_ng
-                lin = _field_component_linear(z_arrays[1], site, a, NX, NY, NZ, NT, NC, NG)
-                for j in 1:n
-                    corr = zero(ComplexF64)
-                    for i in 1:n
-                        corr += z_arrays[i][lin] * A[i, j]
-                    end
-                    g_arrays[j][lin] -= corr
-                end
-            end
-        end
-    end
-
-    for j in 1:n
-        _copy_field_array_to_wf!(grads[j], g_arrays[j])
-    end
-    return grads
-end
-
 function _apply_dagdiracdirac!(out, D, tmp, x)
     mul!(tmp, D, x)
     mul!(out, D', tmp)
@@ -839,23 +774,28 @@ function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
                                               cache::CCL_ErrorCache)
     e0 = cache.error
     _ensure_cache_buffers!(cache, e0)
-    full_cycle_objective = layer.objective in (:hutchinson, :hutchinson_abs, :frobenius)
+    cycle_error_objective = layer.objective == :cycle_frobenius
+    full_cycle_objective = layer.objective in (:hutchinson, :hutchinson_abs, :frobenius, :cycle_frobenius)
 
-    # Hutchinson/Frobenius mode estimates the full error-propagation operator norm:
-    #     ||A E e0||^2 / ||A e0||^2,
-    # where A is D, gamma5*D, or D'D depending on `operator`.
+    # Hutchinson/Frobenius mode estimates the full propagated error norm.
+    # For gamma5dirac, H = gamma5*D is only the coarse operator; the loss
+    # intentionally does not use ||H E e0||^2, because that would suppress
+    # the low modes multigrid is meant to capture.
+    # The :cycle_frobenius objective estimates the V-cycle error propagator itself:
+    #     ||E e0||^2, with ||E e0||^2 / ||e0||^2 kept as the diagnostic ratio.
     #
     # The older :ratio objective keeps the conditional denominator after
     # pre-smoothing:
     #     ||A E e0||^2 / ||A S_pre e0||^2.
     initial_denominator = NaN
-    if full_cycle_objective
+    if cycle_error_objective
+        initial_denominator = max(real(inner_product(e0, e0)), eps(Float64))
+    elseif full_cycle_objective
         if layer.operator == :dirac
             mul!(cache.tmp, layer.D, e0)
             initial_denominator = max(real(inner_product(cache.tmp, cache.tmp)), eps(Float64))
         elseif layer.operator == :gamma5dirac
-            _apply_gamma5dirac!(cache.tmp, layer.D, e0)
-            initial_denominator = max(real(inner_product(cache.tmp, cache.tmp)), eps(Float64))
+            initial_denominator = max(real(inner_product(e0, e0)), eps(Float64))
         else
             _apply_dagdiracdirac!(cache.tmp, layer.D, cache.tmp2, e0)
             initial_denominator = max(real(inner_product(e0, cache.tmp)), eps(Float64))
@@ -900,16 +840,21 @@ function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
         denominator = max(real(inner_product(cache.Ae, cache.Ae)), eps(Float64))
         opt = restrict_f2c(setup, cache.tmp)     # P' D r, should be small after Dc solve.
     elseif layer.operator == :gamma5dirac
-        _apply_gamma5dirac!(cache.tmp, layer.D, q)       # Hq
-        _apply_gamma5dirac!(cache.Ar, layer.D, cache.tmp) # H'Hq = H^2 q
-        numerator = real(inner_product(cache.tmp, cache.tmp))
-        denominator = max(real(inner_product(cache.Ae, cache.Ae)), eps(Float64))
+        _apply_gamma5dirac!(cache.tmp, layer.D, q)       # Hq, diagnostic only.
+        _copyto_wf!(cache.Ar, q)
+        numerator = real(inner_product(q, q))
+        denominator = max(real(inner_product(e, e)), eps(Float64))
         opt = restrict_f2c(setup, cache.tmp)     # P' H r, should be small after Hc solve.
     else
         _apply_dagdiracdirac!(cache.Ar, layer.D, cache.tmp, q)
         numerator = real(inner_product(q, cache.Ar))
         denominator = max(real(inner_product(e, cache.Ae)), eps(Float64))
         opt = restrict_f2c(setup, cache.Ar)
+    end
+    if cycle_error_objective
+        numerator = real(inner_product(q, q))
+        denominator = initial_denominator
+        _copyto_wf!(cache.Ar, q)
     end
     if layer.cycle_post_smooth_steps > 0 && layer.cycle_smoother == :richardson
         _copyto_wf!(cache.tmp2, cache.Ar)
@@ -928,6 +873,12 @@ function _coarse_correction_loss_forward_one!(layer::CoarseCorrectionLoss_Layer,
         loss = -log(effective_gain)
         grad_scale = 1.0 / effective_gain
     elseif layer.objective == :hutchinson_abs
+        denominator = 1.0
+        ratio = numerator / initial_denominator
+        gain = 1.0 - ratio
+        loss = numerator
+        grad_scale = 1.0
+    elseif cycle_error_objective
         denominator = 1.0
         ratio = numerator / initial_denominator
         gain = 1.0 - ratio
@@ -1213,15 +1164,6 @@ function _ccl_tangent_col_kernel!(out, cols, n::Int32, nblocks::Int32, j::Int32)
     return nothing
 end
 
-function _ccl_horizontal_col_kernel!(out, cols, n::Int32, nblocks::Int32, j::Int32)
-    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
-    total = n * nblocks
-    if idx <= total
-        out[idx] = cols[(j - Int32(1)) * total + idx]
-    end
-    return nothing
-end
-
 function _project_tangent_gpu!(grads::Vector, setup::DDalphaAMG_Setup)
     n = setup.Nv
     nblocks = setup.Nblocks
@@ -1239,30 +1181,6 @@ function _project_tangent_gpu!(grads::Vector, setup::DDalphaAMG_Setup)
     blocks = cld(total, threads)
     for j in 1:n
         @cuda threads=threads blocks=blocks _ccl_tangent_col_kernel!(
-            hcol.data, cols, Int32(n), Int32(nblocks), Int32(j))
-        prolongate_c2f!(corr, setup, hcol)
-        axpby!(-1, corr, 1, grads[j])
-    end
-    return grads
-end
-
-function _project_horizontal_gpu!(grads::Vector, setup::DDalphaAMG_Setup)
-    n = setup.Nv
-    nblocks = setup.Nblocks
-    total = n * nblocks
-    cols = CUDA.zeros(ComplexF64, total * n)
-    tmp_cv = _coarse_vector_like(setup)
-    for j in 1:n
-        restrict_f2c!(tmp_cv, setup, grads[j])
-        copyto!(view(cols, ((j - 1) * total + 1):(j * total)), tmp_cv.data)
-    end
-
-    hcol = _coarse_vector_like(setup)
-    corr = similar(setup.test_vectors[1])
-    threads = 256
-    blocks = cld(total, threads)
-    for j in 1:n
-        @cuda threads=threads blocks=blocks _ccl_horizontal_col_kernel!(
             hcol.data, cols, Int32(n), Int32(nblocks), Int32(j))
         prolongate_c2f!(corr, setup, hcol)
         axpby!(-1, corr, 1, grads[j])
@@ -1292,35 +1210,6 @@ function _project_tangent!(grads::Vector, setup::DDalphaAMG_Setup)
                 mij = mcols[j][base + i]
                 mji = mcols[i][base + j]
                 data[base + i] = 0.5 * (mij + conj(mji))
-            end
-        end
-        _assign_coarse_data!(hcol, data)
-        prolongate_c2f!(corr, setup, hcol)
-        axpby!(-1, corr, 1, grads[j])
-    end
-    return grads
-end
-
-function _project_horizontal!(grads::Vector, setup::DDalphaAMG_Setup)
-    if setup.test_vectors[1] isa CCL_WF3x1GPU
-        return _project_horizontal_gpu!(grads, setup)
-    end
-
-    n = setup.Nv
-    nblocks = setup.Nblocks
-    mcols = Vector{Vector{ComplexF64}}(undef, n)
-    for j in 1:n
-        mcols[j] = _coarse_data_cpu(restrict_f2c(setup, grads[j]))
-    end
-
-    hcol = _coarse_vector_like(setup)
-    corr = similar(setup.test_vectors[1])
-    data = Vector{ComplexF64}(undef, n * nblocks)
-    for j in 1:n
-        for b in 1:nblocks
-            base = (b - 1) * n
-            for i in 1:n
-                data[base + i] = mcols[j][base + i]
             end
         end
         _assign_coarse_data!(hcol, data)
@@ -1425,8 +1314,9 @@ function activation.DeltaRule!(layer::CoarseCorrectionLoss_Layer, ::Identity,
         elseif layer.operator == :gamma5dirac
             denom = cache.denominator
 
-            # Explicit term from r = e - P*y: -g_r*y', where g_r = 2H'Hr / ||He||^2
-            # and H = gamma5*D is Hermitian.
+            # Explicit term from r = e - P*y: -g_r*y', where g_r is the
+            # propagated error gradient. H = gamma5*D is used only in the
+            # coarse Galerkin solve, not as an extra loss metric.
             for j in 1:nP
                 _fill_basis_gradient!(layer._one_split_grad[j], cache.Ar, coeffs, setup, j, -2.0 / denom)
             end

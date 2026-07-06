@@ -3605,7 +3605,8 @@ function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{<:WF3x1}, d::V
             copyto!(layer._grad_site_cpu, vec(site_buf))
 
             @inbounds for i in 1:nblocks_total
-                grad_W[bmap[i], k] += conj(layer._grad_site_cpu[i])
+                # grad_W[bmap[i], k] += conj(layer._grad_site_cpu[i])
+                grad_W[bmap[i], k] += layer._grad_site_cpu[i]
             end
         end
     else
@@ -3627,7 +3628,8 @@ function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{<:WF3x1}, d::V
                         s += dk[ic, ix, iy, iz, it, ig] * zk[ic, ix, iy, iz, it, ig]
                     end
                 end
-                grad_W[bid, k] += conj(s)
+                # grad_W[bid, k] += conj(s)
+                grad_W[bid, k] += s
             end
         end
     end

@@ -15,7 +15,6 @@ export block_orthonormalize!
 export deflated_initial_guess
 export precompute_coarse_operator!
 export gamma5!, chiral_project!
-export compare_ddalphaamg_cpu_gpu
 
 
 const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
@@ -2134,7 +2133,7 @@ Solve the coarse-grid system `Dc * x_c = b_c` with GMRES. `Dc` is applied either
 through a precomputed coarse operator or matrix-free as `R * D * P`.
 """
 function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
-                      maxiter::Int=500, restart::Int=20, tol::Float64=1e-2,
+                      maxiter::Int=20, restart::Int=20, tol::Float64=1e-2,
                       coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing)
     x_c = similar(b_c)
     zero!(x_c)
@@ -2217,6 +2216,7 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         apply_Dc!(w_c, x_c)
         coarse_axpby!(-1.0, w_c, 1.0, r_c)
         res = coarse_norm(r_c) / b_norm
+        println("res:$(res),iter:$(iter)")
         if res < tol
             return x_c
         end
@@ -2366,7 +2366,6 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                           coarse_apply_counter=_coarse_apply_counter,
                           fine_apply_counter=_fine_apply_counter)
             total_coarse_gmres += 1
-            println("restart:$(m)","coarse_gmres:$(total_coarse_gmres)")
 
             w = similar(b)
             _amg_mul_dirac!(w, D, Z[j]; fine_apply_counter=_fine_apply_counter)
@@ -2486,6 +2485,9 @@ Arguments:
   correction and the implemented restriction remains `R = P'`.
 - `precompute_coarse`: precompute the coarse operator stencil. Solves need this,
   but matrix-free training losses can disable it.
+- `smooth_external_vectors`: when `coarse_vectors` are provided, apply the same
+  zero-RHS MR smoothing used for setup seeds before chiral splitting and block
+  orthonormalization.
 
 Example:
 ```julia
@@ -2494,7 +2496,7 @@ solution = solve_DDalphaAMG(D, b, setup; tol=1e-10)
 ```
 """
 function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
-                          nsmooth::Int=8, verbose::Bool=true,
+                          nsmooth::Int=16, verbose::Bool=true,
                           coarse_vectors::Union{Nothing,Vector{<:WF3x1}}=nothing,
                           smoother::Symbol=:mr,
                           nvcycle::Int=4,
@@ -2503,7 +2505,8 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                           vcycle_update_smoother::Symbol=:sap,
                           use_chirality::Bool=false,
                           precompute_coarse::Bool=true,
-                          block_normalize::Bool=true)
+                          block_normalize::Bool=true,
+                          smooth_external_vectors::Bool=true)
     NX, NY, NZ, NT = template.NX, template.NY, template.NZ, template.NT
     NC, NG = template.NC, template.NG
 
@@ -2536,6 +2539,14 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         test_vectors = _copy_wf_vector(coarse_vectors)
         if verbose
             println("  using externally provided test vectors")
+        end
+        if smooth_external_vectors && nsmooth > 0
+            verbose && println("  smoothing external test vectors with MR ($nsmooth iterations)...")
+            zero_rhs = similar(template)
+            zero_wf!(zero_rhs)
+            for v in 1:Nv_smooth
+                mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
+            end
         end
     else
         test_vectors = [similar(template) for _ in 1:Nv_smooth]
@@ -2716,90 +2727,6 @@ function solve_DDalphaAMG(D, b::WF3x1, setup::DDalphaAMG_Setup;
                   verbose=verbose, smoother=smoother,
                   pre_smooth=pre_smooth, post_smooth=post_smooth)
 end
-
-function _debug_field_relerr(cpu_ref::WF3x1CPU, val::WF3x1, cpu_template::WF3x1CPU)
-    val_cpu = val isa WF3x1CPU ? val : begin
-        tmp = similar(cpu_template)
-        substitute_fermion!(tmp, val)
-        CUDA.synchronize()
-        tmp
-    end
-    diff = deepcopy(cpu_ref)
-    axpby!(-1, val_cpu, 1, diff)
-    num = sqrt(real(inner_product(diff, diff)))
-    den = sqrt(real(inner_product(cpu_ref, cpu_ref)))
-    return num / max(den, eps(Float64))
-end
-
-function _debug_coarse_relerr(cpu_ref::CoarseVector, val::CoarseVector)
-    vdata = val.data isa CuArray ? Array(val.data) : val.data
-    return norm(cpu_ref.data .- vdata) / max(norm(cpu_ref.data), eps(Float64))
-end
-
-function _debug_report!(rows, name, err)
-    push!(rows, (name=name, relerr=err))
-    println(rpad(name, 28), " relerr = ", err)
-    return err
-end
-
-function compare_ddalphaamg_cpu_gpu(Dcpu, Dgpu,
-                                    bcpu::WF3x1CPU, bgpu::WF3x1GPU,
-                                    setup_cpu::DDalphaAMG_Setup,
-                                    setup_gpu::DDalphaAMG_Setup;
-                                    pre_smooth::Int=4,
-                                    post_smooth::Int=4,
-                                    coarse_tol::Float64=1e-2,
-                                    coarse_maxiter::Int=50)
-    rows = NamedTuple[]
-    println("CPU b size = ", size(bcpu.f))
-    println("GPU b size = ", size(bgpu.f),
-            " blocksize=", bgpu.blockinfo.blocksize,
-            " rsize=", bgpu.blockinfo.rsize)
-    println("CPU setup: Nv=", setup_cpu.Nv, " Nblocks=", setup_cpu.Nblocks)
-    println("GPU setup: Nv=", setup_gpu.Nv, " Nblocks=", setup_gpu.Nblocks)
-
-    _assert_same_wf_layout("setup_gpu.test_vectors[1]", setup_gpu.test_vectors[1], "bgpu", bgpu)
-
-    ntv = min(length(setup_cpu.test_vectors), length(setup_gpu.test_vectors))
-    for i in 1:ntv
-        _debug_report!(rows, "test_vector[$i]",
-            _debug_field_relerr(setup_cpu.test_vectors[i], setup_gpu.test_vectors[i], bcpu))
-    end
-
-    db_cpu = similar(bcpu)
-    db_gpu = similar(bgpu)
-    mul!(db_cpu, Dcpu, bcpu)
-    mul!(db_gpu, Dgpu, bgpu)
-    CUDA.synchronize()
-    _debug_report!(rows, "D*b", _debug_field_relerr(db_cpu, db_gpu, bcpu))
-
-    rc_cpu = restrict_f2c(setup_cpu, bcpu)
-    rc_gpu = restrict_f2c(setup_gpu, bgpu)
-    CUDA.synchronize()
-    _debug_report!(rows, "restrict_f2c(b)", _debug_coarse_relerr(rc_cpu, rc_gpu))
-
-    cg_cpu = coarse_gmres(setup_cpu, Dcpu, rc_cpu; maxiter=coarse_maxiter, tol=coarse_tol)
-    cg_gpu = coarse_gmres(setup_gpu, Dgpu, rc_gpu; maxiter=coarse_maxiter, tol=coarse_tol)
-    CUDA.synchronize()
-    _debug_report!(rows, "coarse_gmres(Rb)", _debug_coarse_relerr(cg_cpu, cg_gpu))
-
-    pc_cpu = prolongate_c2f(setup_cpu, cg_cpu)
-    pc_gpu = prolongate_c2f(setup_gpu, cg_gpu)
-    CUDA.synchronize()
-    _debug_report!(rows, "prolongate(coarse)", _debug_field_relerr(pc_cpu, pc_gpu, bcpu))
-
-    vc_cpu = vcycle(Dcpu, bcpu, setup_cpu;
-        pre_smooth=pre_smooth, post_smooth=post_smooth,
-        coarse_maxiter=coarse_maxiter, coarse_tol=coarse_tol)
-    vc_gpu = vcycle(Dgpu, bgpu, setup_gpu;
-        pre_smooth=pre_smooth, post_smooth=post_smooth,
-        coarse_maxiter=coarse_maxiter, coarse_tol=coarse_tol)
-    CUDA.synchronize()
-    _debug_report!(rows, "vcycle(b)", _debug_field_relerr(vc_cpu, vc_gpu, bcpu))
-
-    return rows
-end
-
 
 # ==========================================
 #  Deflation initial guess

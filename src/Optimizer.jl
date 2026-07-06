@@ -11,7 +11,7 @@ import ..Layer_types: PrallelTransportAttention_Layer,siteweight_Layer,Dirac_Lay
 import ..Layer_types: fermionfield_Layer
 import ..Layer_types: BlockScalar_Layer, BlockMatrix_Layer
 
-import ..gpu: gpu_adam_update!, blockscalar_adam_update!, sync_W_from_gpu!, sync_W_to_gpu!, Spin_matrix_GPU, zero_wf!
+import ..gpu: gpu_adam_update!, blockscalar_adam_update!, blockmatrix_adam_update!, sync_W_from_gpu!, sync_W_to_gpu!, Spin_matrix_GPU, zero_wf!
 
 const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
 const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
@@ -724,7 +724,7 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad::Matrix{ComplexF64})
         v_hat_im = st_im.v / (1 - opt.β2^opt.t)
         Δ_im = opt.α * m_hat_im / (sqrt(v_hat_im) + opt.ε)
 
-        layer.W[idx] -= complex(Δ_re, Δ_im)
+        layer.W[idx] -= complex(Δ_re, -Δ_im)
     end
 end
 
@@ -792,7 +792,7 @@ function update!(layer::BlockMatrix_Layer, opt::Adam, grad)
             cache[:adam_m] = CUDA.zeros(ComplexF64, size(W_gpu)...)
             cache[:adam_v] = CUDA.zeros(ComplexF64, size(W_gpu)...)
         end
-        blockscalar_adam_update!(W_gpu, cache[:adam_m], cache[:adam_v], grad_gpu,
+        blockmatrix_adam_update!(W_gpu, cache[:adam_m], cache[:adam_v], grad_gpu,
                                  opt.α, opt.β1, opt.β2, opt.ε, opt.t)
         return layer
     end
@@ -858,7 +858,7 @@ function _warm_blockscalar_adam!(layer::BlockScalar_Layer, opt::Adam)
     else
         fill!(cache[:grad], 0)
     end
-    blockscalar_adam_update!(W_gpu, cache[:adam_m], cache[:adam_v], cache[:grad],
+    blockmatrix_adam_update!(W_gpu, cache[:adam_m], cache[:adam_v], cache[:grad],
                              opt.α, opt.β1, opt.β2, opt.ε, max(opt.t, 1))
     fill!(cache[:adam_m], 0)
     fill!(cache[:adam_v], 0)
@@ -1219,6 +1219,90 @@ function _load_checkpoint_fermion_adam_field!(x::WF3x1CPU, arr, data, key_x::Str
     return _copy_checkpoint_fermion_array!(x, arr, nothing)
 end
 
+function _lattice_dims_from_layers(layers)
+    for layer in layers
+        if layer isa fermionfield_Layer && !isempty(layer.x)
+            x = layer.x[1]
+            return (Int(x.NX), Int(x.NY), Int(x.NZ), Int(x.NT))
+        end
+    end
+    return nothing
+end
+
+function _infer_block_r(nblocks::Int, dims::NTuple{4,Int})
+    volume = prod(dims)
+    volume % nblocks == 0 || return nothing
+    block_volume = volume ÷ nblocks
+    r = round(Int, block_volume^(1 / 4))
+    return r^4 == block_volume ? r : nothing
+end
+
+@inline function _block_id(bx::Int, by::Int, bz::Int, bt::Int, NBX::Int, NBY::Int, NBZ::Int)
+    return bx + NBX * ((by - 1) + NBY * ((bz - 1) + NBZ * (bt - 1)))
+end
+
+function _convert_blockscalar_weights(arr::AbstractMatrix{ComplexF64},
+                                      dims::NTuple{4,Int},
+                                      src_r::Int,
+                                      dst_r::Int)
+    src_r == dst_r && return copy(arr)
+    NX, NY, NZ, NT = dims
+    src_NBX, src_NBY, src_NBZ, src_NBT = NX ÷ src_r, NY ÷ src_r, NZ ÷ src_r, NT ÷ src_r
+    dst_NBX, dst_NBY, dst_NBZ, dst_NBT = NX ÷ dst_r, NY ÷ dst_r, NZ ÷ dst_r, NT ÷ dst_r
+    src_nblocks = src_NBX * src_NBY * src_NBZ * src_NBT
+    dst_nblocks = dst_NBX * dst_NBY * dst_NBZ * dst_NBT
+    size(arr, 1) == src_nblocks || error("source block count does not match inferred source r")
+
+    out = zeros(ComplexF64, dst_nblocks, size(arr, 2))
+    counts = zeros(Int, dst_nblocks)
+
+    if src_r < dst_r
+        dst_r % src_r == 0 || error("source r=$src_r does not divide destination r=$dst_r")
+        ratio = dst_r ÷ src_r
+        @inbounds for sbt in 1:src_NBT, sbz in 1:src_NBZ, sby in 1:src_NBY, sbx in 1:src_NBX
+            dbx = (sbx - 1) ÷ ratio + 1
+            dby = (sby - 1) ÷ ratio + 1
+            dbz = (sbz - 1) ÷ ratio + 1
+            dbt = (sbt - 1) ÷ ratio + 1
+            src_bid = _block_id(sbx, sby, sbz, sbt, src_NBX, src_NBY, src_NBZ)
+            dst_bid = _block_id(dbx, dby, dbz, dbt, dst_NBX, dst_NBY, dst_NBZ)
+            out[dst_bid, :] .+= arr[src_bid, :]
+            counts[dst_bid] += 1
+        end
+        @inbounds for bid in eachindex(counts)
+            out[bid, :] ./= counts[bid]
+        end
+    else
+        src_r % dst_r == 0 || error("destination r=$dst_r does not divide source r=$src_r")
+        ratio = src_r ÷ dst_r
+        @inbounds for dbt in 1:dst_NBT, dbz in 1:dst_NBZ, dby in 1:dst_NBY, dbx in 1:dst_NBX
+            sbx = (dbx - 1) ÷ ratio + 1
+            sby = (dby - 1) ÷ ratio + 1
+            sbz = (dbz - 1) ÷ ratio + 1
+            sbt = (dbt - 1) ÷ ratio + 1
+            src_bid = _block_id(sbx, sby, sbz, sbt, src_NBX, src_NBY, src_NBZ)
+            dst_bid = _block_id(dbx, dby, dbz, dbt, dst_NBX, dst_NBY, dst_NBZ)
+            out[dst_bid, :] .= arr[src_bid, :]
+        end
+    end
+
+    return out
+end
+
+function _maybe_convert_blockscalar_checkpoint(arr::AbstractMatrix{ComplexF64},
+                                               layer::BlockScalar_Layer,
+                                               dims)
+    size(arr) == size(layer.W) && return copy(arr)
+    dims === nothing && return nothing
+    src_r = _infer_block_r(size(arr, 1), dims)
+    src_r === nothing && return nothing
+    try
+        return _convert_blockscalar_weights(arr, dims, src_r, layer.r)
+    catch
+        return nothing
+    end
+end
+
 """
     load_checkpoint!(path, layers, opt)
 
@@ -1229,6 +1313,7 @@ Falls back silently if a layer's key is absent (partial checkpoint).
 function load_checkpoint!(path::AbstractString, layers, opt::Adam)
     data = JLD2.load(path)
     opt.t = Int(get(data, "opt_t", 0))
+    lattice_dims = _lattice_dims_from_layers(layers)
 
     for (i, layer) in enumerate(layers)
         if layer isa PTLayer || layer isa DenseLinearLayer
@@ -1260,22 +1345,30 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
         elseif layer isa BlockScalar_Layer
             key_W = "layer_$(i)_W"
             if haskey(data, key_W)
-                if size(layer.W) != size(data[key_W])
+                w_arr = _maybe_convert_blockscalar_checkpoint(data[key_W], layer, lattice_dims)
+                if w_arr === nothing
                     @warn "Skipping checkpoint BlockScalar weight with incompatible shape" layer=i key=key_W expected=size(layer.W) got=size(data[key_W])
                     continue
                 end
-                copyto!(layer.W, data[key_W])
+                copyto!(layer.W, w_arr)
                 cache = layer._gpu_w_buf
                 if cache isa Dict && haskey(cache, :W) && cache[:W] !== nothing
                     copyto!(cache[:W], layer.W)
                 end
             end
             key_m = "layer_$(i)_adam_m"
-            if haskey(data, key_m) && size(data[key_m]) == size(layer.W)
+            if haskey(data, key_m)
+                m_arr = _maybe_convert_blockscalar_checkpoint(data[key_m], layer, lattice_dims)
+                v_arr = _maybe_convert_blockscalar_checkpoint(data["layer_$(i)_adam_v"], layer, lattice_dims)
                 cache = layer._gpu_w_buf
-                if cache isa Dict
-                    cache[:adam_m] = CuArray{ComplexF64}(data[key_m])
-                    cache[:adam_v] = CuArray{ComplexF64}(data["layer_$(i)_adam_v"])
+                if cache isa Dict && haskey(cache, :W) && cache[:W] !== nothing
+                    m_arr !== nothing && (cache[:adam_m] = CuArray{ComplexF64}(m_arr))
+                    v_arr !== nothing && (cache[:adam_v] = CuArray{ComplexF64}(v_arr))
+                elseif m_arr !== nothing && v_arr !== nothing
+                    layer._gpu_w_buf = Dict{Symbol,Any}(
+                        :adam_m => m_arr,
+                        :adam_v => v_arr,
+                    )
                 end
             end
         elseif layer isa BlockMatrix_Layer

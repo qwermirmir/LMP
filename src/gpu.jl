@@ -1072,7 +1072,8 @@ function _blockscalar_grad_by_block_kernel!(
     end
 
     if tid == Int32(1)
-        @inbounds grad[bid, k] = conj(sh[Int32(1)])
+        # @inbounds grad[bid, k] = conj(sh[Int32(1)])
+        @inbounds grad[bid, k] = sh[Int32(1)]
     end
     return nothing
 end
@@ -1687,11 +1688,24 @@ function blockscalar_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
     total = length(W_gpu)
     threads = min(256, total)
     nblocks = cld(total, threads)
-    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adam_complex_standard!(
+    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adam_complex!(
         W_gpu, m_gpu, v_gpu, grad_gpu, alpha, beta1, beta2, eps, bias1, bias2)
 end
 
 export blockscalar_adam_update!
+
+function blockmatrix_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
+                                  alpha, beta1, beta2, eps, t)
+    bias1 = 1.0 / (1.0 - beta1^t)
+    bias2 = 1.0 / (1.0 - beta2^t)
+    total = length(W_gpu)
+    threads = min(256, total)
+    nblocks = cld(total, threads)
+    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adam_complex_standard!(
+        W_gpu, m_gpu, v_gpu, grad_gpu, alpha, beta1, beta2, eps, bias1, bias2)
+end
+
+export blockmatrix_adam_update!
 
 function _cudakernel_adjoint_W!(Wadj, W, n)
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x

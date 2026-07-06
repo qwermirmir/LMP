@@ -113,7 +113,6 @@ export restrict_f2c!, prolongate_c2f!, coarse_apply!
 export precompute_coarse_operator!
 export mr_smooth!, sap_smooth!
 export block_orthonormalize!,deflated_initial_guess,_to_cpu,_to_gpu,_to_cpu_gauge
-export compare_ddalphaamg_cpu_gpu
 export gamma5!, chiral_project!
 export CoarseCorrectionLoss_Layer, coarse_correction_loss_forward!
 export CloverDiracOperator, compute_Fmunu, refresh_clover!
