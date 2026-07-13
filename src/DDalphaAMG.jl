@@ -145,6 +145,170 @@ mutable struct DDalphaAMG_Setup{T<:WF3x1}
     _gpu_cache::Any
 end
 
+mutable struct AMGProfile
+    times::Dict{Symbol,Float64}
+    counts::Dict{Symbol,Int}
+    synchronize::Bool
+end
+
+AMGProfile(; synchronize::Bool=true) =
+    AMGProfile(Dict{Symbol,Float64}(), Dict{Symbol,Int}(), synchronize)
+
+function _amg_profile_add!(profile::AMGProfile, key::Symbol, seconds::Real)
+    profile.times[key] = get(profile.times, key, 0.0) + Float64(seconds)
+    return profile
+end
+
+_amg_profile_add!(::Nothing, key::Symbol, seconds::Real) = nothing
+
+function _amg_profile_count!(profile::AMGProfile, key::Symbol, n::Integer=1)
+    profile.counts[key] = get(profile.counts, key, 0) + Int(n)
+    return profile
+end
+
+_amg_profile_count!(::Nothing, key::Symbol, n::Integer=1) = nothing
+
+function _amg_profile_sync(profile::Union{Nothing,AMGProfile})
+    if profile !== nothing && profile.synchronize
+        try
+            CUDA.synchronize()
+        catch
+        end
+    end
+    return nothing
+end
+
+function _amg_profile_time!(f, profile::Union{Nothing,AMGProfile}, key::Symbol)
+    profile === nothing && return f()
+    _amg_profile_sync(profile)
+    t0 = time_ns()
+    result = f()
+    _amg_profile_sync(profile)
+    _amg_profile_add!(profile, key, (time_ns() - t0) / 1.0e9)
+    _amg_profile_count!(profile, key)
+    return result
+end
+
+function _amg_print_profile(io::IO, profile::AMGProfile)
+    total = sum(values(profile.times); init=0.0)
+    println(io, "  DD-alphaAMG profile breakdown:")
+    for (key, seconds) in sort(collect(profile.times); by=x -> x[2], rev=true)
+        pct = total > 0 ? 100 * seconds / total : 0.0
+        count = get(profile.counts, key, 0)
+        println(io, "    ", rpad(String(key), 30),
+                " time=", round(seconds; digits=6), "s",
+                "  pct=", round(pct; digits=2), "%",
+                "  count=", count)
+    end
+    return profile
+end
+
+function _amg_fine_dirac_flops_per_apply(setup::DDalphaAMG_Setup)
+    return 1320 * setup.NX * setup.NY * setup.NZ * setup.NT
+end
+
+@inline _amg_complex_matvec_flops(nrows::Int, ncols::Int) =
+    nrows * (6 * ncols + 2 * max(ncols - 1, 0))
+
+function _amg_coarse_stencil_couplings_per_block(setup::DDalphaAMG_Setup)
+    dims = (setup.NBX, setup.NBY, setup.NBZ, setup.NBT)
+    return 1 + sum(d > 2 ? 2 : 1 for d in dims)
+end
+
+function _amg_coarse_operator_flops_per_apply(setup::DDalphaAMG_Setup)
+    n = setup.Nv * setup.Nblocks
+    if setup.Dc_matrix !== nothing
+        return _amg_complex_matvec_flops(n, n)
+    end
+    couplings = _amg_coarse_stencil_couplings_per_block(setup)
+    return setup.Nblocks * couplings * _amg_complex_matvec_flops(setup.Nv, setup.Nv)
+end
+
+@inline _amg_count_flops!(counter::Nothing, n::Integer) = nothing
+@inline _amg_count_flops!(counter::Ref{Int}, n::Integer) = (counter[] += Int(n); nothing)
+@inline _amg_complex_axpby_flops(n::Integer) = 14 * Int(n)
+@inline _amg_complex_dot_flops(n::Integer) = 8 * Int(n)
+@inline _amg_complex_norm_flops(n::Integer) = 3 * Int(n)
+@inline _amg_fine_dofs(x::WF3x1) = length(x.f)
+@inline _amg_fine_dofs(setup::DDalphaAMG_Setup) =
+    setup.NX * setup.NY * setup.NZ * setup.NT * setup.NC * setup.NG
+@inline _amg_coarse_dofs(setup::DDalphaAMG_Setup) = setup.Nv * setup.Nblocks
+@inline _amg_restrict_flops(setup::DDalphaAMG_Setup) =
+    setup.Nv * _amg_fine_dofs(setup) * 8
+@inline _amg_prolongate_flops(setup::DDalphaAMG_Setup) =
+    setup.Nv * _amg_fine_dofs(setup) * 8
+
+function _amg_flop_stats(setup::DDalphaAMG_Setup,
+                         variable_fine_applications::Integer,
+                         variable_coarse_applications::Integer,
+                         variable_vector_flops::Integer=0;
+                         outer_fine_applications::Integer=0,
+                         outer_vector_flops::Integer=0)
+    fine_per_apply = _amg_fine_dirac_flops_per_apply(setup)
+    coarse_per_apply = _amg_coarse_operator_flops_per_apply(setup)
+    fine = Int(variable_fine_applications) * fine_per_apply
+    coarse = Int(variable_coarse_applications) * coarse_per_apply
+    vector = Int(variable_vector_flops)
+    preconditioner_total = fine + coarse + vector
+    outer_fine = Int(outer_fine_applications) * fine_per_apply
+    outer_vector = Int(outer_vector_flops)
+    outer_total = outer_fine + outer_vector
+    return (; fine_per_apply, coarse_per_apply,
+            fine, coarse, vector, preconditioner_total,
+            outer_fine, outer_vector, outer_total,
+            total=preconditioner_total + outer_total)
+end
+
+function _amg_print_solver_counts(io::IO,
+                                  setup::DDalphaAMG_Setup,
+                                  total_coarse_gmres::Integer,
+                                  coarse_apply_counter::Integer,
+                                  fine_apply_counter::Integer,
+                                  variable_coarse_apply_counter::Integer,
+                                  variable_fine_apply_counter::Integer,
+                                  variable_vector_flops::Integer=0,
+                                  outer_fine_applications::Integer=0,
+                                  outer_vector_flops::Integer=0)
+    flops = _amg_flop_stats(setup, variable_fine_apply_counter, variable_coarse_apply_counter,
+                            variable_vector_flops;
+                            outer_fine_applications=outer_fine_applications,
+                            outer_vector_flops=outer_vector_flops)
+    println(io, "  Total coarse GMRES calls: $total_coarse_gmres")
+    println(io, "  Total coarse operator applications: $coarse_apply_counter")
+    println(io, "  Total fine Dirac applications: $fine_apply_counter")
+    println(io, "  Variable coarse operator applications: $variable_coarse_apply_counter")
+    println(io, "  Variable fine Dirac applications: $variable_fine_apply_counter")
+    println(io, "  Outer FGMRES fine Dirac applications: $outer_fine_applications")
+    println(io, "  Fine Dirac FLOPs per apply: $(flops.fine_per_apply)")
+    println(io, "  Coarse operator FLOPs per apply: $(flops.coarse_per_apply)")
+    println(io, "  Estimated variable fine Dirac FLOPs: $(flops.fine)")
+    println(io, "  Estimated variable coarse operator FLOPs: $(flops.coarse)")
+    println(io, "  Estimated variable vector FLOPs: $(flops.vector)")
+    println(io, "  Estimated variable preconditioner FLOPs: $(flops.preconditioner_total)")
+    println(io, "  Estimated outer fine Dirac FLOPs: $(flops.outer_fine)")
+    println(io, "  Estimated outer FGMRES vector FLOPs: $(flops.outer_vector)")
+    println(io, "  Estimated outer FGMRES FLOPs: $(flops.outer_total)")
+    println(io, "  Estimated variable total FLOPs: $(flops.total)")
+    return flops
+end
+
+_amg_print_solver_counts(setup::DDalphaAMG_Setup,
+                         total_coarse_gmres::Integer,
+                         coarse_apply_counter::Integer,
+                         fine_apply_counter::Integer,
+                         variable_coarse_apply_counter::Integer,
+                         variable_fine_apply_counter::Integer,
+                         variable_vector_flops::Integer=0,
+                         outer_fine_applications::Integer=0,
+                         outer_vector_flops::Integer=0) =
+    _amg_print_solver_counts(stdout, setup, total_coarse_gmres,
+                             coarse_apply_counter, fine_apply_counter,
+                             variable_coarse_apply_counter,
+                             variable_fine_apply_counter,
+                             variable_vector_flops,
+                             outer_fine_applications,
+                             outer_vector_flops)
+
 
 """
     CoarseStencilOperator
@@ -1979,7 +2143,8 @@ Minimal Residual (MR) smoother. Each iteration computes
 `r = b - D*x`, `alpha = <D*r, r> / <D*r, D*r>`, then updates `x += alpha*r`.
 """
 function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4,
-                    fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+                    fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                    flop_counter::Union{Nothing,Ref{Int}}=nothing)
 
     Dr = similar(x)  # D*r work buffer
     r = similar(x)   # b - D*x work buffer
@@ -1989,15 +2154,18 @@ function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4,
         # r = b - D * x
         _amg_mul_dirac!(r, D, x; fine_apply_counter=fine_apply_counter)
         axpby!(1, b, -1, r)  # r = b - D*x
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
         # Dr = D * r
         _amg_mul_dirac!(Dr, D, r; fine_apply_counter=fine_apply_counter)
         num = inner_product(Dr, r)
         den = inner_product(Dr, Dr)
+        _amg_count_flops!(flop_counter, 2 * _amg_complex_dot_flops(_amg_fine_dofs(x)))
         if abs(den) < 1e-30
             break
         end
         α = num / den
         axpby!(α, r, 1, x)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
     end
     return x
 end
@@ -2012,11 +2180,13 @@ the corrections into the fine-grid solution.
 """
 function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
                      niter::Int=1, nblock_mr::Int=4,
-                     fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+                     fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                     flop_counter::Union{Nothing,Ref{Int}}=nothing)
     if x isa WF3x1GPU && b isa WF3x1GPU && _amg_can_fuse_wilson(D, x, x)
         return _sap_smooth_gpu_paper!(x, D, b, setup;
                                       niter=niter, nblock_mr=nblock_mr,
-                                      fine_apply_counter=fine_apply_counter)
+                                      fine_apply_counter=fine_apply_counter,
+                                      flop_counter=flop_counter)
     end
 
     r_blk = setup.r
@@ -2032,6 +2202,7 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
         # Global residual: res = b - D*x
         _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)           # res = D*x
         axpby!(1, b, -1, res)     # res = b - D*x
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
         # Red-black SAP. Same-color blocks are independent for nearest-neighbor Wilson D.
         for color in 0:1
@@ -2048,6 +2219,8 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
 
                     num = block_inner_product(Alr, local_r, bx, by, bz, bt, r_blk)
                     den = block_inner_product(Alr, Alr, bx, by, bz, bt, r_blk)
+                    block_dofs = r_blk^4 * setup.NC * setup.NG
+                    _amg_count_flops!(flop_counter, 2 * _amg_complex_dot_flops(block_dofs))
                     if abs(den) < 1e-30
                         break
                     end
@@ -2055,12 +2228,15 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
 
                     block_axpby!(α, local_r, 1, δ, bx, by, bz, bt, r_blk)
                     block_axpby!(-α, Alr, 1, local_r, bx, by, bz, bt, r_blk)
+                    _amg_count_flops!(flop_counter, 2 * _amg_complex_axpby_flops(block_dofs))
                 end
 
                 block_axpby!(1, δ, 1, x, bx, by, bz, bt, r_blk)
+                _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(r_blk^4 * setup.NC * setup.NG))
                 block_project!(δ, bx, by, bz, bt, r_blk)
                 _amg_mul_dirac!(Alr, D, δ; fine_apply_counter=fine_apply_counter)
                 axpby!(-1, Alr, 1, res)
+                _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
             end
         end
     end
@@ -2069,7 +2245,8 @@ end
 
 function _sap_smooth_gpu_paper!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalphaAMG_Setup;
                                 niter::Int=1, nblock_mr::Int=4,
-                                fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+                                fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                                flop_counter::Union{Nothing,Ref{Int}}=nothing)
     cache = _ensure_gpu_cache!(setup)
     bi = x.blockinfo
     total = Int32(length(x.f))
@@ -2089,6 +2266,7 @@ function _sap_smooth_gpu_paper!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalphaAMG_S
     for _ in 1:niter
         _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)
         axpby!(1, b, -1, res)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
         for color in Int32(0):Int32(1)
             @cuda threads=threads blocks=grid _amg_init_color_fields_kernel!(
@@ -2103,19 +2281,25 @@ function _sap_smooth_gpu_paper!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalphaAMG_S
                 @cuda threads=threads blocks=setup.Nblocks shmem=(2 * threads * sizeof(ComplexF64)) _amg_block_mr_dot_kernel!(
                     num, den, reshape(Alr.f, :), reshape(local_r.f, :),
                     cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ)
+                _amg_count_flops!(flop_counter,
+                    2 * setup.Nblocks * _amg_complex_dot_flops(setup.r^4 * setup.NC * setup.NG))
 
                 @cuda threads=threads blocks=grid _amg_block_mr_update_kernel!(
                     reshape(delta.f, :), reshape(local_r.f, :), reshape(Alr.f, :),
                     num, den, cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+                _amg_count_flops!(flop_counter,
+                    2 * setup.Nblocks * _amg_complex_axpby_flops(setup.r^4 * setup.NC * setup.NG))
             end
 
             @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
                 reshape(x.f, :), reshape(delta.f, :), cache[:bmap],
                 nc_ng, total, color, NBX, NBY, NBZ)
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
             _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
             @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
                 reshape(res.f, :), reshape(Ddelta.f, :))
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
         end
     end
     return x
@@ -2134,10 +2318,16 @@ through a precomputed coarse operator or matrix-free as `R * D * P`.
 """
 function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
                       maxiter::Int=20, restart::Int=20, tol::Float64=1e-2,
-                      coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+                      coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                      flop_counter::Union{Nothing,Ref{Int}}=nothing,
+                      profile::Union{Nothing,AMGProfile}=nothing)
     x_c = similar(b_c)
     zero!(x_c)
-    b_norm = coarse_norm(b_c)
+    b_norm = _amg_profile_time!(profile, :coarse_rhs_norm) do
+        coarse_norm(b_c)
+    end
+    ncoarse = length(b_c.data)
+    _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
     if b_norm < 1e-30
         return x_c
     end
@@ -2159,12 +2349,14 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
 
     # Helper for coarse-operator application.
     @inline function apply_Dc!(w, v)
-        if has_stencil
-            apply_coarse_stencil!(w, setup.coarse_stencil, v)
-        elseif has_Dc
-            mul!(w.data, setup.Dc_matrix, v.data)
-        else
-            coarse_apply!(w, setup, D, v, fine_buf1, fine_buf2)
+        _amg_profile_time!(profile, :coarse_apply) do
+            if has_stencil
+                apply_coarse_stencil!(w, setup.coarse_stencil, v)
+            elseif has_Dc
+                mul!(w.data, setup.Dc_matrix, v.data)
+            else
+                coarse_apply!(w, setup, D, v, fine_buf1, fine_buf2)
+            end
         end
         coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
     end
@@ -2173,9 +2365,15 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         # residual: r = b - Dc*x
         r_c.data .= b_c.data
         apply_Dc!(w_c, x_c)
-        coarse_axpby!(-1.0, w_c, 1.0, r_c)
+        _amg_profile_time!(profile, :coarse_residual_axpby) do
+            coarse_axpby!(-1.0, w_c, 1.0, r_c)
+        end
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
 
-        β = coarse_norm(r_c)
+        β = _amg_profile_time!(profile, :coarse_residual_norm) do
+            coarse_norm(r_c)
+        end
+        _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
         if β / b_norm < tol
             return x_c
         end
@@ -2183,6 +2381,7 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         # Arnoldi process
         fill!(H, zero(ComplexF64))
         V[1].data .= r_c.data ./ β
+        _amg_count_flops!(flop_counter, 2 * ncoarse)
 
         j_final = m
         for j = 1:m
@@ -2190,33 +2389,57 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
 
             # Modified Gram-Schmidt
             for i = 1:j
-                H[i,j] = coarse_dot(V[i], w_c)
-                coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
+                H[i,j] = _amg_profile_time!(profile, :coarse_mgs_dot) do
+                    coarse_dot(V[i], w_c)
+                end
+                _amg_profile_time!(profile, :coarse_mgs_axpby) do
+                    coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
+                end
+                _amg_count_flops!(flop_counter,
+                    _amg_complex_dot_flops(ncoarse) + _amg_complex_axpby_flops(ncoarse))
             end
-            H[j+1,j] = coarse_norm(w_c)
+            H[j+1,j] = _amg_profile_time!(profile, :coarse_mgs_norm) do
+                coarse_norm(w_c)
+            end
+            _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
 
             if abs(H[j+1,j]) < 1e-14
                 j_final = j
                 break
             end
-            V[j+1].data .= w_c.data ./ H[j+1,j]
+            _amg_profile_time!(profile, :coarse_mgs_normalize) do
+                V[j+1].data .= w_c.data ./ H[j+1,j]
+            end
+            _amg_count_flops!(flop_counter, 2 * ncoarse)
         end
 
         # Least-squares solve: min ||beta*e1 - H*y||.
         fill!(e1, zero(ComplexF64))
         e1[1] = β
-        y = H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
+        y = _amg_profile_time!(profile, :coarse_lstsq) do
+            H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
+        end
+        _amg_count_flops!(flop_counter, 16 * j_final^3)
 
         for k = 1:j_final
-            coarse_axpby!(y[k], V[k], 1.0, x_c)
+            _amg_profile_time!(profile, :coarse_solution_update) do
+                coarse_axpby!(y[k], V[k], 1.0, x_c)
+            end
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
         end
 
         # Convergence check
         r_c.data .= b_c.data
         apply_Dc!(w_c, x_c)
-        coarse_axpby!(-1.0, w_c, 1.0, r_c)
-        res = coarse_norm(r_c) / b_norm
-        println("res:$(res),iter:$(iter)")
+        _amg_profile_time!(profile, :coarse_check_axpby) do
+            coarse_axpby!(-1.0, w_c, 1.0, r_c)
+        end
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
+        res = _amg_profile_time!(profile, :coarse_check_norm) do
+            coarse_norm(r_c)
+        end / b_norm
+        _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
+        # println("res:$(res),iter:$(iter)")
         if res < tol
             return x_c
         end
@@ -2247,7 +2470,9 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 coarse_maxiter::Int=50, coarse_tol::Float64=1e-2,
                 smoother::Symbol=:mr,
                 coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
-                fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+                fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                flop_counter::Union{Nothing,Ref{Int}}=nothing,
+                profile::Union{Nothing,AMGProfile}=nothing)
     x = similar(b)
     zero_wf!(x)
 
@@ -2257,35 +2482,55 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
     r_coarse = _coarse_vector(setup)
 
     # 1. Pre-smoothing
-    if smoother == :sap
-        sap_smooth!(x, D, b, setup; niter=1, nblock_mr=pre_smooth,
-                    fine_apply_counter=fine_apply_counter)
-    else
-        mr_smooth!(x, D, b; niter=pre_smooth,
-                   fine_apply_counter=fine_apply_counter)
+    _amg_profile_time!(profile, :vcycle_pre_smooth) do
+        if smoother == :sap
+            sap_smooth!(x, D, b, setup; niter=1, nblock_mr=pre_smooth,
+                        fine_apply_counter=fine_apply_counter,
+                        flop_counter=flop_counter)
+        else
+            mr_smooth!(x, D, b; niter=pre_smooth,
+                       fine_apply_counter=fine_apply_counter,
+                       flop_counter=flop_counter)
+        end
     end
 
     # 2. Compute residual and restrict it to the coarse grid.
-    _amg_mul_dirac!(r_fine, D, x; fine_apply_counter=fine_apply_counter)       # r_fine = D*x
-    axpby!(1, b, -1, r_fine) # r_fine = b - D*x
-    restrict_f2c!(r_coarse, setup, r_fine)
+    _amg_profile_time!(profile, :vcycle_residual_restrict) do
+        _amg_mul_dirac!(r_fine, D, x; fine_apply_counter=fine_apply_counter)       # r_fine = D*x
+        axpby!(1, b, -1, r_fine) # r_fine = b - D*x
+        restrict_f2c!(r_coarse, setup, r_fine)
+    end
+    _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(b)))
+    _amg_count_flops!(flop_counter, _amg_restrict_flops(setup))
 
     # 3. Coarse-grid solve.
-    e_coarse = coarse_gmres(setup, D, r_coarse;
-                            maxiter=coarse_maxiter, tol=coarse_tol,
-                            coarse_apply_counter=coarse_apply_counter)
+    e_coarse = _amg_profile_time!(profile, :coarse_gmres_total) do
+        coarse_gmres(setup, D, r_coarse;
+                     maxiter=coarse_maxiter, tol=coarse_tol,
+                     coarse_apply_counter=coarse_apply_counter,
+                     flop_counter=flop_counter,
+                     profile=profile)
+    end
 
     # 4. Prolongate the correction to the fine grid.
-    prolongate_c2f!(correction, setup, e_coarse)
-    axpby!(1, correction, 1, x)
+    _amg_profile_time!(profile, :vcycle_prolongate_update) do
+        prolongate_c2f!(correction, setup, e_coarse)
+        axpby!(1, correction, 1, x)
+    end
+    _amg_count_flops!(flop_counter, _amg_prolongate_flops(setup))
+    _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(b)))
 
     # 5. Post-smoothing
-    if smoother == :sap
-        sap_smooth!(x, D, b, setup; niter=1, nblock_mr=post_smooth,
-                    fine_apply_counter=fine_apply_counter)
-    else
-        mr_smooth!(x, D, b; niter=post_smooth,
-                   fine_apply_counter=fine_apply_counter)
+    _amg_profile_time!(profile, :vcycle_post_smooth) do
+        if smoother == :sap
+            sap_smooth!(x, D, b, setup; niter=1, nblock_mr=post_smooth,
+                        fine_apply_counter=fine_apply_counter,
+                        flop_counter=flop_counter)
+        else
+            mr_smooth!(x, D, b; niter=post_smooth,
+                       fine_apply_counter=fine_apply_counter,
+                       flop_counter=flop_counter)
+        end
     end
 
     return x
@@ -2308,7 +2553,9 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 maxiter::Int=100, restart::Int=20, tol::Float64=1e-10,
                 verbose::Bool=true, smoother::Symbol=:mr,
                 pre_smooth::Int=4, post_smooth::Int=4,
-                coarse_tol::Float64=1e-1)
+                coarse_tol::Float64=1e-1,
+                profile::Bool=false,
+                profile_synchronize::Bool=true)
 
     x = x0 === nothing ? similar(b) : _copy_wf(x0)
     x0 === nothing && zero_wf!(x)
@@ -2323,12 +2570,24 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
     total_coarse_gmres = 0  # coarse GMRES call counter
     _coarse_apply_counter = Ref(0)  # coarse operator application counter
     _fine_apply_counter = Ref(0)
+    _variable_coarse_apply_counter = Ref(0)
+    _variable_fine_apply_counter = Ref(0)
+    _variable_vector_flop_counter = Ref(0)
+    _outer_fine_apply_counter = Ref(0)
+    _outer_vector_flop_counter = Ref(0)
+    _profile = profile ? AMGProfile(synchronize=profile_synchronize) : nothing
+    nfine = _amg_fine_dofs(b)
 
     for cycle = 1:maxiter
         # r = b - D * x
-        _amg_mul_dirac!(r, D, x; fine_apply_counter=_fine_apply_counter)           # r = D*x
-        axpby!(1, b, -1, r)     # r = b - D*x
-        β = sqrt(real(inner_product(r, r)))
+        outer_fine_before = _fine_apply_counter[]
+        β = _amg_profile_time!(_profile, :outer_residual) do
+            _amg_mul_dirac!(r, D, x; fine_apply_counter=_fine_apply_counter)           # r = D*x
+            axpby!(1, b, -1, r)     # r = b - D*x
+            sqrt(real(inner_product(r, r)))
+        end
+        _outer_fine_apply_counter[] += _fine_apply_counter[] - outer_fine_before
+        _outer_vector_flop_counter[] += _amg_complex_axpby_flops(nfine) + _amg_complex_norm_flops(nfine)
 
         if verbose
             println("FGMRES cycle $cycle: relative residual = $(β/b_norm)")
@@ -2337,9 +2596,15 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         if β / b_norm < tol
             if verbose
                 println("FGMRES converged! ($(cycle) cycles)")
-                println("  Total coarse GMRES calls: $total_coarse_gmres")
-                println("  Total coarse operator applications: $(_coarse_apply_counter[])")
-                println("  Total fine Dirac applications: $(_fine_apply_counter[])")
+                _amg_print_solver_counts(setup, total_coarse_gmres,
+                                         _coarse_apply_counter[],
+                                         _fine_apply_counter[],
+                                         _variable_coarse_apply_counter[],
+                                         _variable_fine_apply_counter[],
+                                         _variable_vector_flop_counter[],
+                                         _outer_fine_apply_counter[],
+                                         _outer_vector_flop_counter[])
+                _profile !== nothing && _amg_print_profile(stdout, _profile)
             end
             return x
         end
@@ -2355,27 +2620,45 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         g[1] = β
 
         V[1] = r / β
+        _outer_vector_flop_counter[] += 2 * nfine
 
         j_final = m
         converged = false
         for j = 1:m
             # V-cycle preconditioner: apply M^{-1} * v_j.
-            Z[j] = vcycle(D, V[j], setup;
-                          pre_smooth=pre_smooth, post_smooth=post_smooth,
-                          coarse_tol=coarse_tol, smoother=smoother,
-                          coarse_apply_counter=_coarse_apply_counter,
-                          fine_apply_counter=_fine_apply_counter)
+            fine_before_vcycle = _fine_apply_counter[]
+            coarse_before_vcycle = _coarse_apply_counter[]
+            Z[j] = _amg_profile_time!(_profile, :vcycle_total) do
+                vcycle(D, V[j], setup;
+                       pre_smooth=pre_smooth, post_smooth=post_smooth,
+                       coarse_tol=coarse_tol, smoother=smoother,
+                       coarse_apply_counter=_coarse_apply_counter,
+                       fine_apply_counter=_fine_apply_counter,
+                       flop_counter=_variable_vector_flop_counter,
+                       profile=_profile)
+            end
             total_coarse_gmres += 1
+            _variable_fine_apply_counter[] += _fine_apply_counter[] - fine_before_vcycle
+            _variable_coarse_apply_counter[] += _coarse_apply_counter[] - coarse_before_vcycle
 
             w = similar(b)
-            _amg_mul_dirac!(w, D, Z[j]; fine_apply_counter=_fine_apply_counter)
+            outer_fine_before = _fine_apply_counter[]
+            _amg_profile_time!(_profile, :outer_apply_preconditioned_vector) do
+                _amg_mul_dirac!(w, D, Z[j]; fine_apply_counter=_fine_apply_counter)
+            end
+            _outer_fine_apply_counter[] += _fine_apply_counter[] - outer_fine_before
 
             # Modified Gram-Schmidt
-            for i = 1:j
-                H[i,j] = inner_product(V[i], w)
-                axpby!(-H[i,j], V[i], 1, w)
+            _amg_profile_time!(_profile, :outer_mgs) do
+                for i = 1:j
+                    H[i,j] = inner_product(V[i], w)
+                    axpby!(-H[i,j], V[i], 1, w)
+                end
+                H[j+1,j] = sqrt(real(inner_product(w, w)))
             end
-            H[j+1,j] = sqrt(real(inner_product(w, w)))
+            _outer_vector_flop_counter[] +=
+                j * (_amg_complex_dot_flops(nfine) + _amg_complex_axpby_flops(nfine)) +
+                _amg_complex_norm_flops(nfine)
 
             if abs(H[j+1,j]) < 1e-14
                 j_final = j
@@ -2388,6 +2671,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 break
             end
             V[j+1] = w / H[j+1,j]
+            _outer_vector_flop_counter[] += 2 * nfine
 
             for i = 1:(j-1)
                 tmp = cs[i] * H[i,j] + sn[i] * H[i+1,j]
@@ -2426,16 +2710,25 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         end
 
         # Update solution: x += Z * y.
-        for k = 1:j_final
-            axpby!(y[k], Z[k], 1, x)
+        _amg_profile_time!(_profile, :outer_solution_update) do
+            for k = 1:j_final
+                axpby!(y[k], Z[k], 1, x)
+            end
         end
+        _outer_vector_flop_counter[] += j_final * _amg_complex_axpby_flops(nfine)
 
         if converged
             if verbose
                 println("FGMRES converged at cycle $cycle, step $(j_final)!")
-                println("  Total coarse GMRES calls: $total_coarse_gmres")
-                println("  Total coarse operator applications: $(_coarse_apply_counter[])")
-                println("  Total fine Dirac applications: $(_fine_apply_counter[])")
+                _amg_print_solver_counts(setup, total_coarse_gmres,
+                                         _coarse_apply_counter[],
+                                         _fine_apply_counter[],
+                                         _variable_coarse_apply_counter[],
+                                         _variable_fine_apply_counter[],
+                                         _variable_vector_flop_counter[],
+                                         _outer_fine_apply_counter[],
+                                         _outer_vector_flop_counter[])
+                _profile !== nothing && _amg_print_profile(stdout, _profile)
             end
             return x
         end
@@ -2443,13 +2736,22 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
 
     if verbose
         r_final = similar(b)
+        outer_fine_before = _fine_apply_counter[]
         _amg_mul_dirac!(r_final, D, x; fine_apply_counter=_fine_apply_counter)
         axpby!(1, b, -1, r_final)
+        _outer_fine_apply_counter[] += _fine_apply_counter[] - outer_fine_before
+        _outer_vector_flop_counter[] += _amg_complex_axpby_flops(nfine) + _amg_complex_norm_flops(nfine)
         println("FGMRES: max iterations reached. " *
                 "Final relative residual = $(sqrt(real(inner_product(r_final, r_final)))/b_norm)")
-        println("  Total coarse GMRES calls: $total_coarse_gmres")
-        println("  Total coarse operator applications: $(_coarse_apply_counter[])")
-        println("  Total fine Dirac applications: $(_fine_apply_counter[])")
+        _amg_print_solver_counts(setup, total_coarse_gmres,
+                                 _coarse_apply_counter[],
+                                 _fine_apply_counter[],
+                                 _variable_coarse_apply_counter[],
+                                 _variable_fine_apply_counter[],
+                                 _variable_vector_flop_counter[],
+                                 _outer_fine_apply_counter[],
+                                 _outer_vector_flop_counter[])
+        _profile !== nothing && _amg_print_profile(stdout, _profile)
     end
     return x
 end
@@ -2721,11 +3023,15 @@ function solve_DDalphaAMG(D, b::WF3x1, setup::DDalphaAMG_Setup;
                           x0::Union{Nothing,WF3x1}=nothing,
                           tol::Float64=1e-10, maxiter::Int=100, restart::Int=20,
                           verbose::Bool=true, smoother::Symbol=:mr,
-                          pre_smooth::Int=4, post_smooth::Int=4)
+                          pre_smooth::Int=4, post_smooth::Int=4,
+                          profile::Bool=false,
+                          profile_synchronize::Bool=true)
     return fgmres(D, b, setup;
                   x0=x0, tol=tol, maxiter=maxiter, restart=restart,
                   verbose=verbose, smoother=smoother,
-                  pre_smooth=pre_smooth, post_smooth=post_smooth)
+                  pre_smooth=pre_smooth, post_smooth=post_smooth,
+                  profile=profile,
+                  profile_synchronize=profile_synchronize)
 end
 
 # ==========================================
