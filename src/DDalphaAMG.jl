@@ -1139,9 +1139,9 @@ function _amg_block_mr_dot_kernel!(num, den, Alr, local_r,
     acc_num = zero(ComplexF64)
     acc_den = zero(ComplexF64)
     if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
-        total_sites = block_counts[bid]
+        total = block_counts[bid] * nc_ng
         p = tid
-        while p <= total_sites * nc_ng
+        while p <= total
             site_pos = (p - Int32(1)) ÷ nc_ng + Int32(1)
             comp = (p - Int32(1)) % nc_ng + Int32(1)
             site = block_sites[site_pos, bid]
@@ -1181,11 +1181,179 @@ function _amg_block_mr_update_kernel!(delta, local_r, Alr, num, den, bmap,
         bid = bmap[site]
         if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
             d = den[bid]
-            if abs(d) > 1e-30
+            if abs(d) > 1.0e-30
                 alpha = num[bid] / d
                 delta[idx] += alpha * local_r[idx]
                 local_r[idx] -= alpha * Alr[idx]
             end
+        end
+    end
+    return nothing
+end
+
+function _amg_color_block_dot_kernel!(out, x, y, block_sites, block_counts,
+                                      nc_ng::Int32, color::Int32,
+                                      NBX::Int32, NBY::Int32, NBZ::Int32)
+    bid = Int32(blockIdx().x)
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
+    acc = zero(ComplexF64)
+    if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        total = block_counts[bid] * nc_ng
+        p = tid
+        while p <= total
+            site_pos = (p - Int32(1)) ÷ nc_ng + Int32(1)
+            comp = (p - Int32(1)) % nc_ng + Int32(1)
+            site = block_sites[site_pos, bid]
+            idx = (site - Int32(1)) * nc_ng + comp
+            acc += conj(x[idx]) * y[idx]
+            p += bsz
+        end
+    end
+    sh[tid] = acc
+    sync_threads()
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            sh[tid] += sh[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+    if tid == Int32(1)
+        out[bid] = sh[1]
+    end
+    return nothing
+end
+
+@inline function _amg_gmres_h_index(row::Int32, col::Int32, bid::Int32,
+                                    mplus::Int32, m::Int32)
+    return row + (col - Int32(1)) * mplus + (bid - Int32(1)) * mplus * m
+end
+
+function _amg_color_block_dot_h_kernel!(H, row::Int32, col::Int32,
+                                        x, y, block_sites, block_counts,
+                                        nc_ng::Int32, color::Int32,
+                                        NBX::Int32, NBY::Int32, NBZ::Int32,
+                                        mplus::Int32, m::Int32)
+    bid = Int32(blockIdx().x)
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
+    acc = zero(ComplexF64)
+    if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        total = block_counts[bid] * nc_ng
+        p = tid
+        while p <= total
+            site_pos = (p - Int32(1)) ÷ nc_ng + Int32(1)
+            comp = (p - Int32(1)) % nc_ng + Int32(1)
+            site = block_sites[site_pos, bid]
+            idx = (site - Int32(1)) * nc_ng + comp
+            acc += conj(x[idx]) * y[idx]
+            p += bsz
+        end
+    end
+    sh[tid] = acc
+    sync_threads()
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            sh[tid] += sh[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+    if tid == Int32(1)
+        H[_amg_gmres_h_index(row, col, bid, mplus, m)] = sh[1]
+    end
+    return nothing
+end
+
+function _amg_color_invnorm_from_vec_kernel!(coeff, norm_out, dotvals,
+                                             color::Int32,
+                                             NBX::Int32, NBY::Int32, NBZ::Int32)
+    bid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if bid <= length(coeff)
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            nrm = sqrt(max(real(dotvals[bid]), 0.0))
+            norm_out[bid] = nrm
+            coeff[bid] = nrm > 1.0e-30 ? ComplexF64(1.0 / nrm) : zero(ComplexF64)
+        else
+            norm_out[bid] = 0.0
+            coeff[bid] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_color_invnorm_from_h_kernel!(coeff, H, row::Int32, col::Int32,
+                                           color::Int32,
+                                           NBX::Int32, NBY::Int32, NBZ::Int32,
+                                           mplus::Int32, m::Int32)
+    bid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if bid <= length(coeff)
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            idx = _amg_gmres_h_index(row, col, bid, mplus, m)
+            nrm = sqrt(max(real(H[idx]), 0.0))
+            H[idx] = ComplexF64(nrm)
+            coeff[bid] = nrm > 1.0e-30 ? ComplexF64(1.0 / nrm) : zero(ComplexF64)
+        else
+            coeff[bid] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_color_block_axpby_coeff_kernel!(y, x, coeff, bmap,
+                                              nc_ng::Int32, total::Int32,
+                                              color::Int32,
+                                              NBX::Int32, NBY::Int32, NBZ::Int32,
+                                              α, β)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        bid = bmap[site]
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            y[idx] = α * coeff[bid] * x[idx] + β * y[idx]
+        elseif β == zero(β)
+            y[idx] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_color_block_axpby_h_kernel!(y, x, H, row::Int32, col::Int32,
+                                          bmap, nc_ng::Int32, total::Int32,
+                                          color::Int32,
+                                          NBX::Int32, NBY::Int32, NBZ::Int32,
+                                          mplus::Int32, m::Int32,
+                                          α, β)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        bid = bmap[site]
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            c = H[_amg_gmres_h_index(row, col, bid, mplus, m)]
+            y[idx] = α * c * x[idx] + β * y[idx]
+        elseif β == zero(β)
+            y[idx] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_color_gmres_update_kernel!(delta, v, ycoeff, k::Int32,
+                                         bmap, nc_ng::Int32, total::Int32,
+                                         color::Int32,
+                                         NBX::Int32, NBY::Int32, NBZ::Int32,
+                                         m::Int32)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        bid = bmap[site]
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            delta[idx] += ycoeff[k + (bid - Int32(1)) * m] * v[idx]
         end
     end
     return nothing
@@ -2170,23 +2338,95 @@ function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4,
     return x
 end
 
+function _amg_local_gmres_block_solve!(
+        δ::WF3x1, D, rhs::WF3x1,
+        bx::Int, by::Int, bz::Int, bt::Int, r_blk::Int, restart::Int,
+        V::Vector{<:WF3x1}, w::WF3x1,
+        H::Matrix{ComplexF64}, e1::Vector{ComplexF64};
+        fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+        flop_counter::Union{Nothing,Ref{Int}}=nothing,
+        block_dofs::Int)
+    block_zero!(δ, bx, by, bz, bt, r_blk)
+    fill!(H, zero(ComplexF64))
+    fill!(e1, zero(ComplexF64))
+
+    block_project!(V[1], bx, by, bz, bt, r_blk)
+    block_copy!(V[1], rhs, bx, by, bz, bt, r_blk)
+    β = sqrt(real(block_inner_product(V[1], V[1], bx, by, bz, bt, r_blk)))
+    _amg_count_flops!(flop_counter, _amg_complex_norm_flops(block_dofs))
+    β < 1e-30 && return δ
+
+    block_axpby!(1 / β, V[1], 0, V[1], bx, by, bz, bt, r_blk)
+    _amg_count_flops!(flop_counter, 2 * block_dofs)
+
+    j_final = restart
+    for j = 1:restart
+        _amg_mul_dirac!(w, D, V[j]; fine_apply_counter=fine_apply_counter)
+        block_project!(w, bx, by, bz, bt, r_blk)
+
+        for i = 1:j
+            H[i,j] = block_inner_product(V[i], w, bx, by, bz, bt, r_blk)
+            block_axpby!(-H[i,j], V[i], 1, w, bx, by, bz, bt, r_blk)
+            _amg_count_flops!(flop_counter,
+                _amg_complex_dot_flops(block_dofs) + _amg_complex_axpby_flops(block_dofs))
+        end
+
+        H[j+1,j] = sqrt(real(block_inner_product(w, w, bx, by, bz, bt, r_blk)))
+        _amg_count_flops!(flop_counter, _amg_complex_norm_flops(block_dofs))
+        if abs(H[j+1,j]) < 1e-14
+            j_final = j
+            break
+        end
+
+        block_project!(V[j+1], bx, by, bz, bt, r_blk)
+        block_copy!(V[j+1], w, bx, by, bz, bt, r_blk)
+        block_axpby!(1 / H[j+1,j], V[j+1], 0, V[j+1], bx, by, bz, bt, r_blk)
+        _amg_count_flops!(flop_counter, 2 * block_dofs)
+    end
+
+    e1[1] = β
+    y = H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
+    _amg_count_flops!(flop_counter, 16 * j_final^3)
+
+    for k = 1:j_final
+        block_axpby!(y[k], V[k], 1, δ, bx, by, bz, bt, r_blk)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(block_dofs))
+    end
+    return δ
+end
+
 
 """
-    sap_smooth!(x, D, b, setup; niter, nblock_mr)
+    sap_smooth!(x, D, b, setup; niter, block_solver, nblock_mr, nblock_gmres)
 
 Schwarz Alternating Procedure (SAP) smoother. It sweeps over coarse blocks,
-applies local minimal-residual updates with block-local support, and accumulates
-the corrections into the fine-grid solution.
+approximates each block-local system with MR by default, matching the
+DD-alphaAMG paper parameters. Set `block_solver=:gmres` to use a stronger local
+GMRES variant.
 """
 function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
-                     niter::Int=1, nblock_mr::Int=4,
+                     niter::Int=1,
+                     block_solver::Symbol=:mr,
+                     nblock_mr::Int=4,
+                     nblock_gmres::Int=nblock_mr,
                      fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                      flop_counter::Union{Nothing,Ref{Int}}=nothing)
+    block_solver in (:mr, :gmres) ||
+        throw(ArgumentError("block_solver must be :mr or :gmres, got $block_solver"))
     if x isa WF3x1GPU && b isa WF3x1GPU && _amg_can_fuse_wilson(D, x, x)
-        return _sap_smooth_gpu_paper!(x, D, b, setup;
-                                      niter=niter, nblock_mr=nblock_mr,
-                                      fine_apply_counter=fine_apply_counter,
-                                      flop_counter=flop_counter)
+        if block_solver == :mr
+            return _sap_smooth_gpu_mr_batched!(x, D, b, setup;
+                                               niter=niter,
+                                               nblock_mr=nblock_mr,
+                                               fine_apply_counter=fine_apply_counter,
+                                               flop_counter=flop_counter)
+        else
+            return _sap_smooth_gpu_gmres_batched!(x, D, b, setup;
+                                                  niter=niter,
+                                                  nblock_gmres=nblock_gmres,
+                                                  fine_apply_counter=fine_apply_counter,
+                                                  flop_counter=flop_counter)
+        end
     end
 
     r_blk = setup.r
@@ -2194,9 +2434,15 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
 
     # Preallocate reusable work buffers.
     δ      = similar(x)
-    local_r = similar(x)
-    Alr    = similar(x)
     res    = similar(x)
+    Ddelta = similar(x)
+    local_r = block_solver == :mr ? similar(x) : nothing
+    Alr = block_solver == :mr ? similar(x) : nothing
+    gmres_V = block_solver == :gmres ? [similar(x) for _ in 1:(nblock_gmres + 1)] : WF3x1[]
+    gmres_w = block_solver == :gmres ? similar(x) : nothing
+    gmres_H = block_solver == :gmres ? zeros(ComplexF64, nblock_gmres + 1, nblock_gmres) : zeros(ComplexF64, 0, 0)
+    gmres_e1 = block_solver == :gmres ? zeros(ComplexF64, nblock_gmres + 1) : ComplexF64[]
+    block_dofs = r_blk^4 * setup.NC * setup.NG
 
     for _ = 1:niter
         # Global residual: res = b - D*x
@@ -2209,102 +2455,48 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
             for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
                 ((bx + by + bz + bt) & 1) == color || continue
 
-                block_zero!(δ, bx, by, bz, bt, r_blk)
-                block_project!(local_r, bx, by, bz, bt, r_blk)
-                block_copy!(local_r, res, bx, by, bz, bt, r_blk)
+                if block_solver == :gmres
+                    _amg_local_gmres_block_solve!(
+                        δ, D, res, bx, by, bz, bt, r_blk, nblock_gmres,
+                        gmres_V, gmres_w::WF3x1, gmres_H, gmres_e1;
+                        fine_apply_counter=fine_apply_counter,
+                        flop_counter=flop_counter,
+                        block_dofs=block_dofs)
+                else
+                    block_zero!(δ, bx, by, bz, bt, r_blk)
+                    block_project!(local_r::WF3x1, bx, by, bz, bt, r_blk)
+                    block_copy!(local_r::WF3x1, res, bx, by, bz, bt, r_blk)
 
-                for _ = 1:nblock_mr
-                    _amg_mul_dirac!(Alr, D, local_r; fine_apply_counter=fine_apply_counter)
-                    block_project!(Alr, bx, by, bz, bt, r_blk)
+                    for _ = 1:nblock_mr
+                        _amg_mul_dirac!(Alr::WF3x1, D, local_r::WF3x1;
+                                        fine_apply_counter=fine_apply_counter)
+                        block_project!(Alr::WF3x1, bx, by, bz, bt, r_blk)
 
-                    num = block_inner_product(Alr, local_r, bx, by, bz, bt, r_blk)
-                    den = block_inner_product(Alr, Alr, bx, by, bz, bt, r_blk)
-                    block_dofs = r_blk^4 * setup.NC * setup.NG
-                    _amg_count_flops!(flop_counter, 2 * _amg_complex_dot_flops(block_dofs))
-                    if abs(den) < 1e-30
-                        break
+                        num = block_inner_product(Alr::WF3x1, local_r::WF3x1, bx, by, bz, bt, r_blk)
+                        den = block_inner_product(Alr::WF3x1, Alr::WF3x1, bx, by, bz, bt, r_blk)
+                        _amg_count_flops!(flop_counter, 2 * _amg_complex_dot_flops(block_dofs))
+                        if abs(den) < 1e-30
+                            break
+                        end
+                        α = num / den
+
+                        block_axpby!(α, local_r::WF3x1, 1, δ, bx, by, bz, bt, r_blk)
+                        block_axpby!(-α, Alr::WF3x1, 1, local_r::WF3x1, bx, by, bz, bt, r_blk)
+                        _amg_count_flops!(flop_counter, 2 * _amg_complex_axpby_flops(block_dofs))
                     end
-                    α = num / den
-
-                    block_axpby!(α, local_r, 1, δ, bx, by, bz, bt, r_blk)
-                    block_axpby!(-α, Alr, 1, local_r, bx, by, bz, bt, r_blk)
-                    _amg_count_flops!(flop_counter, 2 * _amg_complex_axpby_flops(block_dofs))
                 end
 
                 block_axpby!(1, δ, 1, x, bx, by, bz, bt, r_blk)
-                _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(r_blk^4 * setup.NC * setup.NG))
+                _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(block_dofs))
                 block_project!(δ, bx, by, bz, bt, r_blk)
-                _amg_mul_dirac!(Alr, D, δ; fine_apply_counter=fine_apply_counter)
-                axpby!(-1, Alr, 1, res)
+                _amg_mul_dirac!(Ddelta, D, δ; fine_apply_counter=fine_apply_counter)
+                axpby!(-1, Ddelta, 1, res)
                 _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
             end
         end
     end
     return x
 end
-
-function _sap_smooth_gpu_paper!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalphaAMG_Setup;
-                                niter::Int=1, nblock_mr::Int=4,
-                                fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
-                                flop_counter::Union{Nothing,Ref{Int}}=nothing)
-    cache = _ensure_gpu_cache!(setup)
-    bi = x.blockinfo
-    total = Int32(length(x.f))
-    nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
-    threads = 256
-    grid = cld(Int(total), threads)
-    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ)
-
-    delta = similar(x)
-    local_r = similar(x)
-    Alr = similar(x)
-    res = similar(x)
-    Ddelta = similar(x)
-    num = CUDA.zeros(ComplexF64, setup.Nblocks)
-    den = CUDA.zeros(ComplexF64, setup.Nblocks)
-
-    for _ in 1:niter
-        _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)
-        axpby!(1, b, -1, res)
-        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
-
-        for color in Int32(0):Int32(1)
-            @cuda threads=threads blocks=grid _amg_init_color_fields_kernel!(
-                reshape(delta.f, :), reshape(local_r.f, :), reshape(res.f, :),
-                cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
-
-            for _ in 1:nblock_mr
-                @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
-                    Alr.f, local_r.f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
-                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, color, NBX, NBY, NBZ)
-
-                @cuda threads=threads blocks=setup.Nblocks shmem=(2 * threads * sizeof(ComplexF64)) _amg_block_mr_dot_kernel!(
-                    num, den, reshape(Alr.f, :), reshape(local_r.f, :),
-                    cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ)
-                _amg_count_flops!(flop_counter,
-                    2 * setup.Nblocks * _amg_complex_dot_flops(setup.r^4 * setup.NC * setup.NG))
-
-                @cuda threads=threads blocks=grid _amg_block_mr_update_kernel!(
-                    reshape(delta.f, :), reshape(local_r.f, :), reshape(Alr.f, :),
-                    num, den, cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
-                _amg_count_flops!(flop_counter,
-                    2 * setup.Nblocks * _amg_complex_axpby_flops(setup.r^4 * setup.NC * setup.NG))
-            end
-
-            @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
-                reshape(x.f, :), reshape(delta.f, :), cache[:bmap],
-                nc_ng, total, color, NBX, NBY, NBZ)
-            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
-
-            _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
-            @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
-                reshape(res.f, :), reshape(Ddelta.f, :))
-            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
-        end
-    end
-    return x
-end
-
 
 # ==========================================
 #  Coarse Grid Solver: GMRES
@@ -2484,7 +2676,8 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
     # 1. Pre-smoothing
     _amg_profile_time!(profile, :vcycle_pre_smooth) do
         if smoother == :sap
-            sap_smooth!(x, D, b, setup; niter=1, nblock_mr=pre_smooth,
+            sap_smooth!(x, D, b, setup; niter=1,
+                        block_solver=:mr, nblock_mr=pre_smooth,
                         fine_apply_counter=fine_apply_counter,
                         flop_counter=flop_counter)
         else
@@ -2523,7 +2716,8 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
     # 5. Post-smoothing
     _amg_profile_time!(profile, :vcycle_post_smooth) do
         if smoother == :sap
-            sap_smooth!(x, D, b, setup; niter=1, nblock_mr=post_smooth,
+            sap_smooth!(x, D, b, setup; niter=1,
+                        block_solver=:mr, nblock_mr=post_smooth,
                         fine_apply_counter=fine_apply_counter,
                         flop_counter=flop_counter)
         else
@@ -2533,6 +2727,69 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
         end
     end
 
+    return x
+end
+
+function _sap_smooth_gpu_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalphaAMG_Setup;
+                                     niter::Int=1, nblock_mr::Int=4,
+                                     fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                                     flop_counter::Union{Nothing,Ref{Int}}=nothing)
+    cache = _ensure_gpu_cache!(setup)
+    bi = x.blockinfo
+    total = Int32(length(x.f))
+    nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
+    threads = 256
+    grid = cld(Int(total), threads)
+    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ)
+
+    delta = similar(x)
+    local_r = similar(x)
+    Alr = similar(x)
+    res = similar(x)
+    Ddelta = similar(x)
+    num = CUDA.zeros(ComplexF64, setup.Nblocks)
+    den = CUDA.zeros(ComplexF64, setup.Nblocks)
+    block_dofs = setup.r^4 * setup.NC * setup.NG
+
+    for _ in 1:niter
+        _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)
+        axpby!(1, b, -1, res)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+        for color in Int32(0):Int32(1)
+            @cuda threads=threads blocks=grid _amg_init_color_fields_kernel!(
+                reshape(delta.f, :), reshape(local_r.f, :), reshape(res.f, :),
+                cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+
+            for _ in 1:nblock_mr
+                @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
+                    Alr.f, local_r.f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
+                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, color, NBX, NBY, NBZ)
+
+                @cuda threads=threads blocks=setup.Nblocks shmem=(2 * threads * sizeof(ComplexF64)) _amg_block_mr_dot_kernel!(
+                    num, den, reshape(Alr.f, :), reshape(local_r.f, :),
+                    cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ)
+                _amg_count_flops!(flop_counter,
+                    2 * setup.Nblocks * _amg_complex_dot_flops(block_dofs))
+
+                @cuda threads=threads blocks=grid _amg_block_mr_update_kernel!(
+                    reshape(delta.f, :), reshape(local_r.f, :), reshape(Alr.f, :),
+                    num, den, cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+                _amg_count_flops!(flop_counter,
+                    2 * setup.Nblocks * _amg_complex_axpby_flops(block_dofs))
+            end
+
+            @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
+                reshape(x.f, :), reshape(delta.f, :), cache[:bmap],
+                nc_ng, total, color, NBX, NBY, NBZ)
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+            _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
+            @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
+                reshape(res.f, :), reshape(Ddelta.f, :))
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+        end
+    end
     return x
 end
 
@@ -2756,6 +3013,153 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
     return x
 end
 
+function _amg_solve_batched_gmres_y!(yhost, Hhost, betahost,
+                                     m::Int, nblocks::Int,
+                                     active_blocks::Vector{Bool})
+    mplus = m + 1
+    fill!(yhost, zero(ComplexF64))
+    @inbounds for bid in 1:nblocks
+        active_blocks[bid] || continue
+        β = betahost[bid]
+        β > 1.0e-30 || continue
+        Hloc = Matrix{ComplexF64}(undef, mplus, m)
+        for col in 1:m, row in 1:mplus
+            Hloc[row, col] = Hhost[row + (col - 1) * mplus + (bid - 1) * mplus * m]
+        end
+        rhs = zeros(ComplexF64, mplus)
+        rhs[1] = β
+        try
+            y = Hloc \ rhs
+            for k in 1:m
+                yhost[k + (bid - 1) * m] = y[k]
+            end
+        catch
+        end
+    end
+    return yhost
+end
+
+function _sap_smooth_gpu_gmres_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
+                                        setup::DDalphaAMG_Setup;
+                                        niter::Int=1, nblock_gmres::Int=4,
+                                        fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                                        flop_counter::Union{Nothing,Ref{Int}}=nothing)
+    cache = _ensure_gpu_cache!(setup)
+    bi = x.blockinfo
+    total = Int32(length(x.f))
+    nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
+    threads = 256
+    grid = cld(Int(total), threads)
+    block_grid = cld(setup.Nblocks, threads)
+    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ)
+    m = Int32(nblock_gmres)
+    mplus = Int32(nblock_gmres + 1)
+
+    δ = similar(x)
+    res = similar(x)
+    Ddelta = similar(x)
+    w = similar(x)
+    V = [similar(x) for _ in 1:(nblock_gmres + 1)]
+    H = CUDA.zeros(ComplexF64, (nblock_gmres + 1) * nblock_gmres * setup.Nblocks)
+    beta = CUDA.zeros(Float64, setup.Nblocks)
+    dotbuf = CUDA.zeros(ComplexF64, setup.Nblocks)
+    coeff = CUDA.zeros(ComplexF64, setup.Nblocks)
+    ydev = CUDA.zeros(ComplexF64, nblock_gmres * setup.Nblocks)
+
+    active_by_color = [
+        [_amg_block_color_from_bid(bid, setup.NBX, setup.NBY, setup.NBZ) == color
+         for bid in 1:setup.Nblocks]
+        for color in 0:1
+    ]
+
+    for _ in 1:niter
+        _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)
+        axpby!(1, b, -1, res)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+        for color_i in 0:1
+            color = Int32(color_i)
+            fill!(H, zero(ComplexF64))
+            fill!(ydev, zero(ComplexF64))
+
+            @cuda threads=threads blocks=grid _amg_init_color_fields_kernel!(
+                reshape(δ.f, :), reshape(V[1].f, :), reshape(res.f, :),
+                cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+
+            @cuda threads=threads blocks=setup.Nblocks shmem=(threads * sizeof(ComplexF64)) _amg_color_block_dot_kernel!(
+                dotbuf, reshape(V[1].f, :), reshape(V[1].f, :),
+                cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ)
+            @cuda threads=threads blocks=block_grid _amg_color_invnorm_from_vec_kernel!(
+                coeff, beta, dotbuf, color, NBX, NBY, NBZ)
+            @cuda threads=threads blocks=grid _amg_color_block_axpby_coeff_kernel!(
+                reshape(V[1].f, :), reshape(V[1].f, :), coeff, cache[:bmap],
+                nc_ng, total, color, NBX, NBY, NBZ, ComplexF64(1.0), ComplexF64(0.0))
+
+            for j in 1:nblock_gmres
+                @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
+                    w.f, V[j].f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
+                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, color, NBX, NBY, NBZ)
+
+                for i in 1:j
+                    @cuda threads=threads blocks=setup.Nblocks shmem=(threads * sizeof(ComplexF64)) _amg_color_block_dot_h_kernel!(
+                        H, Int32(i), Int32(j), reshape(V[i].f, :), reshape(w.f, :),
+                        cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ,
+                        mplus, m)
+                    @cuda threads=threads blocks=grid _amg_color_block_axpby_h_kernel!(
+                        reshape(w.f, :), reshape(V[i].f, :), H, Int32(i), Int32(j),
+                        cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ,
+                        mplus, m, ComplexF64(-1.0), ComplexF64(1.0))
+                    _amg_count_flops!(flop_counter,
+                        setup.Nblocks * (_amg_complex_dot_flops(setup.r^4 * setup.NC * setup.NG) +
+                                         _amg_complex_axpby_flops(setup.r^4 * setup.NC * setup.NG)))
+                end
+
+                @cuda threads=threads blocks=setup.Nblocks shmem=(threads * sizeof(ComplexF64)) _amg_color_block_dot_h_kernel!(
+                    H, Int32(j + 1), Int32(j), reshape(w.f, :), reshape(w.f, :),
+                    cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ,
+                    mplus, m)
+                @cuda threads=threads blocks=block_grid _amg_color_invnorm_from_h_kernel!(
+                    coeff, H, Int32(j + 1), Int32(j), color, NBX, NBY, NBZ, mplus, m)
+                _amg_count_flops!(flop_counter,
+                    setup.Nblocks * _amg_complex_norm_flops(setup.r^4 * setup.NC * setup.NG))
+
+                if j < nblock_gmres
+                    @cuda threads=threads blocks=grid _amg_color_block_axpby_coeff_kernel!(
+                        reshape(V[j + 1].f, :), reshape(w.f, :), coeff, cache[:bmap],
+                        nc_ng, total, color, NBX, NBY, NBZ, ComplexF64(1.0), ComplexF64(0.0))
+                end
+            end
+
+            Hhost = Array(H)
+            betahost = Array(beta)
+            yhost = zeros(ComplexF64, nblock_gmres * setup.Nblocks)
+            _amg_solve_batched_gmres_y!(yhost, Hhost, betahost,
+                                        nblock_gmres, setup.Nblocks,
+                                        active_by_color[color_i + 1])
+            copyto!(ydev, CuArray(yhost))
+            fill!(δ.f, zero(ComplexF64))
+            for k in 1:nblock_gmres
+                @cuda threads=threads blocks=grid _amg_color_gmres_update_kernel!(
+                    reshape(δ.f, :), reshape(V[k].f, :), ydev, Int32(k),
+                    cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ, m)
+                _amg_count_flops!(flop_counter,
+                    setup.Nblocks * _amg_complex_axpby_flops(setup.r^4 * setup.NC * setup.NG))
+            end
+
+            @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
+                reshape(x.f, :), reshape(δ.f, :), cache[:bmap],
+                nc_ng, total, color, NBX, NBY, NBZ)
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+            _amg_mul_dirac!(Ddelta, D, δ; fine_apply_counter=fine_apply_counter)
+            @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
+                reshape(res.f, :), reshape(Ddelta.f, :))
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+        end
+    end
+    return x
+end
+
 
 # ==========================================
 #  Full setup
@@ -2781,6 +3185,20 @@ Arguments:
 - `smoother`: `:mr`, `:sap`, or `:vcycle`.
 - `nvcycle`: adaptive V-cycle setup iterations when `smoother=:vcycle`.
 - `vcycle_pre_smooth`, `vcycle_post_smooth`: V-cycle smoothing counts.
+- `setup_sap_iters`: red-black SAP sweeps used when setup smoothing uses SAP.
+- `setup_block_solver`: block-local solver inside setup SAP sweeps. `:mr`
+  matches the DD-alphaAMG paper default; `:gmres` keeps the stronger optional path.
+- `setup_block_mr_steps`: block-local MR steps inside each setup SAP sweep.
+- `setup_block_gmres_steps`: block-local GMRES steps inside each setup SAP sweep
+  when `setup_block_solver=:gmres`.
+- `vcycle_post_sap_iters`: red-black SAP sweeps used by the adaptive setup
+  V-cycle post-smoother when `vcycle_update_smoother=:sap`.
+- `vcycle_post_block_solver`: block-local solver inside each adaptive setup
+  V-cycle SAP post-smoothing sweep.
+- `vcycle_post_block_mr_steps`: block-local MR steps inside each adaptive setup
+  V-cycle SAP post-smoothing sweep.
+- `vcycle_post_block_gmres_steps`: block-local GMRES steps inside each adaptive setup
+  V-cycle SAP post-smoothing sweep when `vcycle_post_block_solver=:gmres`.
 - `use_chirality`: follow the paper's chiral coarsening: split each prototype
   into upper/lower chiral components, yielding `2*Nv` coarse vectors. In this
   basis `P' * gamma5 = sigma3 * P'`, so the gamma5 factors cancel in the
@@ -2804,7 +3222,15 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                           nvcycle::Int=4,
                           vcycle_pre_smooth::Int=4, vcycle_post_smooth::Int=4,
                           setup_smoother::Symbol=:mr,
+                          setup_sap_iters::Int=1,
+                          setup_block_solver::Symbol=:mr,
+                          setup_block_mr_steps::Int=4,
+                          setup_block_gmres_steps::Int=setup_block_mr_steps,
                           vcycle_update_smoother::Symbol=:sap,
+                          vcycle_post_sap_iters::Int=1,
+                          vcycle_post_block_solver::Symbol=setup_block_solver,
+                          vcycle_post_block_mr_steps::Int=4,
+                          vcycle_post_block_gmres_steps::Int=vcycle_post_block_mr_steps,
                           use_chirality::Bool=false,
                           precompute_coarse::Bool=true,
                           block_normalize::Bool=true,
@@ -2843,11 +3269,40 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             println("  using externally provided test vectors")
         end
         if smooth_external_vectors && nsmooth > 0
-            verbose && println("  smoothing external test vectors with MR ($nsmooth iterations)...")
             zero_rhs = similar(template)
             zero_wf!(zero_rhs)
-            for v in 1:Nv_smooth
-                mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
+            setup_smoother in (:mr, :sap) ||
+                throw(ArgumentError("setup_smoother must be :mr or :sap, got $setup_smoother"))
+            if setup_smoother == :sap
+                setup_sap_iters > 0 ||
+                    throw(ArgumentError("setup_sap_iters must be positive, got $setup_sap_iters"))
+                setup_block_solver in (:mr, :gmres) ||
+                    throw(ArgumentError("setup_block_solver must be :mr or :gmres, got $setup_block_solver"))
+                setup_block_mr_steps > 0 ||
+                    throw(ArgumentError("setup_block_mr_steps must be positive, got $setup_block_mr_steps"))
+                setup_block_gmres_steps > 0 ||
+                    throw(ArgumentError("setup_block_gmres_steps must be positive, got $setup_block_gmres_steps"))
+                block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
+                block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
+                verbose && println("  smoothing external test vectors with SAP ($(setup_sap_iters) sweeps, $(block_steps) $(block_name) steps)...")
+                sap_setup = DDalphaAMG_Setup{typeof(template)}(
+                    test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
+                    NBX, NBY, NBZ, NBT, Nblocks, nothing,
+                    nothing,
+                    CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
+                )
+                for v in 1:Nv_smooth
+                    sap_smooth!(test_vectors[v], D, zero_rhs, sap_setup;
+                                niter=setup_sap_iters,
+                                block_solver=setup_block_solver,
+                                nblock_mr=setup_block_mr_steps,
+                                nblock_gmres=setup_block_gmres_steps)
+                end
+            else
+                verbose && println("  smoothing external test vectors with MR ($nsmooth iterations)...")
+                for v in 1:Nv_smooth
+                    mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
+                end
             end
         end
     else
@@ -2876,14 +3331,45 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                 throw(ArgumentError("setup_smoother must be :mr or :sap, got $setup_smoother"))
             vcycle_update_smoother in (:mr, :sap) ||
                 throw(ArgumentError("vcycle_update_smoother must be :mr or :sap, got $vcycle_update_smoother"))
+            setup_block_solver in (:mr, :gmres) ||
+                throw(ArgumentError("setup_block_solver must be :mr or :gmres, got $setup_block_solver"))
+            vcycle_post_block_solver in (:mr, :gmres) ||
+                throw(ArgumentError("vcycle_post_block_solver must be :mr or :gmres, got $vcycle_post_block_solver"))
+            setup_sap_iters > 0 ||
+                throw(ArgumentError("setup_sap_iters must be positive, got $setup_sap_iters"))
+            setup_block_mr_steps > 0 ||
+                throw(ArgumentError("setup_block_mr_steps must be positive, got $setup_block_mr_steps"))
+            setup_block_gmres_steps > 0 ||
+                throw(ArgumentError("setup_block_gmres_steps must be positive, got $setup_block_gmres_steps"))
+            vcycle_post_sap_iters > 0 ||
+                throw(ArgumentError("vcycle_post_sap_iters must be positive, got $vcycle_post_sap_iters"))
+            vcycle_post_block_mr_steps > 0 ||
+                throw(ArgumentError("vcycle_post_block_mr_steps must be positive, got $vcycle_post_block_mr_steps"))
+            vcycle_post_block_gmres_steps > 0 ||
+                throw(ArgumentError("vcycle_post_block_gmres_steps must be positive, got $vcycle_post_block_gmres_steps"))
             if verbose
-                println("  [Algorithm 16 setup] Phase 1: $(setup_smoother) smoothing ($nsmooth steps)...")
-                println("  [Algorithm 16 setup] adaptive post-smoother: $(vcycle_update_smoother) ($vcycle_post_smooth steps)")
+                if setup_smoother == :sap
+                    setup_block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
+                    setup_block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
+                    println("  [Algorithm 16 setup] Phase 1: SAP ($(setup_sap_iters) sweeps, $(setup_block_steps) $(setup_block_name) steps)...")
+                else
+                    println("  [Algorithm 16 setup] Phase 1: MR ($nsmooth steps)...")
+                end
+                if vcycle_update_smoother == :sap
+                    post_block_steps = vcycle_post_block_solver == :mr ? vcycle_post_block_mr_steps : vcycle_post_block_gmres_steps
+                    post_block_name = vcycle_post_block_solver == :mr ? "block-MR" : "block-GMRES"
+                    println("  [Algorithm 16 setup] adaptive post-smoother: SAP ($(vcycle_post_sap_iters) sweeps, $(post_block_steps) $(post_block_name) steps)")
+                else
+                    println("  [Algorithm 16 setup] adaptive post-smoother: MR ($vcycle_post_smooth steps)")
+                end
             end
             for v in 1:Nv_smooth
                 if setup_smoother == :sap
                     sap_smooth!(test_vectors[v], D, zero_rhs, sap_setup;
-                                niter=1, nblock_mr=nsmooth,
+                                niter=setup_sap_iters,
+                                block_solver=setup_block_solver,
+                                nblock_mr=setup_block_mr_steps,
+                                nblock_gmres=setup_block_gmres_steps,
                                 fine_apply_counter=_setup_fine_apply_counter)
                 else
                     mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth,
@@ -2922,7 +3408,10 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                     prolongate_c2f!(correction, cur_setup, e_coarse)
                     if vcycle_update_smoother == :sap
                         sap_smooth!(correction, D, r_fine, cur_setup;
-                                    niter=1, nblock_mr=vcycle_post_smooth,
+                                    niter=vcycle_post_sap_iters,
+                                    block_solver=vcycle_post_block_solver,
+                                    nblock_mr=vcycle_post_block_mr_steps,
+                                    nblock_gmres=vcycle_post_block_gmres_steps,
                                     fine_apply_counter=_setup_fine_apply_counter)
                     else
                         mr_smooth!(correction, D, r_fine; niter=vcycle_post_smooth,
@@ -2938,8 +3427,18 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             end
             verbose && println("  [Algorithm 16 setup] fine Dirac applications: $(_setup_fine_apply_counter[])")
         elseif smoother == :sap
+            setup_block_solver in (:mr, :gmres) ||
+                throw(ArgumentError("setup_block_solver must be :mr or :gmres, got $setup_block_solver"))
+            setup_sap_iters > 0 ||
+                throw(ArgumentError("setup_sap_iters must be positive, got $setup_sap_iters"))
+            setup_block_mr_steps > 0 ||
+                throw(ArgumentError("setup_block_mr_steps must be positive, got $setup_block_mr_steps"))
+            setup_block_gmres_steps > 0 ||
+                throw(ArgumentError("setup_block_gmres_steps must be positive, got $setup_block_gmres_steps"))
             if verbose
-                println("  smoothing test vectors with SAP ($nsmooth iterations)...")
+                setup_block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
+                setup_block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
+                println("  smoothing test vectors with SAP ($(setup_sap_iters) sweeps, $(setup_block_steps) $(setup_block_name) steps)...")
             end
             # SAP needs a temporary setup for block-local smoothing.
             block_orthonormalize!(test_vectors, r; normalize=block_normalize)
@@ -2950,7 +3449,11 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                 CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
             )
             for v in 1:Nv_smooth
-                sap_smooth!(test_vectors[v], D, zero_rhs, pre_setup; niter=1, nblock_mr=nsmooth)
+                sap_smooth!(test_vectors[v], D, zero_rhs, pre_setup;
+                            niter=setup_sap_iters,
+                            block_solver=setup_block_solver,
+                            nblock_mr=setup_block_mr_steps,
+                            nblock_gmres=setup_block_gmres_steps)
             end
         else  # :mr (default)
             if verbose
