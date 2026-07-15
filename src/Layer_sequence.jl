@@ -6,15 +6,15 @@ module Layer_sequence
 
 import ..Layer_types: Layer, CPTC_Layer, PTC_Layer,ActivationFunction,Identity,Attention_Layer,Softmax,NormLayer,test_Layer,complexNormLayer,minmaxNormLayer,zscoreNormLayer,RealAttention_Layer
 import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,siteweight_Layer,RayleighQuotient_Layer,PtcRayleighQuotient_Layer,HoppingRayleighQuotient_Layer
-import ..Layer_types: Orthogonal_Layer,LossSumLayer,Ritz_Layer
+import ..Layer_types: Orthogonal_Layer,LossSumLayer,Ritz_Layer,ZeroMode_Layer
 import ..elementry_base: Hopping_operator, Spin_matrix, inner_product,g2vector_generator!,addmul!
 import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minmax,spincolortrace
 import ..Optimizer: Opt, update!, Adam, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!, save_checkpoint, load_checkpoint!
 import ..activation:  gradient, DeltaRule,DeltaRule!
-import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,Matmul_batch!
+import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,_sync_blockmatrix_W_gpu!,blockmatrix_apply_gpu!,Matmul_batch!
 import ..gpu: sync_W_to_gpu!,pack_fermions!,unpack_fermions!,batched_forward!,fused_hopping_gpu!,fused_wilson_mul_gpu!,batched_hopping_steps_gpu!,get_shared_buf!,get_shared_float_buf!,get_shared_matrix!,_batch_normsq!,_normalize_batch!,_batch_normsq_dot!,_backward_normalize!,ritz_gram_matrices_gpu!,_normlayer_fwd!
 import ..Layer_types: DenseLinearLayer, PTLayer,fermionfield_Layer,GramSchmidt_Layer
-import ..Layer_types: BlockScalar_Layer
+import ..Layer_types: BlockScalar_Layer, BlockMatrix_Layer
 import ..elementry_base: blockize, unblockize
 using JLD2
 abstract type Operator end
@@ -53,6 +53,195 @@ export substitute_Layer!
 export _to_cpu, _to_gpu,_to_cpu_gauge
 export train_timed, load_gauge_cache, save_raw_gauge, convert_gauge_paths_to_raw
 export _GPU_MEMORY_REPORT, gpu_memory_report, gpu_memory_report_bindings, cuda_memory_summary, cuda_pool_summary
+
+_metadata_value_string(x) = x === nothing ? "nothing" : string(x)
+
+function _print_metadata_block(io::IO, title::AbstractString, rows)
+    println(io, "# --- $(title) ---")
+    for row in rows
+        if row isa Pair
+            println(io, "# ", row.first, ",", _metadata_value_string(row.second))
+        else
+            println(io, "# ", _metadata_value_string(row))
+        end
+    end
+end
+
+function _layer_shape_summary(layer)
+    if layer isa DenseLinearLayer
+        return "In=$(layer.In), Out=$(layer.Out), cuda=$(layer.cuda), W=$(length(layer.W))"
+    elseif layer isa PTLayer
+        return "paths=$(length(layer.paths)), Out=$(layer.Out), W=$(length(layer.W))"
+    elseif layer isa fermionfield_Layer
+        return "In=$(layer.In)"
+    elseif layer isa NormLayer
+        return ""
+    elseif layer isa Ritz_Layer
+        return "Out=$(layer.Out)"
+    elseif layer isa ZeroMode_Layer
+        return "Out=$(layer.Out)"
+    elseif layer isa BlockScalar_Layer
+        return "W=$(size(layer.W)), r=$(layer.r), residual=$(layer.residual)"
+    elseif layer isa BlockMatrix_Layer
+        return "W=$(size(layer.W)), r=$(layer.r), residual=$(layer.residual)"
+    elseif layer isa LossSumLayer
+        return "w1=$(layer.w1), w2=$(layer.w2), l1=$(nameof(typeof(layer.l1))), l2=$(nameof(typeof(layer.l2)))"
+    else
+        parts = String[]
+        hasproperty(layer, :W) && push!(parts, "W=$(size(getproperty(layer, :W)))")
+        hasproperty(layer, :Out) && push!(parts, "Out=$(getproperty(layer, :Out))")
+        hasproperty(layer, :r) && push!(parts, "r=$(getproperty(layer, :r))")
+        return join(parts, ", ")
+    end
+end
+
+function _coarse_loss_summary(layer)
+    !hasproperty(layer, :coarse_tol) && return nothing
+    parts = [
+        "operator=$(getproperty(layer, :operator))",
+        "objective=$(getproperty(layer, :objective))",
+        "gain_eps=$(getproperty(layer, :gain_eps))",
+        "objective_scale=$(getproperty(layer, :objective_scale))",
+        "block_size=$(getproperty(layer, :block_size))",
+        "use_chirality=$(getproperty(layer, :use_chirality))",
+        "tol=$(getproperty(layer, :coarse_tol))",
+        "maxiter=$(getproperty(layer, :coarse_maxiter))",
+        "restart=$(getproperty(layer, :coarse_restart))",
+        "refresh_error=$(getproperty(layer, :refresh_error))",
+        "smooth_steps=$(getproperty(layer, :error_smooth_steps))",
+        "cycle_smoother=$(getproperty(layer, :cycle_smoother))",
+        "cycle_omega=$(getproperty(layer, :cycle_omega))",
+        "cycle_pre_smooth_steps=$(getproperty(layer, :cycle_pre_smooth_steps))",
+        "cycle_post_smooth_steps=$(getproperty(layer, :cycle_post_smooth_steps))",
+        "block_normalize=$(getproperty(layer, :block_normalize))",
+        "tangent_project=$(getproperty(layer, :tangent_project))",
+        "orth_pullback=$(getproperty(layer, :orthonormalization_pullback))",
+    ]
+    hasproperty(layer, :_replay_buffer) &&
+        push!(parts, "replay_buffer_size=$(get(ENV, "COARSE_LOSS_REPLAY_BUFFER_SIZE", "0"))")
+    hasproperty(layer, :_replay_buffer) &&
+        push!(parts, "replay_errors_per_forward=$(get(ENV, "COARSE_LOSS_REPLAY_ERRORS_PER_FORWARD", "0"))")
+    hasproperty(layer, :_replay_buffer) &&
+        push!(parts, "replay_store_per_forward=$(get(ENV, "COARSE_LOSS_REPLAY_STORE_PER_FORWARD", get(ENV, "COARSE_LOSS_REPLAY_ERRORS_PER_FORWARD", "0")))")
+    return join(parts, ", ")
+end
+
+function _collect_nested_loss_layers!(rows::Vector{String}, layer, prefix::String)
+    if layer isa LossSumLayer
+        push!(rows, "$(prefix)LossSumLayer: w1=$(layer.w1), w2=$(layer.w2)")
+        _collect_nested_loss_layers!(rows, layer.l1, prefix * "  l1.")
+        _collect_nested_loss_layers!(rows, layer.l2, prefix * "  l2.")
+    else
+        summary = _layer_shape_summary(layer)
+        line = "$(prefix)$(nameof(typeof(layer)))"
+        !isempty(summary) && (line *= ": $(summary)")
+        coarse = _coarse_loss_summary(layer)
+        coarse !== nothing && (line *= ": $(coarse)")
+        push!(rows, line)
+    end
+    return rows
+end
+
+function _layer_metadata_rows(layers)
+    rows = String[]
+    for (i, layer) in enumerate(layers)
+        summary = _layer_shape_summary(layer)
+        line = "layer[$(i)],$(nameof(typeof(layer)))"
+        !isempty(summary) && (line *= ",$(summary)")
+        coarse = _coarse_loss_summary(layer)
+        coarse !== nothing && (line *= ",$(coarse)")
+        push!(rows, line)
+        if layer isa LossSumLayer
+            _collect_nested_loss_layers!(rows, layer.l1, "  layer[$(i)].l1.")
+            _collect_nested_loss_layers!(rows, layer.l2, "  layer[$(i)].l2.")
+        end
+    end
+    return rows
+end
+
+function _write_training_metadata(io::IO, layers, params, gauge_paths, test_paths, gauge_format, opt,
+                                  epochs, epoch_offset, batch, N, logfile, checkpoint_every,
+                                  activation_checkpoint_interval, run_metadata)
+    println(io, "# --- Run Metadata ---")
+    println(io, "# started_at,", Libc.strftime("%Y-%m-%d %H:%M:%S", time()))
+    println(io, "# cwd,", pwd())
+    println(io, "# julia,", VERSION)
+    println(io, "# cuda_visible_devices,", get(ENV, "CUDA_VISIBLE_DEVICES", ""))
+    println(io, "# gpu_functional,", CUDA.functional())
+    println(io, "# logfile,", logfile)
+    println(io, "# epochs_requested,", epochs)
+    println(io, "# epoch_offset,", epoch_offset)
+    println(io, "# batch,", batch)
+    println(io, "# depth,", length(layers))
+    println(io, "# configs_per_epoch,", N)
+    println(io, "# full_epochs,", (epochs * batch) / N)
+    println(io, "# gauge_format,", gauge_format)
+    println(io, "# train_gauge_count,", length(gauge_paths))
+    !isempty(gauge_paths) && println(io, "# train_gauge_first,", first(gauge_paths))
+    !isempty(gauge_paths) && println(io, "# train_gauge_last,", last(gauge_paths))
+    if test_paths !== nothing
+        println(io, "# test_gauge_count,", length(test_paths))
+        !isempty(test_paths) && println(io, "# test_gauge_first,", first(test_paths))
+        !isempty(test_paths) && println(io, "# test_gauge_last,", last(test_paths))
+    else
+        println(io, "# test_gauge_count,0")
+    end
+    println(io, "# optimizer,", nameof(typeof(opt)))
+    hasproperty(opt, :α) && println(io, "# learning_rate,", getproperty(opt, :α))
+    println(io, "# checkpoint_every,", checkpoint_every)
+    activation_checkpoint_interval > 0 &&
+        println(io, "# activation_checkpoint_interval,", activation_checkpoint_interval)
+    if params isa AbstractDict
+        _print_metadata_block(io, "Dirac/Physics Parameters", sort(collect(params); by=x -> string(x.first)))
+    else
+        println(io, "# params,", params)
+    end
+    if run_metadata !== nothing
+        if run_metadata isa AbstractDict
+            _print_metadata_block(io, "Experiment Metadata", sort(collect(run_metadata); by=x -> string(x.first)))
+        else
+            _print_metadata_block(io, "Experiment Metadata", run_metadata)
+        end
+    end
+    _print_metadata_block(io, "Layer Stack", _layer_metadata_rows(layers))
+    println(io, "# --- End Metadata ---")
+end
+
+function _coarse_metric_rows!(rows::Vector{String}, layer, prefix::String="")
+    if layer isa LossSumLayer
+        _coarse_metric_rows!(rows, layer.l1, prefix * "l1.")
+        _coarse_metric_rows!(rows, layer.l2, prefix * "l2.")
+    elseif hasproperty(layer, :ratio_value) && hasproperty(layer, :gain_value)
+        pfx = isempty(prefix) ? "" : prefix
+        push!(rows, "$(pfx)ratio=$(getproperty(layer, :ratio_value))")
+        push!(rows, "$(pfx)gain=$(getproperty(layer, :gain_value))")
+        hasproperty(layer, :orth_residual) &&
+            push!(rows, "$(pfx)coarse_orth_rel=$(getproperty(layer, :orth_residual))")
+        hasproperty(layer, :replay_used) &&
+            push!(rows, "$(pfx)replay_used=$(getproperty(layer, :replay_used))")
+        hasproperty(layer, :replay_stored) &&
+            push!(rows, "$(pfx)replay_stored=$(getproperty(layer, :replay_stored))")
+    end
+    return rows
+end
+
+function _loss_metrics_text(layer, current_loss=nothing)
+    rows = _coarse_metric_rows!(String[], layer)
+    if layer isa LossSumLayer && current_loss !== nothing
+        if hasproperty(layer.l1, :loss_value)
+            push!(rows, "l1.loss=$(getproperty(layer.l1, :loss_value))")
+        end
+        if hasproperty(layer.l2, :loss_value)
+            l2_loss = getproperty(layer.l2, :loss_value)
+            push!(rows, "l2.loss=$(l2_loss)")
+            if layer.w1 != 0
+                total = real(current_loss)
+                push!(rows, "l1.loss_inferred=$((total - layer.w2 * real(l2_loss)) / layer.w1)")
+            end
+        end
+    end
+    return isempty(rows) ? "" : ", " * join(rows, ", ")
+end
 
 # Set to a layer index j to print per-step @allocated for that layer during backward.
 # Example: LMP.Layer_sequence._ALLOC_DEBUG_LAYER[] = 35
@@ -345,6 +534,15 @@ function _get_blocks(layer::Ritz_Layer)
     catch; end
     return nothing
 end
+function _get_blocks(layer::ZeroMode_Layer)
+    try
+        U = layer.D.U
+        if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+            return U[1].blockinfo.blocks
+        end
+    catch; end
+    return nothing
+end
 function _get_blocks(layer::HoppingRayleighQuotient_Layer)
     if eltype(layer.hop.Gauge) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
         return layer.hop.Gauge[1].blockinfo.blocks
@@ -378,6 +576,9 @@ _has_gpu(layer::LossSumLayer) = _has_gpu(layer.l1) || _has_gpu(layer.l2)
 _has_gpu(layer::fermionfield_Layer) = !isempty(layer.x) && layer.x[1] isa WF3x1GPU
 _has_gpu(layer::GramSchmidt_Layer) = !isempty(layer.x) && layer.x[1] isa WF3x1GPU
 function _has_gpu(layer::Ritz_Layer)
+    try; return eltype(layer.D.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator; catch; return false; end
+end
+function _has_gpu(layer::ZeroMode_Layer)
     try; return eltype(layer.D.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator; catch; return false; end
 end
 function _has_gpu(layer::PtcRayleighQuotient_Layer)
@@ -468,6 +669,14 @@ _to_cpu(layer::Layer) = layer
 function _to_cpu(layer::BlockScalar_Layer)
     layer._gpu_w_buf = nothing
     layer._gpu_w_cpu = Matrix{ComplexF64}(undef, 0, 0)
+    layer._gpu_block_map = Int[]
+    layer._result = WF3x1[]
+    layer._initialized = false
+    return layer
+end
+
+function _to_cpu(layer::BlockMatrix_Layer)
+    layer._gpu_w_buf = nothing
     layer._gpu_block_map = Int[]
     layer._result = WF3x1[]
     layer._initialized = false
@@ -599,6 +808,17 @@ function _to_cpu(layer::Ritz_Layer)
     return layer
 end
 
+function _to_cpu(layer::ZeroMode_Layer)
+    layer.D = _to_cpu_dirac(layer.D)
+    layer._zeromode_init = false
+    layer._Dz = Any[]
+    layer._DdagDz = Any[]
+    layer._delta = Any[]
+    layer._losses = Float64[]
+    layer._denoms = Float64[]
+    return layer
+end
+
 # --- PtcRayleighQuotient_Layer ---
 function _to_cpu(layer::PtcRayleighQuotient_Layer)
     layer.D = _to_cpu_dirac(layer.D)
@@ -703,6 +923,13 @@ function _shared_layer_gauge(layer::Ritz_Layer)
         return nothing
     end
 end
+function _shared_layer_gauge(layer::ZeroMode_Layer)
+    try
+        return layer.D.U
+    catch
+        return nothing
+    end
+end
 function _shared_layer_gauge(layer::PtcRayleighQuotient_Layer)
     try
         return layer.D.U
@@ -724,6 +951,15 @@ end
 function _to_gpu(layer::BlockScalar_Layer, blocks=nothing)
     layer._gpu_w_buf = nothing
     layer._gpu_w_cpu = Matrix{ComplexF64}(undef, 0, 0)
+    layer._gpu_block_map = Int[]
+    layer._result = WF3x1[]
+    layer._block_map = Int[]
+    layer._initialized = false
+    return layer
+end
+
+function _to_gpu(layer::BlockMatrix_Layer, blocks=nothing)
+    layer._gpu_w_buf = nothing
     layer._gpu_block_map = Int[]
     layer._result = WF3x1[]
     layer._block_map = Int[]
@@ -897,6 +1133,28 @@ function _to_gpu(layer::Ritz_Layer, blocks, shared_U)
     layer._DdagDz = Any[]
     layer._VD = Any[]
     layer._work = Any[]
+    return layer
+end
+
+function _to_gpu(layer::ZeroMode_Layer, blocks=nothing)
+    layer.D = _to_gpu_dirac(layer.D; blocks=blocks)
+    layer._zeromode_init = false
+    layer._Dz = Any[]
+    layer._DdagDz = Any[]
+    layer._delta = Any[]
+    layer._losses = Float64[]
+    layer._denoms = Float64[]
+    return layer
+end
+
+function _to_gpu(layer::ZeroMode_Layer, blocks, shared_U)
+    layer.D = _to_gpu_dirac(layer.D; blocks=blocks, shared_U=shared_U)
+    layer._zeromode_init = false
+    layer._Dz = Any[]
+    layer._DdagDz = Any[]
+    layer._delta = Any[]
+    layer._losses = Float64[]
+    layer._denoms = Float64[]
     return layer
 end
 
@@ -1616,6 +1874,16 @@ function refresh_model!(layers::Vector{<:Layer}, D_new, U_new)
 end
 
 _refresh_layer!(layer::Ritz_Layer, D_new, U_new) = (layer.D = D_new)
+function _refresh_layer!(layer::ZeroMode_Layer, D_new, U_new)
+    layer.D = D_new
+    layer._zeromode_init = false
+    layer._Dz = Any[]
+    layer._DdagDz = Any[]
+    layer._delta = Any[]
+    layer._losses = Float64[]
+    layer._denoms = Float64[]
+    return nothing
+end
 _refresh_layer!(layer::PtcRayleighQuotient_Layer, D_new, U_new) = (layer.D = D_new)
 _refresh_layer!(layer::PTLayer, D_new, U_new) = (layer.U = U_new)
 _refresh_layer!(layer::fermionfield_Layer, D_new, U_new) = refresh_fermionfield!(layer, U_new)
@@ -1632,6 +1900,19 @@ function _refresh_layer!(layer::LossSumLayer, D_new, U_new)
 end
 
 _refresh_layer!(layer::Layer, D_new, U_new) = nothing
+
+_refresh_forward_error!(layer::Layer, D_new) = nothing
+function _refresh_forward_error!(layer::LossSumLayer, D_new)
+    _refresh_forward_error!(layer.l1, D_new)
+    _refresh_forward_error!(layer.l2, D_new)
+    return nothing
+end
+function refresh_forward_errors!(layers::Vector{<:Layer}, D_new)
+    for layer in layers
+        _refresh_forward_error!(layer, D_new)
+    end
+    return layers
+end
 
 
 
@@ -1924,6 +2205,52 @@ function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
 end
 
 
+function (layer::ZeroMode_Layer)(x::AbstractVector{<:WF3x1})
+    l = length(x)
+
+    need_reinit = !layer._zeromode_init || length(layer._Dz) != l
+    if !need_reinit
+        need_reinit = typeof(layer._Dz[1]) != typeof(x[1])
+    end
+    if need_reinit
+        layer._Dz = Vector{Any}(undef, l)
+        layer._DdagDz = Vector{Any}(undef, l)
+        layer._losses = zeros(Float64, l)
+        layer._denoms = zeros(Float64, l)
+        for i in 1:l
+            layer._Dz[i] = _alloc_result_wf(x[1])
+            layer._DdagDz[i] = _alloc_result_wf(x[1])
+        end
+        layer._zeromode_init = true
+    end
+
+    Dx = layer._Dz
+    DdagDx = layer._DdagDz
+    if x[1] isa WF3x1GPU
+        _kappa = _dirac_kappa(layer.D)
+        _U = layer.D.U
+        @inbounds for i in 1:l
+            fused_wilson_mul_gpu!(Dx[i], x[i], _U, _kappa, false)
+            fused_wilson_mul_gpu!(DdagDx[i], Dx[i], _U, _kappa, true)
+        end
+    else
+        @inbounds for i in 1:l
+            mul!(Dx[i], layer.D, x[i])
+            mul!(DdagDx[i], layer.D', Dx[i])
+        end
+    end
+
+    total = 0.0
+    @inbounds for i in 1:l
+        li = real(inner_product(Dx[i], Dx[i]))
+        layer._losses[i] = li
+        layer._denoms[i] = real(inner_product(x[i], x[i]))
+        total += li
+    end
+    return total / l
+end
+
+
 
 
 function (layer::Orthogonal_Layer)(x::AbstractVector{<:WF3x1})
@@ -2062,6 +2389,70 @@ function (layer::BlockScalar_Layer)(x::AbstractVector{<:WF3x1})
             end
             if layer.residual
                 axpby!(1, xk, 1, rk)
+            end
+        end
+    end
+
+    return result
+end
+
+function (layer::BlockMatrix_Layer)(x::AbstractVector{<:WF3x1})
+    nin = length(x)
+    nblocks, nout, win = size(layer.W)
+    win == nin || error("BlockMatrix_Layer expected $win input vectors, got $nin")
+    r = layer.r
+
+    if !layer._initialized || length(layer._result) != nout || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(x[1]))
+        layer._result = Vector{WF3x1}(undef, nout)
+        for o in 1:nout
+            layer._result[o] = deepcopy(x[min(o, nin)])
+        end
+        if x[1] isa WF3x1GPU
+            _init_gpu_block_cache!(layer, x[1])
+        else
+            NX, NY, NZ, NT = x[1].NX, x[1].NY, x[1].NZ, x[1].NT
+            NBX = div(NX, r); NBY = div(NY, r); NBZ = div(NZ, r); NBT = div(NT, r)
+            nsites = NX * NY * NZ * NT
+            layer._block_map = Vector{Int}(undef, nsites)
+            idx = 0
+            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                idx += 1
+                bx = div(ix - 1, r) + 1; by = div(iy - 1, r) + 1
+                bz = div(iz - 1, r) + 1; bt = div(it - 1, r) + 1
+                layer._block_map[idx] = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
+            end
+        end
+        layer._initialized = true
+    end
+
+    result = layer._result
+    if x[1] isa WF3x1GPU
+        W_gpu, bmap_gpu, _ = _sync_blockmatrix_W_gpu!(layer; upload=false)
+        blockmatrix_apply_gpu!(result, x, W_gpu, bmap_gpu, layer.residual)
+    else
+        NC, NG = x[1].NC, x[1].NG
+        NX, NY, NZ, NT = x[1].NX, x[1].NY, x[1].NZ, x[1].NT
+        bmap = layer._block_map
+        W = layer.W
+
+        @inbounds for o in 1:nout
+            ro = result[o]
+            site = 0
+            for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+                site += 1
+                bid = bmap[site]
+                for ig in 1:NG
+                    @simd for ic in 1:NC
+                        s = zero(ComplexF64)
+                        for i in 1:nin
+                            s += W[bid, o, i] * x[i][ic, ix, iy, iz, it, ig]
+                        end
+                        if layer.residual && o <= nin
+                            s += x[o][ic, ix, iy, iz, it, ig]
+                        end
+                        ro[ic, ix, iy, iz, it, ig] = s
+                    end
+                end
             end
         end
     end
@@ -2752,6 +3143,64 @@ function _checkpointed_forward_loss!(to, fwd_names, layers, D, u::Vector{Any},
     return checkpoints
 end
 
+function _checkpointed_buffer_setup!(layers, D, depth::Int)
+    u = Vector{Any}(undef, depth)
+    fill!(u, nothing)
+    u[1] = [D]
+
+    body_idx = min(4, depth)
+    body_size = nothing
+    delta_tail = Dict{Int,Any}()
+    transition_j = nothing
+    transition_input = nothing
+    delta1_buf = nothing
+
+    for i in 1:(depth-1)
+        u[i+1] = layers[i](u[i])
+
+        if i + 1 == 2
+            delta1_buf = deepcopy(u[2])
+        end
+        if i + 1 == body_idx
+            body_size = length(u[i+1])
+        end
+
+        if body_size !== nothing
+            if 3 <= i <= depth - 2 && length(u[i+1]) != body_size
+                if transition_j === nothing
+                    transition_j = i
+                    transition_input = deepcopy(u[i])
+                end
+            end
+            if transition_j !== nothing && transition_j <= i <= depth - 1
+                delta_tail[i] = deepcopy(u[i+1])
+            end
+        end
+
+        if i > 1
+            _clear_layer_forward_cache!(layers[i-1])
+            u[i] = nothing
+        end
+    end
+
+    if transition_j === nothing
+        transition_j = depth - 1
+        transition_input = deepcopy(u[depth-1])
+        delta_tail[depth-1] = deepcopy(u[depth])
+    elseif !haskey(delta_tail, depth - 1)
+        delta_tail[depth-1] = deepcopy(u[depth])
+    end
+
+    buf_a = deepcopy(transition_input)
+    buf_b = deepcopy(transition_input)
+
+    _clear_layer_forward_cache!(layers[depth-1])
+    fill!(u, nothing)
+    _force_cuda_reclaim!()
+
+    return u, delta_tail, transition_j, buf_a, buf_b, delta1_buf
+end
+
 function _recompute_checkpoint_segment!(to, layers, u::Vector{Any}, checkpoints,
                                         start_idx::Int, stop_idx::Int)
     fill!(u, nothing)
@@ -2841,7 +3290,9 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                gauge_preprocess! = nothing,
                epoch_offset::Int=0,
                checkpoint_every::Int=0,
-               checkpoint_fn=nothing) where {T<:Layer}
+               checkpoint_fn=nothing,
+               activation_checkpoint_interval::Int=0,
+               run_metadata=nothing) where {T<:Layer}
 
     depth = length(layers)
     N = gauge_format === :raw ? length(gauge_paths) : (gauge_cache === nothing ? length(gauge_paths) : length(gauge_cache))
@@ -2851,13 +3302,19 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         logfile = "train_log_$(Libc.strftime("%Y-%m-%d_%H%M%S", time())).txt"
     end
     log_io = open(logfile, "a")
+    _write_training_metadata(log_io, layers, params, gauge_paths, test_paths, gauge_format, opt,
+                             epochs, epoch_offset, batch, N, logfile, checkpoint_every,
+                             activation_checkpoint_interval, run_metadata)
     println(log_io, "=== Training started: $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
-    println(log_io, "epochs=$epochs, batch=$batch, depth=$depth, configs=$N")
+    println(log_io, "steps=$epochs, batch=$batch, depth=$depth, configs_per_epoch=$N")
+    println(log_io, "full_epochs=$((epochs * batch) / N)")
+    activation_checkpoint_interval > 0 &&
+        println(log_io, "activation_checkpoint_interval=$activation_checkpoint_interval")
     flush(log_io)
 
     fig, ax = plt.subplots()
     ax.set_title("Loss Curve")
-    ax.set_xlabel("Epoch")
+    ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
     line, = ax.plot([], [], "b-", linewidth=2)
     test_line = nothing
@@ -2894,58 +3351,165 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             layers[i].U = U_template
         end
     end
-    if layers[end] isa PtcRayleighQuotient_Layer
-        layers[end].D = D
-    elseif layers[end] isa LossSumLayer
-        if layers[end].l1 isa PtcRayleighQuotient_Layer; layers[end].l1.D = D; end
-        if layers[end].l2 isa PtcRayleighQuotient_Layer; layers[end].l2.D = D; end
-    end
-    if layers[end] isa Ritz_Layer
-        layers[end].D = D
-    end
+    refresh_model!(layers, D, U_template)
 
     sync_layers_to_gpu!(layers)
-    dummy, f = forward_propagation(layers, D, D)
-    u = dummy
+    if activation_checkpoint_interval > 0
+        u, delta_tail, transition_j, buf_a, buf_b, delta1_buf =
+            _checkpointed_buffer_setup!(layers, D, depth)
+    else
+        dummy, f = forward_propagation(layers, D, D)
+        u = dummy
 
-    # Ping-pong ---------------------------------------------------
-    # body_size: PT body length (= pl)
-    body_size = length(u[min(4, depth)])
+        # Ping-pong ---------------------------------------------------
+        # body_size: PT body length (= pl)
+        body_size = length(u[min(4, depth)])
 
-    # Tail: keep separate delta[j] buffers for layers whose size differs from body_size.
-    delta_tail = Dict{Int,Any}(depth-1 => deepcopy(u[depth]))
-    for j in 3:depth-2
-        length(u[j+1]) != body_size && (delta_tail[j] = deepcopy(u[j+1]))
+        # Tail: keep separate delta[j] buffers for layers whose size differs from body_size.
+        delta_tail = Dict{Int,Any}(depth-1 => deepcopy(u[depth]))
+        for j in 3:depth-2
+            length(u[j+1]) != body_size && (delta_tail[j] = deepcopy(u[j+1]))
+        end
+
+        # transition_j: first tail layer before body ping-pong begins.
+        transition_j = minimum(keys(delta_tail))
+
+        # Fill missing tail buffers.
+        for j in transition_j:depth-1
+            haskey(delta_tail, j) || (delta_tail[j] = deepcopy(u[j+1]))
+        end
+
+        # Two ping-pong buffers shaped like u[transition_j].
+        buf_a = deepcopy(u[transition_j])
+        buf_b = deepcopy(u[transition_j])
+
+        # Layer 1 gradient uses u[2] shape; u[1] is [D], so body ping-pong cannot reuse it.
+        delta1_buf = depth >= 2 ? deepcopy(u[2]) : nothing
     end
-
-    # transition_j: first tail layer before body ping-pong begins.
-    transition_j = minimum(keys(delta_tail))
-
-    # Fill missing tail buffers.
-    for j in transition_j:depth-1
-        haskey(delta_tail, j) || (delta_tail[j] = deepcopy(u[j+1]))
-    end
-
-    # Two ping-pong buffers shaped like u[transition_j].
-    buf_a = deepcopy(u[transition_j])
-    buf_b = deepcopy(u[transition_j])
-
-    # Layer 1 gradient uses u[2] shape; u[1] is [D], so body ping-pong cannot reuse it.
-    delta1_buf = depth >= 2 ? deepcopy(u[2]) : nothing
     # -----------------------------------------------------------------------
 
     temp = Vector{ComplexF64}(undef, batch)
     d = Vector{Any}(undef, depth)
     test_loss_history = Float64[]
+    checkpoint_timer = activation_checkpoint_interval > 0 ? TimerOutput() : nothing
+    npad = ndigits(depth)
+    fwd_names = activation_checkpoint_interval > 0 ?
+        ["fwd_" * lpad(i, npad, '0') * "_$(nameof(typeof(layers[i])))" for i in 1:depth] :
+        String[]
+    bwd_names = activation_checkpoint_interval > 0 ?
+        ["bwd_" * lpad(i, npad, '0') * "_$(nameof(typeof(layers[i])))" for i in 1:depth] :
+        String[]
+    refresh_error_every_forward =
+        lowercase(get(ENV, "COARSE_LOSS_REFRESH_EVERY_FORWARD", "false")) in ("1", "true", "yes", "on")
+    refresh_error_every_forward &&
+        println(log_io, "coarse_loss_refresh_every_forward=true")
 
     # D shares U_template and is updated in-place by substitute_U!.
-    if layers[end] isa PtcRayleighQuotient_Layer; layers[end].D = D
-    elseif layers[end] isa Ritz_Layer;            layers[end].D = D
+    # Refresh all layer references once more after buffer setup, including
+    # nested loss layers such as LossSumLayer(Ritz, CoarseCorrectionLoss).
+    refresh_model!(layers, D, U_template)
+
+    function _load_training_gauge!(k::Int)
+        if gauge_format === :raw
+            _read_raw_gauge_to_gpu!(U_template, gauge_paths[k], _staging, _raw_cpu_buffers)
+        elseif gauge_cache !== nothing
+            U_src = gauge_cache[k]
+            for mu in eachindex(U_template)
+                _fast_substitute_U!(U_template[mu], U_src[mu], _staging[mu])
+            end
+        else
+            U_src = JLD2.load(gauge_paths[k], "U")
+            for mu in eachindex(U_template)
+                _fast_substitute_U!(U_template[mu], U_src[mu], _staging[mu])
+            end
+        end
+        gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
+        for i in 1:depth
+            layers[i] isa PTLayer && (layers[i].U = U_template)
+        end
+        refresh_model!(layers, D, U_template)
+        return nothing
     end
 
-    for epoch in 1:epochs
-        next_k = mod(epoch, N) + 1
+    for step in 1:epochs
+        next_k = mod(step, N) + 1
+        current_k = mod1(step, N)
         _train_dbg = _TRAIN_ALLOC_DEBUG[]
+
+        if batch > 1
+            activation_checkpoint_interval > 0 &&
+                error("ML-style gauge batch currently requires activation_checkpoint_interval=0")
+
+            fill!(d, nothing)
+            current_loss = 0.0
+            first_k = mod1((epoch_offset + step - 1) * batch + 1, N)
+            last_k = first_k
+            for b in 1:batch
+                sample_index = (epoch_offset + step - 1) * batch + b
+                current_k = mod1(sample_index, N)
+                last_k = current_k
+                _load_training_gauge!(current_k)
+                refresh_error_every_forward && refresh_forward_errors!(layers, D)
+                f = forward_propagation!(layers, D, D, u)
+                temp[b] = f
+                current_loss += real(f)
+                backward_and_gradient!(layers, u, batch, delta_tail, buf_a, buf_b,
+                                       transition_j, d, gamma, delta1_buf)
+            end
+
+            for i in 1:depth-1
+                d[i] === nothing && continue
+                update!(layers[i], opt, d[i])
+            end
+
+            current_loss /= batch
+            push!(real(loss_history), real(current_loss))
+            abs_step = epoch_offset + step
+            full_epoch = (abs_step * batch) / N
+            epoch_text = string(round(full_epoch; digits=4))
+            config_text = first_k == last_k ? "$(first_k)/$(N)" : "$(first_k)-$(last_k)/$(N)"
+            log_line = "Step: $(abs_step), Epoch: $(epoch_text), ConfigBatch: $(config_text), BatchSize: $(batch), Loss: $(current_loss)$(_loss_metrics_text(layers[end]))"
+            println(log_line)
+            println(log_io, log_line)
+            flush(log_io)
+
+            if test_paths !== nothing && mod(abs_step, test_interval) == 0
+                test_loss = 0.0
+                n_test = length(test_paths)
+                for tc in 1:n_test
+                    if gauge_format === :raw
+                        _read_raw_gauge_to_gpu!(U_template, test_paths[tc], _staging, _raw_cpu_buffers)
+                    else
+                        U_src = test_gauge_cache === nothing ? JLD2.load(test_paths[tc], "U") : test_gauge_cache[tc]
+                        for mu in eachindex(U_template)
+                            _fast_substitute_U!(U_template[mu], U_src[mu], _staging[mu])
+                        end
+                    end
+                    gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
+                    refresh_model!(layers, D, U_template)
+                    refresh_error_every_forward && refresh_forward_errors!(layers, D)
+                    test_loss += real(forward_propagation!(layers, D, D, u))
+                end
+                test_loss /= n_test
+                push!(test_loss_history, real(test_loss))
+                test_line_text = "  [Test] Step: $(abs_step), Epoch: $(epoch_text), Test Loss: $(test_loss)$(_loss_metrics_text(layers[end]))"
+                println(test_line_text)
+                println(log_io, test_line_text)
+                flush(log_io)
+
+                test_line !== nothing && test_line.set_xdata(test_interval:test_interval:(test_interval*length(test_loss_history)))
+                test_line !== nothing && test_line.set_ydata(test_loss_history)
+            end
+
+            if checkpoint_every > 0 && checkpoint_fn !== nothing && abs_step % checkpoint_every == 0
+                ckpt = checkpoint_fn(abs_step)
+                save_checkpoint(ckpt, layers, opt)
+                println("  [Checkpoint] Step $(abs_step) saved: $ckpt")
+                println(log_io, "  [Checkpoint] Step $(abs_step) saved: $ckpt")
+                flush(log_io)
+            end
+            continue
+        end
 
         # Load/copy the next gauge configuration.
         if gauge_format === :raw
@@ -2953,19 +3517,19 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             cpu_prefetch = nothing
             if _train_dbg
                 _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
-                _train_debug_step("epoch $epoch raw_path_get", _dbg_gc, _dbg_t)
+                _train_debug_step("step $step raw_path_get", _dbg_gc, _dbg_t)
             end
         elseif gauge_cache !== nothing
             _next_U_dbg = gauge_cache[next_k]
             cpu_prefetch = nothing
             if _train_dbg
                 _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
-                _train_debug_step("epoch $epoch train_cache_get", _dbg_gc, _dbg_t)
+                _train_debug_step("step $step train_cache_get", _dbg_gc, _dbg_t)
             end
         elseif _train_dbg
             _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
             _next_U_dbg = JLD2.load(gauge_paths[next_k], "U")
-            _train_debug_step("epoch $epoch train_jld2_load", _dbg_gc, _dbg_t)
+            _train_debug_step("step $step train_jld2_load", _dbg_gc, _dbg_t)
             cpu_prefetch = nothing
         else
             cpu_prefetch = @async JLD2.load(gauge_paths[next_k], "U")
@@ -2981,7 +3545,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                 layers[i].U = U_template
             end
         end
-        _train_dbg && _train_debug_step("epoch $epoch set_layer_U", _dbg_gc, _dbg_t)
+        _train_dbg && _train_debug_step("step $step set_layer_U", _dbg_gc, _dbg_t)
 
 
         if _train_dbg
@@ -2989,13 +3553,29 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         end
         fill!(d, nothing)
         for b in 1:batch
-            f = forward_propagation!(layers, D, D, u)
-            temp[b] = f
-            backward_and_gradient!(layers, u, batch, delta_tail, buf_a, buf_b,
-                                   transition_j, d, gamma, delta1_buf)
+                if activation_checkpoint_interval > 0
+                    refresh_error_every_forward && refresh_forward_errors!(layers, D)
+                    checkpoints = _checkpointed_forward_loss!(
+                    checkpoint_timer, fwd_names, layers, D, u, temp, b, depth,
+                    activation_checkpoint_interval)
+                _checkpointed_backward_timed!(
+                    checkpoint_timer, bwd_names, layers, u, checkpoints,
+                    batch, delta_tail, buf_a, buf_b, transition_j, d, gamma,
+                    delta1_buf)
+                checkpoints = nothing
+                _clear_forward_caches!(layers)
+                fill!(u, nothing)
+                _force_cuda_reclaim!()
+                else
+                    refresh_error_every_forward && refresh_forward_errors!(layers, D)
+                    f = forward_propagation!(layers, D, D, u)
+                temp[b] = f
+                backward_and_gradient!(layers, u, batch, delta_tail, buf_a, buf_b,
+                                       transition_j, d, gamma, delta1_buf)
+            end
         end
 
-        _train_dbg && _train_debug_step("epoch $epoch fwd_bwd", _dbg_gc, _dbg_t; sync_gpu=true)
+        _train_dbg && _train_debug_step("step $step fwd_bwd", _dbg_gc, _dbg_t; sync_gpu=true)
 
         if _train_dbg
             _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
@@ -3004,7 +3584,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             d[i] === nothing && continue
             update!(layers[i], opt, d[i])
         end
-        _train_dbg && _train_debug_step("epoch $epoch optimizer", _dbg_gc, _dbg_t; sync_gpu=true)
+        _train_dbg && _train_debug_step("step $step optimizer", _dbg_gc, _dbg_t; sync_gpu=true)
 
         if _train_dbg
             _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
@@ -3015,13 +3595,16 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         end
         push!(real(loss_history), real(current_loss))
 
-        abs_epoch = epoch_offset + epoch
-        println("Epoch: $(abs_epoch), Loss: $current_loss")
-        println(log_io, "Epoch: $(abs_epoch), Loss: $current_loss")
+        abs_step = epoch_offset + step
+        full_epoch = abs_step / N
+        epoch_text = string(round(full_epoch; digits=4))
+        log_line = "Step: $(abs_step), Epoch: $(epoch_text), Config: $(current_k)/$(N), Loss: $(current_loss)$(_loss_metrics_text(layers[end], current_loss))"
+        println(log_line)
+        println(log_io, log_line)
         flush(log_io)
-        _train_dbg && _train_debug_step("epoch $epoch loss_log", _dbg_gc, _dbg_t)
+        _train_dbg && _train_debug_step("step $step loss_log", _dbg_gc, _dbg_t)
 
-        if test_paths !== nothing && mod(abs_epoch, test_interval) == 0
+        if test_paths !== nothing && mod(abs_step, test_interval) == 0
             if _train_dbg
                 _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
             end
@@ -3029,12 +3612,12 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             n_test = length(test_paths)
             test_Us_cpu = gauge_format === :raw ? nothing : Vector{Any}(undef, n_test)
             if gauge_format === :raw
-                _train_dbg && _train_debug_step("epoch $epoch test_raw_paths_get", _dbg_gc, _dbg_t)
+                _train_dbg && _train_debug_step("step $step test_raw_paths_get", _dbg_gc, _dbg_t)
             elseif _train_dbg
                 for tc in 1:n_test
                     test_Us_cpu[tc] = test_gauge_cache === nothing ? JLD2.load(test_paths[tc], "U") : test_gauge_cache[tc]
                 end
-                _train_debug_step("epoch $epoch test_jld2_load_all", _dbg_gc, _dbg_t)
+                _train_debug_step("step $step test_jld2_load_all", _dbg_gc, _dbg_t)
             else
                 if test_gauge_cache === nothing
                     @sync for tc in 1:n_test
@@ -3059,30 +3642,46 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                 end
                 gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
                 # _sanitize_U!(U_template)
+                refresh_model!(layers, D, U_template)
                 for b in 1:batch
-                    test_loss += real(forward_propagation!(layers, D, D, u))
+                    if activation_checkpoint_interval > 0
+                        refresh_error_every_forward && refresh_forward_errors!(layers, D)
+                        test_temp = Vector{ComplexF64}(undef, 1)
+                        checkpoints = _checkpointed_forward_loss!(
+                            checkpoint_timer, fwd_names, layers, D, u,
+                            test_temp, 1, depth, activation_checkpoint_interval)
+                        test_loss += real(test_temp[1])
+                        checkpoints = nothing
+                        _clear_forward_caches!(layers)
+                        fill!(u, nothing)
+                        _force_cuda_reclaim!()
+                    else
+                        refresh_error_every_forward && refresh_forward_errors!(layers, D)
+                        test_loss += real(forward_propagation!(layers, D, D, u))
+                    end
                 end
             end
-            _train_dbg && _train_debug_step("epoch $epoch test_substitute_forward", _dbg_gc, _dbg_t; sync_gpu=true)
+            _train_dbg && _train_debug_step("step $step test_substitute_forward", _dbg_gc, _dbg_t; sync_gpu=true)
             if _train_dbg
                 _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
             end
             test_loss /= n_test
             push!(test_loss_history, real(test_loss))
-            println("  [Test] Epoch: $(abs_epoch), Test Loss: $test_loss")
-            println(log_io, "  [Test] Epoch: $(abs_epoch), Test Loss: $test_loss")
+            test_line_text = "  [Test] Step: $(abs_step), Epoch: $(epoch_text), Test Loss: $(test_loss)$(_loss_metrics_text(layers[end], test_loss))"
+            println(test_line_text)
+            println(log_io, test_line_text)
             flush(log_io)
 
             test_line !== nothing && test_line.set_xdata(test_interval:test_interval:(test_interval*length(test_loss_history)))
             test_line !== nothing && test_line.set_ydata(test_loss_history)
-            _train_dbg && _train_debug_step("epoch $epoch test_log_plotdata", _dbg_gc, _dbg_t)
+            _train_dbg && _train_debug_step("step $step test_log_plotdata", _dbg_gc, _dbg_t)
         end
 
-        if checkpoint_every > 0 && checkpoint_fn !== nothing && abs_epoch % checkpoint_every == 0
-            ckpt = checkpoint_fn(abs_epoch)
+        if checkpoint_every > 0 && checkpoint_fn !== nothing && abs_step % checkpoint_every == 0
+            ckpt = checkpoint_fn(abs_step)
             save_checkpoint(ckpt, layers, opt)
-            println("  [Checkpoint] Saved: $ckpt")
-            println(log_io, "  [Checkpoint] Saved: $ckpt")
+            println("  [Checkpoint] Step $(abs_step) saved: $ckpt")
+            println(log_io, "  [Checkpoint] Step $(abs_step) saved: $ckpt")
             flush(log_io)
         end
 
@@ -3097,6 +3696,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             end
             _read_raw_gauge_to_gpu!(U_template, gauge_paths[next_k], _staging, _raw_cpu_buffers)
             gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
+            refresh_model!(layers, D, U_template)
             _train_dbg && _train_debug_step("epoch $epoch raw_read_next_U", _dbg_gc, _dbg_t; sync_gpu=true)
         else
             _next_U = _train_dbg ? _next_U_dbg : fetch(cpu_prefetch)
@@ -3108,6 +3708,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                 _fast_substitute_U!(U_template[mu], _next_U[mu], _staging[mu])
             end
             gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
+            refresh_model!(layers, D, U_template)
             _train_dbg && _train_debug_step("epoch $epoch substitute_next_U", _dbg_gc, _dbg_t; sync_gpu=true)
         end
         # _sanitize_U!(U_template)

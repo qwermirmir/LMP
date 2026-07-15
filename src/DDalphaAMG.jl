@@ -14,8 +14,7 @@ export mr_smooth!, sap_smooth!
 export block_orthonormalize!
 export deflated_initial_guess
 export precompute_coarse_operator!
-export gamma5!, chiral_project!, gamma5_sign
-export compare_ddalphaamg_cpu_gpu
+export gamma5!, chiral_project!
 
 
 const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
@@ -24,14 +23,15 @@ const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerat
 const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 
 # ==========================================
-#  邊玲ｼ蟄舌・繧ｯ繝医Ν (Coarse Grid Vector)
+#  Coarse Grid Vector
 # ==========================================
 
 """
     CoarseVector
 
-邊玲ｼ蟄蝉ｸ翫・繝吶け繝医Ν縲・
-data[(bidx-1)*Nv + v] 縺ｧ繝悶Ο繝・け bidx 縺ｮ繝・せ繝医・繧ｯ繝医Ν逡ｪ蜿ｷ v 縺ｮ謌仙・縺ｫ繧｢繧ｯ繧ｻ繧ｹ縲・
+Coarse-grid vector storing Nv components on each coarse block.
+The entry for block `bidx` and vector component `v` is
+`data[(bidx - 1) * Nv + v]`.
 """
 mutable struct CoarseVector
     data::AbstractVector{ComplexF64}
@@ -65,30 +65,30 @@ function coarse_norm(a::CoarseVector)
     return sqrt(real(dot(a.data, a.data)))
 end
 
-function coarse_axpby!(ﾎｱ, x::CoarseVector, ﾎｲ, y::CoarseVector)
+function coarse_axpby!(α, x::CoarseVector, β, y::CoarseVector)
     if y.data isa CuArray
-        y.data .= ﾎｱ .* x.data .+ ﾎｲ .* y.data
+        y.data .= α .* x.data .+ β .* y.data
         return y
     end
     @inbounds @simd for i in eachindex(y.data)
-        y.data[i] = ﾎｱ * x.data[i] + ﾎｲ * y.data[i]
+        y.data[i] = α * x.data[i] + β * y.data[i]
     end
     return y
 end
 
 
 # ==========================================
-#  繧ｻ繝・ヨ繧｢繝・・讒矩菴・(Setup Structure)
+#  Setup Structure
 # ==========================================
 
 """
     DDalphaAMG_Setup
 
-DD-ﾎｱAMG 縺ｮ繧ｻ繝・ヨ繧｢繝・・諠・ｱ繧剃ｿ晄戟縺吶ｋ讒矩菴薙・
-- test_vectors: 繝悶Ο繝・け逶ｴ莠､豁｣隕丞喧縺輔ｌ縺溘ユ繧ｹ繝医・繧ｯ繝医Ν
-- r: 蜷・婿蜷代・繝悶Ο繝・け繧ｵ繧､繧ｺ
-- Nv: 繝・せ繝医・繧ｯ繝医Ν謨ｰ
-- NBX,NBY,NBZ,NBT: 邊玲ｼ蟄舌・蜷・婿蜷代ヶ繝ｭ繝・け謨ｰ
+Container for DD-alphaAMG setup data.
+
+Fields include block-orthonormalized test vectors, block geometry, optional
+precomputed coarse operators, reusable coarse GMRES work buffers, and GPU cache
+storage.
 """
 @inline _amg_device(::WF3x1GPU) = Val(:gpu)
 @inline _amg_device(::WF3x1CPU) = Val(:cpu)
@@ -145,15 +145,179 @@ mutable struct DDalphaAMG_Setup{T<:WF3x1}
     _gpu_cache::Any
 end
 
+mutable struct AMGProfile
+    times::Dict{Symbol,Float64}
+    counts::Dict{Symbol,Int}
+    synchronize::Bool
+end
+
+AMGProfile(; synchronize::Bool=true) =
+    AMGProfile(Dict{Symbol,Float64}(), Dict{Symbol,Int}(), synchronize)
+
+function _amg_profile_add!(profile::AMGProfile, key::Symbol, seconds::Real)
+    profile.times[key] = get(profile.times, key, 0.0) + Float64(seconds)
+    return profile
+end
+
+_amg_profile_add!(::Nothing, key::Symbol, seconds::Real) = nothing
+
+function _amg_profile_count!(profile::AMGProfile, key::Symbol, n::Integer=1)
+    profile.counts[key] = get(profile.counts, key, 0) + Int(n)
+    return profile
+end
+
+_amg_profile_count!(::Nothing, key::Symbol, n::Integer=1) = nothing
+
+function _amg_profile_sync(profile::Union{Nothing,AMGProfile})
+    if profile !== nothing && profile.synchronize
+        try
+            CUDA.synchronize()
+        catch
+        end
+    end
+    return nothing
+end
+
+function _amg_profile_time!(f, profile::Union{Nothing,AMGProfile}, key::Symbol)
+    profile === nothing && return f()
+    _amg_profile_sync(profile)
+    t0 = time_ns()
+    result = f()
+    _amg_profile_sync(profile)
+    _amg_profile_add!(profile, key, (time_ns() - t0) / 1.0e9)
+    _amg_profile_count!(profile, key)
+    return result
+end
+
+function _amg_print_profile(io::IO, profile::AMGProfile)
+    total = sum(values(profile.times); init=0.0)
+    println(io, "  DD-alphaAMG profile breakdown:")
+    for (key, seconds) in sort(collect(profile.times); by=x -> x[2], rev=true)
+        pct = total > 0 ? 100 * seconds / total : 0.0
+        count = get(profile.counts, key, 0)
+        println(io, "    ", rpad(String(key), 30),
+                " time=", round(seconds; digits=6), "s",
+                "  pct=", round(pct; digits=2), "%",
+                "  count=", count)
+    end
+    return profile
+end
+
+function _amg_fine_dirac_flops_per_apply(setup::DDalphaAMG_Setup)
+    return 1320 * setup.NX * setup.NY * setup.NZ * setup.NT
+end
+
+@inline _amg_complex_matvec_flops(nrows::Int, ncols::Int) =
+    nrows * (6 * ncols + 2 * max(ncols - 1, 0))
+
+function _amg_coarse_stencil_couplings_per_block(setup::DDalphaAMG_Setup)
+    dims = (setup.NBX, setup.NBY, setup.NBZ, setup.NBT)
+    return 1 + sum(d > 2 ? 2 : 1 for d in dims)
+end
+
+function _amg_coarse_operator_flops_per_apply(setup::DDalphaAMG_Setup)
+    n = setup.Nv * setup.Nblocks
+    if setup.Dc_matrix !== nothing
+        return _amg_complex_matvec_flops(n, n)
+    end
+    couplings = _amg_coarse_stencil_couplings_per_block(setup)
+    return setup.Nblocks * couplings * _amg_complex_matvec_flops(setup.Nv, setup.Nv)
+end
+
+@inline _amg_count_flops!(counter::Nothing, n::Integer) = nothing
+@inline _amg_count_flops!(counter::Ref{Int}, n::Integer) = (counter[] += Int(n); nothing)
+@inline _amg_complex_axpby_flops(n::Integer) = 14 * Int(n)
+@inline _amg_complex_dot_flops(n::Integer) = 8 * Int(n)
+@inline _amg_complex_norm_flops(n::Integer) = 3 * Int(n)
+@inline _amg_fine_dofs(x::WF3x1) = length(x.f)
+@inline _amg_fine_dofs(setup::DDalphaAMG_Setup) =
+    setup.NX * setup.NY * setup.NZ * setup.NT * setup.NC * setup.NG
+@inline _amg_coarse_dofs(setup::DDalphaAMG_Setup) = setup.Nv * setup.Nblocks
+@inline _amg_restrict_flops(setup::DDalphaAMG_Setup) =
+    setup.Nv * _amg_fine_dofs(setup) * 8
+@inline _amg_prolongate_flops(setup::DDalphaAMG_Setup) =
+    setup.Nv * _amg_fine_dofs(setup) * 8
+
+function _amg_flop_stats(setup::DDalphaAMG_Setup,
+                         variable_fine_applications::Integer,
+                         variable_coarse_applications::Integer,
+                         variable_vector_flops::Integer=0;
+                         outer_fine_applications::Integer=0,
+                         outer_vector_flops::Integer=0)
+    fine_per_apply = _amg_fine_dirac_flops_per_apply(setup)
+    coarse_per_apply = _amg_coarse_operator_flops_per_apply(setup)
+    fine = Int(variable_fine_applications) * fine_per_apply
+    coarse = Int(variable_coarse_applications) * coarse_per_apply
+    vector = Int(variable_vector_flops)
+    preconditioner_total = fine + coarse + vector
+    outer_fine = Int(outer_fine_applications) * fine_per_apply
+    outer_vector = Int(outer_vector_flops)
+    outer_total = outer_fine + outer_vector
+    return (; fine_per_apply, coarse_per_apply,
+            fine, coarse, vector, preconditioner_total,
+            outer_fine, outer_vector, outer_total,
+            total=preconditioner_total + outer_total)
+end
+
+function _amg_print_solver_counts(io::IO,
+                                  setup::DDalphaAMG_Setup,
+                                  total_coarse_gmres::Integer,
+                                  coarse_apply_counter::Integer,
+                                  fine_apply_counter::Integer,
+                                  variable_coarse_apply_counter::Integer,
+                                  variable_fine_apply_counter::Integer,
+                                  variable_vector_flops::Integer=0,
+                                  outer_fine_applications::Integer=0,
+                                  outer_vector_flops::Integer=0)
+    flops = _amg_flop_stats(setup, variable_fine_apply_counter, variable_coarse_apply_counter,
+                            variable_vector_flops;
+                            outer_fine_applications=outer_fine_applications,
+                            outer_vector_flops=outer_vector_flops)
+    println(io, "  Total coarse GMRES calls: $total_coarse_gmres")
+    println(io, "  Total coarse operator applications: $coarse_apply_counter")
+    println(io, "  Total fine Dirac applications: $fine_apply_counter")
+    println(io, "  Variable coarse operator applications: $variable_coarse_apply_counter")
+    println(io, "  Variable fine Dirac applications: $variable_fine_apply_counter")
+    println(io, "  Outer FGMRES fine Dirac applications: $outer_fine_applications")
+    println(io, "  Fine Dirac FLOPs per apply: $(flops.fine_per_apply)")
+    println(io, "  Coarse operator FLOPs per apply: $(flops.coarse_per_apply)")
+    println(io, "  Estimated variable fine Dirac FLOPs: $(flops.fine)")
+    println(io, "  Estimated variable coarse operator FLOPs: $(flops.coarse)")
+    println(io, "  Estimated variable vector FLOPs: $(flops.vector)")
+    println(io, "  Estimated variable preconditioner FLOPs: $(flops.preconditioner_total)")
+    println(io, "  Estimated outer fine Dirac FLOPs: $(flops.outer_fine)")
+    println(io, "  Estimated outer FGMRES vector FLOPs: $(flops.outer_vector)")
+    println(io, "  Estimated outer FGMRES FLOPs: $(flops.outer_total)")
+    println(io, "  Estimated variable total FLOPs: $(flops.total)")
+    return flops
+end
+
+_amg_print_solver_counts(setup::DDalphaAMG_Setup,
+                         total_coarse_gmres::Integer,
+                         coarse_apply_counter::Integer,
+                         fine_apply_counter::Integer,
+                         variable_coarse_apply_counter::Integer,
+                         variable_fine_apply_counter::Integer,
+                         variable_vector_flops::Integer=0,
+                         outer_fine_applications::Integer=0,
+                         outer_vector_flops::Integer=0) =
+    _amg_print_solver_counts(stdout, setup, total_coarse_gmres,
+                             coarse_apply_counter, fine_apply_counter,
+                             variable_coarse_apply_counter,
+                             variable_fine_apply_counter,
+                             variable_vector_flops,
+                             outer_fine_applications,
+                             outer_vector_flops)
+
 
 """
     CoarseStencilOperator
 
 Coarse operator stored in block-stencil form on coarse grid DOFs:
 - onsite block: self[:, :, b]
-- nearest-neighbor links: plus[:, :, b, ﾎｼ], minus[:, :, b, ﾎｼ]  (ﾎｼ=1..4)
+- nearest-neighbor links: plus[:, :, b, mu], minus[:, :, b, mu]  (mu=1..4)
 
-Each block matrix has size Nvﾃ湧v, and total coarse size is Nv*Nblocks.
+Each block matrix has size Nv x Nv, and total coarse size is Nv*Nblocks.
 """
 mutable struct CoarseStencilOperator
     Nv::Int
@@ -225,7 +389,7 @@ function apply_coarse_stencil!(out::CoarseVector, op::CoarseStencilOperator, x::
             out.data[dst_base + i] += acc
         end
 
-        # +/竏・nearest neighbors: dst = nb_plus/minus(bs, mu)
+        # +//-nearest neighbors: dst = nb_plus/minus(bs, mu)
         for mu in 1:4
             bp = op.nb_plus[bs, mu]
             bm = op.nb_minus[bs, mu]
@@ -270,7 +434,7 @@ end
 
 
 # ==========================================
-#  繝悶Ο繝・け繝ｦ繝ｼ繝・ぅ繝ｪ繝・ぅ
+#  Block utilities
 # ==========================================
 
 @inline function block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
@@ -387,7 +551,8 @@ function _amg_restrict_kernel!(out, tv, x, block_sites, block_counts, nc_ng::Int
     return nothing
 end
 
-function _amg_restrict_one_kernel!(out, tv, x, block_sites, block_counts, nc_ng::Int32, Nv::Int32, v::Int32)
+function _amg_restrict_one_kernel!(out, tv, x, block_sites, block_counts,
+                                   nc::Int32, nc_ng::Int32, Nv::Int32, v::Int32)
     bid = Int32(blockIdx().x)
     tid = Int32(threadIdx().x)
     bsz = Int32(blockDim().x)
@@ -469,12 +634,12 @@ function _amg_block_project_kernel!(x, bmap, nc_ng::Int32, total::Int32, bid_tar
     return nothing
 end
 
-function _amg_block_axpby_kernel!(y, x, bmap, nc_ng::Int32, total::Int32, bid_target::Int32, ﾎｱ, ﾎｲ)
+function _amg_block_axpby_kernel!(y, x, bmap, nc_ng::Int32, total::Int32, bid_target::Int32, α, β)
     idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if idx <= total
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         if bmap[site] == bid_target
-            @inbounds y[idx] = ﾎｱ * x[idx] + ﾎｲ * y[idx]
+            @inbounds y[idx] = α * x[idx] + β * y[idx]
         end
     end
     return nothing
@@ -511,33 +676,41 @@ function _amg_block_inner_kernel!(out, x, y, block_sites, block_counts, nc_ng::I
     return nothing
 end
 
-function _amg_orthogonalize_kernel!(v, u, block_sites, block_counts, coeffs, nc_ng::Int32)
+function _amg_orthogonalize_kernel!(v, u, block_sites, block_counts, coeffs, nc_ng::Int32,
+                                    normalize::Bool)
     bid = Int32(blockIdx().x)
     tid = Int32(threadIdx().x)
     bsz = Int32(blockDim().x)
-    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
+    sh = CUDA.@cuDynamicSharedMem(ComplexF64, 2Int(bsz))
     total = block_counts[bid] * nc_ng
     acc = ComplexF64(0.0)
+    den = 0.0
     p = tid
     while p <= total
         site_pos = (p - Int32(1)) ÷ nc_ng + Int32(1)
         comp = (p - Int32(1)) % nc_ng + Int32(1)
         site = block_sites[site_pos, bid]
         fidx = (site - Int32(1)) * nc_ng + comp
-        @inbounds acc += conj(u[fidx]) * v[fidx]
+        @inbounds begin
+            acc += conj(u[fidx]) * v[fidx]
+            den += abs2(u[fidx])
+        end
         p += bsz
     end
     sh[tid] = acc
+    sh[tid + bsz] = ComplexF64(den)
     sync_threads()
     half = bsz >> Int32(1)
     while half > Int32(0)
         if tid <= half
             sh[tid] += sh[tid + half]
+            sh[tid + bsz] += sh[tid + bsz + half]
         end
         sync_threads()
         half = half >> Int32(1)
     end
-    coeff = sh[Int32(1)]
+    den_block = real(sh[Int32(1) + bsz])
+    coeff = normalize || den_block <= 1e-28 ? sh[Int32(1)] : sh[Int32(1)] / den_block
     if tid == Int32(1)
         coeffs[bid] = coeff
     end
@@ -966,9 +1139,9 @@ function _amg_block_mr_dot_kernel!(num, den, Alr, local_r,
     acc_num = zero(ComplexF64)
     acc_den = zero(ComplexF64)
     if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
-        total_sites = block_counts[bid]
+        total = block_counts[bid] * nc_ng
         p = tid
-        while p <= total_sites * nc_ng
+        while p <= total
             site_pos = (p - Int32(1)) ÷ nc_ng + Int32(1)
             comp = (p - Int32(1)) % nc_ng + Int32(1)
             site = block_sites[site_pos, bid]
@@ -1008,11 +1181,179 @@ function _amg_block_mr_update_kernel!(delta, local_r, Alr, num, den, bmap,
         bid = bmap[site]
         if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
             d = den[bid]
-            if abs(d) > 1e-30
+            if abs(d) > 1.0e-30
                 alpha = num[bid] / d
                 delta[idx] += alpha * local_r[idx]
                 local_r[idx] -= alpha * Alr[idx]
             end
+        end
+    end
+    return nothing
+end
+
+function _amg_color_block_dot_kernel!(out, x, y, block_sites, block_counts,
+                                      nc_ng::Int32, color::Int32,
+                                      NBX::Int32, NBY::Int32, NBZ::Int32)
+    bid = Int32(blockIdx().x)
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
+    acc = zero(ComplexF64)
+    if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        total = block_counts[bid] * nc_ng
+        p = tid
+        while p <= total
+            site_pos = (p - Int32(1)) ÷ nc_ng + Int32(1)
+            comp = (p - Int32(1)) % nc_ng + Int32(1)
+            site = block_sites[site_pos, bid]
+            idx = (site - Int32(1)) * nc_ng + comp
+            acc += conj(x[idx]) * y[idx]
+            p += bsz
+        end
+    end
+    sh[tid] = acc
+    sync_threads()
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            sh[tid] += sh[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+    if tid == Int32(1)
+        out[bid] = sh[1]
+    end
+    return nothing
+end
+
+@inline function _amg_gmres_h_index(row::Int32, col::Int32, bid::Int32,
+                                    mplus::Int32, m::Int32)
+    return row + (col - Int32(1)) * mplus + (bid - Int32(1)) * mplus * m
+end
+
+function _amg_color_block_dot_h_kernel!(H, row::Int32, col::Int32,
+                                        x, y, block_sites, block_counts,
+                                        nc_ng::Int32, color::Int32,
+                                        NBX::Int32, NBY::Int32, NBZ::Int32,
+                                        mplus::Int32, m::Int32)
+    bid = Int32(blockIdx().x)
+    tid = Int32(threadIdx().x)
+    bsz = Int32(blockDim().x)
+    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
+    acc = zero(ComplexF64)
+    if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        total = block_counts[bid] * nc_ng
+        p = tid
+        while p <= total
+            site_pos = (p - Int32(1)) ÷ nc_ng + Int32(1)
+            comp = (p - Int32(1)) % nc_ng + Int32(1)
+            site = block_sites[site_pos, bid]
+            idx = (site - Int32(1)) * nc_ng + comp
+            acc += conj(x[idx]) * y[idx]
+            p += bsz
+        end
+    end
+    sh[tid] = acc
+    sync_threads()
+    half = bsz >> Int32(1)
+    while half > Int32(0)
+        if tid <= half
+            sh[tid] += sh[tid + half]
+        end
+        sync_threads()
+        half = half >> Int32(1)
+    end
+    if tid == Int32(1)
+        H[_amg_gmres_h_index(row, col, bid, mplus, m)] = sh[1]
+    end
+    return nothing
+end
+
+function _amg_color_invnorm_from_vec_kernel!(coeff, norm_out, dotvals,
+                                             color::Int32,
+                                             NBX::Int32, NBY::Int32, NBZ::Int32)
+    bid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if bid <= length(coeff)
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            nrm = sqrt(max(real(dotvals[bid]), 0.0))
+            norm_out[bid] = nrm
+            coeff[bid] = nrm > 1.0e-30 ? ComplexF64(1.0 / nrm) : zero(ComplexF64)
+        else
+            norm_out[bid] = 0.0
+            coeff[bid] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_color_invnorm_from_h_kernel!(coeff, H, row::Int32, col::Int32,
+                                           color::Int32,
+                                           NBX::Int32, NBY::Int32, NBZ::Int32,
+                                           mplus::Int32, m::Int32)
+    bid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if bid <= length(coeff)
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            idx = _amg_gmres_h_index(row, col, bid, mplus, m)
+            nrm = sqrt(max(real(H[idx]), 0.0))
+            H[idx] = ComplexF64(nrm)
+            coeff[bid] = nrm > 1.0e-30 ? ComplexF64(1.0 / nrm) : zero(ComplexF64)
+        else
+            coeff[bid] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_color_block_axpby_coeff_kernel!(y, x, coeff, bmap,
+                                              nc_ng::Int32, total::Int32,
+                                              color::Int32,
+                                              NBX::Int32, NBY::Int32, NBZ::Int32,
+                                              α, β)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        bid = bmap[site]
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            y[idx] = α * coeff[bid] * x[idx] + β * y[idx]
+        elseif β == zero(β)
+            y[idx] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_color_block_axpby_h_kernel!(y, x, H, row::Int32, col::Int32,
+                                          bmap, nc_ng::Int32, total::Int32,
+                                          color::Int32,
+                                          NBX::Int32, NBY::Int32, NBZ::Int32,
+                                          mplus::Int32, m::Int32,
+                                          α, β)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        bid = bmap[site]
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            c = H[_amg_gmres_h_index(row, col, bid, mplus, m)]
+            y[idx] = α * c * x[idx] + β * y[idx]
+        elseif β == zero(β)
+            y[idx] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_color_gmres_update_kernel!(delta, v, ycoeff, k::Int32,
+                                         bmap, nc_ng::Int32, total::Int32,
+                                         color::Int32,
+                                         NBX::Int32, NBY::Int32, NBZ::Int32,
+                                         m::Int32)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        bid = bmap[site]
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            delta[idx] += ycoeff[k + (bid - Int32(1)) * m] * v[idx]
         end
     end
     return nothing
@@ -1147,7 +1488,7 @@ end
 """
     block_project!(f, bx, by, bz, bt, r)
 
-繝悶Ο繝・け(bx,by,bz,bt)螟悶・蜈ｨ繧ｵ繧､繝医ｒ繧ｼ繝ｭ縺ｫ縺吶ｋ (in-place)縲・
+Keep only the selected block `(bx, by, bz, bt)` and zero all sites outside it.
 """
 function block_project!(f::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NX, NY, NZ, NT = f.NX, f.NY, f.NZ, f.NT
@@ -1180,8 +1521,8 @@ end
 """
     block_copy!(dest, src, bx, by, bz, bt, r)
 
-src 縺ｮ繝悶Ο繝・け(bx,by,bz,bt)蜀・・蛟､繧・dest 縺ｮ蜷後§菴咲ｽｮ縺ｫ繧ｳ繝斐・縺吶ｋ (in-place)縲・
-dest 縺ｮ繝悶Ο繝・け螟悶・螟画峩縺励↑縺・・
+Copy the selected block from `src` into the same block location of `dest`.
+Entries outside the selected block of `dest` are left unchanged.
 """
 function block_copy!(dest::WF3x1, src::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NC, NG = src.NC, src.NG
@@ -1208,7 +1549,7 @@ end
 """
     block_zero!(f, bx, by, bz, bt, r)
 
-f 縺ｮ繝悶Ο繝・け(bx,by,bz,bt)蜀・・蛟､繧偵ぞ繝ｭ縺ｫ縺吶ｋ (in-place)縲・
+Zero the selected block of `f` in place.
 """
 function block_zero!(f::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NC, NG = f.NC, f.NG
@@ -1233,11 +1574,11 @@ function block_zero!(f::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
 end
 
 """
-    block_axpby!(ﾎｱ, x, ﾎｲ, y, bx, by, bz, bt, r)
+    block_axpby!(α, x, β, y, bx, by, bz, bt, r)
 
-y[block] = ﾎｱ * x[block] + ﾎｲ * y[block] 繧偵ヶ繝ｭ繝・け蜀・〒縺ｮ縺ｿ螳溯｡・(in-place)縲・
+Apply `y[block] = α * x[block] + β * y[block]` only inside the selected block.
 """
-function block_axpby!(ﾎｱ, x::WF3x1, ﾎｲ, y::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
+function block_axpby!(α, x::WF3x1, β, y::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NC, NG = x.NC, x.NG
     @inbounds for lt = 1:r
         it = (bt-1)*r + lt
@@ -1250,7 +1591,7 @@ function block_axpby!(ﾎｱ, x::WF3x1, ﾎｲ, y::WF3x1, bx::Int, by::Int, bz::
                     for ig = 1:NG
                         @simd for ic = 1:NC
                             y[ic, ix, iy, iz, it, ig] =
-                                ﾎｱ * x[ic, ix, iy, iz, it, ig] + ﾎｲ * y[ic, ix, iy, iz, it, ig]
+                                α * x[ic, ix, iy, iz, it, ig] + β * y[ic, ix, iy, iz, it, ig]
                         end
                     end
                 end
@@ -1261,9 +1602,9 @@ function block_axpby!(ﾎｱ, x::WF3x1, ﾎｲ, y::WF3x1, bx::Int, by::Int, bz::
 end
 
 """
-    block_inner_product(x, y, bx, by, bz, bt, r) 竊・ComplexF64
+    block_inner_product(x, y, bx, by, bz, bt, r) -> ComplexF64
 
-繝悶Ο繝・け(bx,by,bz,bt)蜀・・縺ｿ縺ｮ蜀・ｩ・筺ｨx|y筺ｩ_B縲・
+Return the inner product restricted to the selected block.
 """
 function block_inner_product(x::WF3x1, y::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     NC, NG = x.NC, x.NG
@@ -1331,13 +1672,13 @@ function block_zero!(f::WF3x1GPU, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     return f
 end
 
-function block_axpby!(ﾎｱ, x::WF3x1GPU, ﾎｲ, y::WF3x1GPU, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
+function block_axpby!(α, x::WF3x1GPU, β, y::WF3x1GPU, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     setup_like, cache = _gpu_block_context_from_field(y, r)
     nc_ng = Int32(size(y.f, 1) * size(y.f, 2))
     total = Int32(length(y.f))
     bid = _gpu_bid(setup_like, bx, by, bz, bt)
     @cuda threads=256 blocks=cld(Int(total), 256) _amg_block_axpby_kernel!(
-        reshape(y.f, :), reshape(x.f, :), cache[:bmap], nc_ng, total, bid, ﾎｱ, ﾎｲ)
+        reshape(y.f, :), reshape(x.f, :), cache[:bmap], nc_ng, total, bid, α, β)
     return y
 end
 
@@ -1353,29 +1694,32 @@ end
 
 
 # ==========================================
-#  ﾎｳ竄・繝ｦ繝ｼ繝・ぅ繝ｪ繝・ぅ (Chiral Splitting)
+#  Chiral Splitting
 # ==========================================
 
 """
-ﾎｳ竄・縺ｮ隨ｦ蜿ｷ縲ゅ％縺ｮ繧ｳ繝ｼ繝峨〒縺ｮ convention:
-  ﾎｳ竄・= diag(-1, -1, +1, +1)   (ig=1,2 竊・-1,  ig=3,4 竊・+1)
+    gamma5_sign(ig)
+
+Return the gamma5 sign for spin component `ig` using the convention
+`diag(-1, -1, +1, +1)`.
 """
 @inline gamma5_sign(ig::Int) = ig <= 2 ? -1 : 1
 
 """
     gamma5!(x::WF3x1)
 
-x 縺ｫ ﾎｳ竄・繧・in-place 縺ｧ驕ｩ逕ｨ: x 竊・ﾎｳ竄・x
+Apply gamma5 in place using the convention `diag(-1, -1, +1, +1)` for spin
+components `ig=1:4`.
 """
 function gamma5!(x::WF3x1)
     NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
     NC, NG = x.NC, x.NG
     @inbounds for it=1:NT, iz=1:NZ, iy=1:NY, ix=1:NX
         for ic=1:NC
-            # ig=1,2 竊・ﾃ・-1)
+            # ig=1,2 have gamma5 eigenvalue -1
             x[ic,ix,iy,iz,it,1] = -x[ic,ix,iy,iz,it,1]
             x[ic,ix,iy,iz,it,2] = -x[ic,ix,iy,iz,it,2]
-            # ig=3,4 縺ｯ ﾎｳ竄・+1 縺ｪ縺ｮ縺ｧ螟画峩荳崎ｦ・
+            # ig=3,4 have gamma5 eigenvalue +1 and are unchanged
         end
     end
     return x
@@ -1391,12 +1735,10 @@ end
 """
     chiral_project!(x::WF3x1, chirality::Symbol)
 
-繧ｫ繧､繝ｩ繝ｫ蟆・ｽｱ繧・in-place 縺ｧ驕ｩ逕ｨ:
-  :plus  竊・P竄・= (1+ﾎｳ竄・/2: ig=3,4 繧剃ｿ晄戟, ig=1,2 繧偵ぞ繝ｭ蛹・
-  :minus 竊・P竄・= (1-ﾎｳ竄・/2: ig=1,2 繧剃ｿ晄戟, ig=3,4 繧偵ぞ繝ｭ蛹・
+Project `x` in place onto one chiral sector.
 
-Note: ﾎｳ竄・diag(-1,-1,+1,+1) 縺ｪ縺ｮ縺ｧ
-  P竄・= diag(0,0,1,1),  P竄・= diag(1,1,0,0)
+- `:plus` keeps `ig=3,4` and zeros `ig=1,2`.
+- `:minus` keeps `ig=1,2` and zeros `ig=3,4`.
 """
 function chiral_project!(x::WF3x1, chirality::Symbol)
     NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
@@ -1404,11 +1746,11 @@ function chiral_project!(x::WF3x1, chirality::Symbol)
     @inbounds for it=1:NT, iz=1:NZ, iy=1:NY, ix=1:NX
         for ic=1:NC
             if chirality == :plus
-                # P竄・ zero out ig=1,2 (ﾎｳ竄・eigenvalue -1)
+                # P+ zeros ig=1,2 (gamma5 eigenvalue -1)
                 x[ic,ix,iy,iz,it,1] = zero(ComplexF64)
                 x[ic,ix,iy,iz,it,2] = zero(ComplexF64)
             else
-                # P竄・ zero out ig=3,4 (ﾎｳ竄・eigenvalue +1)
+                # P- zeros ig=3,4 (gamma5 eigenvalue +1)
                 x[ic,ix,iy,iz,it,3] = zero(ComplexF64)
                 x[ic,ix,iy,iz,it,4] = zero(ComplexF64)
             end
@@ -1424,18 +1766,32 @@ function chiral_project!(x::WF3x1GPU, chirality::Symbol)
     return x
 end
 
+function _chiral_split_vectors(vectors::Vector{T}) where {T<:WF3x1}
+    split_vectors = Vector{T}(undef, 2 * length(vectors))
+    for i in eachindex(vectors)
+        plus = _copy_wf(vectors[i])
+        minus = _copy_wf(vectors[i])
+        chiral_project!(plus, :plus)
+        chiral_project!(minus, :minus)
+        split_vectors[2 * i - 1] = plus
+        split_vectors[2 * i] = minus
+    end
+    return split_vectors
+end
+
 
 # ==========================================
-#  繝悶Ο繝・け逶ｴ莠､豁｣隕丞喧 (Block Orthonormalization)
+#  Block Orthonormalization
 # ==========================================
 
 """
-    block_orthonormalize!(vectors, r)
+    block_orthonormalize!(vectors, r; normalize=true)
 
-蜷・ヶ繝ｭ繝・け蜀・〒繝・せ繝医・繧ｯ繝医Ν繧・Modified Gram-Schmidt 縺ｧ逶ｴ莠､豁｣隕丞喧縺吶ｋ縲・
-蜃ｦ逅・ｾ・ 蜷・ヶ繝ｭ繝・けB縺ｫ縺､縺・※ 筺ｨﾏ違ｵ｢|ﾏ遺ｱｼ筺ｩ_B = ﾎｴ盞｢箜ｼ
+Block-orthogonalize the test vectors with modified Gram-Schmidt.
+For each block B, enforce `<phi_i | phi_j>_B = 0` for `i != j`.
+When `normalize=true`, also enforce `<phi_i | phi_i>_B = 1`.
 """
-function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
+function block_orthonormalize!(vectors::Vector{T}, r::Int; normalize::Bool=true) where {T<:WF3x1}
     if vectors[1] isa WF3x1GPU
         v1 = vectors[1]
         setup_like = (; r=r, NBX=v1.NX ÷ r, NBY=v1.NY ÷ r, NBZ=v1.NZ ÷ r, NBT=v1.NT ÷ r,
@@ -1447,12 +1803,14 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
         norms = CUDA.zeros(Float64, setup_like.Nblocks)
         for v in 1:length(vectors)
             for u in 1:(v-1)
-                @cuda threads=256 blocks=setup_like.Nblocks shmem=(256 * sizeof(ComplexF64)) _amg_orthogonalize_kernel!(
+                @cuda threads=256 blocks=setup_like.Nblocks shmem=(2 * 256 * sizeof(ComplexF64)) _amg_orthogonalize_kernel!(
                     reshape(vectors[v].f, :), reshape(vectors[u].f, :),
-                    cache[:block_sites], cache[:block_counts], coeffs, nc_ng)
+                    cache[:block_sites], cache[:block_counts], coeffs, nc_ng, normalize)
             end
-            @cuda threads=256 blocks=setup_like.Nblocks shmem=(256 * sizeof(Float64)) _amg_normalize_kernel!(
-                reshape(vectors[v].f, :), cache[:block_sites], cache[:block_counts], norms, nc_ng)
+            if normalize
+                @cuda threads=256 blocks=setup_like.Nblocks shmem=(256 * sizeof(Float64)) _amg_normalize_kernel!(
+                    reshape(vectors[v].f, :), cache[:block_sites], cache[:block_counts], norms, nc_ng)
+            end
         end
         return vectors
     end
@@ -1463,11 +1821,11 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
     NBX = NX ÷ r; NBY = NY ÷ r; NBZ = NZ ÷ r; NBT = NT ÷ r
     block_dof = r^4 * NC * NG
 
-    # 繝ｭ繝ｼ繧ｫ繝ｫ繝舌ャ繝輔ぃ繧剃ｺ句燕遒ｺ菫・(繝悶Ο繝・け豈弱↓蜀榊茜逕ｨ)
+    # Preallocate local buffers reused for each block.
     local_vecs = [Vector{ComplexF64}(undef, block_dof) for _ in 1:Nv]
 
     @inbounds for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
-        # 繝悶Ο繝・け蜀・ョ繝ｼ繧ｿ繧呈歓蜃ｺ
+        # Extract block-local data.
         for v = 1:Nv
             idx = 0
             for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
@@ -1485,16 +1843,21 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
         # Modified Gram-Schmidt
         for v = 1:Nv
             for u = 1:(v-1)
-                proj = dot(local_vecs[u], local_vecs[v])
+                den = dot(local_vecs[u], local_vecs[u])
+                proj = normalize || real(den) <= 1e-28 ?
+                       dot(local_vecs[u], local_vecs[v]) :
+                       dot(local_vecs[u], local_vecs[v]) / den
                 local_vecs[v] .-= proj .* local_vecs[u]
             end
-            nrm = norm(local_vecs[v])
-            if nrm > 1e-14
-                local_vecs[v] ./= nrm
+            if normalize
+                nrm = norm(local_vecs[v])
+                if nrm > 1e-14
+                    local_vecs[v] ./= nrm
+                end
             end
         end
 
-        # 譖ｸ縺肴綾縺・
+        # Write back.
         for v = 1:Nv
             idx = 0
             for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
@@ -1513,16 +1876,25 @@ function block_orthonormalize!(vectors::Vector{T}, r::Int) where {T<:WF3x1}
     return vectors
 end
 
+function _block_orthonormalize_chiral_split!(vectors::Vector{T}, r::Int; normalize::Bool=true) where {T<:WF3x1}
+    @assert iseven(length(vectors)) "chiral split vectors must come in plus/minus pairs"
+    plus_vectors = vectors[1:2:end]
+    minus_vectors = vectors[2:2:end]
+    block_orthonormalize!(plus_vectors, r; normalize=normalize)
+    block_orthonormalize!(minus_vectors, r; normalize=normalize)
+    return vectors
+end
+
 
 # ==========================================
-#  蛻ｶ髯先ｼ皮ｮ怜ｭ・(Restriction: fine 竊・coarse)
+#  Restriction: fine -> coarse
 # ==========================================
 
 """
-    restrict_f2c(setup, x) 竊・CoarseVector
+    restrict_f2c(setup, x) -> CoarseVector
 
-邏ｰ譬ｼ蟄舌・繧ｯ繝医Ν繧堤ｲ玲ｼ蟄舌↓蟆・ｽｱ:
-  v_coarse[B, i] = 筺ｨﾏ違ｵ｢|x筺ｩ_B  (繝悶Ο繝・けB蜀・・蜀・ｩ・
+Restrict a fine-grid vector to the coarse grid:
+`v_coarse[B, i] = <phi_i | x>_B`.
 """
 function restrict_f2c(setup::DDalphaAMG_Setup, x::WF3x1)
     if x isa WF3x1GPU
@@ -1545,7 +1917,8 @@ function restrict_f2c(setup::DDalphaAMG_Setup, x::WF3x1)
                 iy = (by-1)*r + ly; ix = (bx-1)*r + lx
                 for ig = 1:NG
                     for ic = 1:NC
-                        val += conj(tv[ic, ix, iy, iz, it, ig]) * x[ic, ix, iy, iz, it, ig]
+                        val += conj(tv[ic, ix, iy, iz, it, ig]) *
+                               x[ic, ix, iy, iz, it, ig]
                     end
                 end
             end
@@ -1557,19 +1930,20 @@ function restrict_f2c(setup::DDalphaAMG_Setup, x::WF3x1)
 end
 
 """
-    restrict_f2c!(cv, setup, x) 竊・CoarseVector
+    restrict_f2c!(cv, setup, x) -> CoarseVector
 
-restrict_f2c 縺ｮ in-place 迚医らｵ先棡繧・cv 縺ｫ譖ｸ縺崎ｾｼ繧縲・
+In-place version of `restrict_f2c`; writes the result into `cv`.
 """
 function restrict_f2c!(cv::CoarseVector, setup::DDalphaAMG_Setup, x::WF3x1)
     if x isa WF3x1GPU
         cache = _ensure_gpu_cache!(setup)
+        nc = Int32(size(x.f, 1))
         nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
         fill!(cv.data, zero(ComplexF64))
         for v in 1:setup.Nv
             @cuda threads=256 blocks=setup.Nblocks shmem=(256 * sizeof(ComplexF64)) _amg_restrict_one_kernel!(
                 cv.data, reshape(setup.test_vectors[v].f, :), reshape(x.f, :),
-                cache[:block_sites], cache[:block_counts], nc_ng, Int32(setup.Nv), Int32(v))
+                cache[:block_sites], cache[:block_counts], nc, nc_ng, Int32(setup.Nv), Int32(v))
         end
         return cv
     end
@@ -1587,7 +1961,8 @@ function restrict_f2c!(cv::CoarseVector, setup::DDalphaAMG_Setup, x::WF3x1)
                 iy = (by-1)*r + ly; ix = (bx-1)*r + lx
                 for ig = 1:NG
                     for ic = 1:NC
-                        val += conj(tv[ic, ix, iy, iz, it, ig]) * x[ic, ix, iy, iz, it, ig]
+                        val += conj(tv[ic, ix, iy, iz, it, ig]) *
+                               x[ic, ix, iy, iz, it, ig]
                     end
                 end
             end
@@ -1600,14 +1975,14 @@ end
 
 
 # ==========================================
-#  蟒ｶ髟ｷ貍皮ｮ怜ｭ・(Prolongation: coarse 竊・fine)
+#  Prolongation: coarse -> fine
 # ==========================================
 
 """
-    prolongate_c2f(setup, cv) 竊・WF3x1
+    prolongate_c2f(setup, cv) -> WF3x1
 
-邊玲ｼ蟄舌・繧ｯ繝医Ν繧堤ｴｰ譬ｼ蟄舌↓陬憺俣:
-  x(site) = ﾎ｣盞｢ c[B(site), i] * ﾏ違ｵ｢(site)
+Prolongate a coarse-grid vector to the fine grid:
+`x(site) = sum_i c[B(site), i] * phi_i(site)`.
 """
 function prolongate_c2f(setup::DDalphaAMG_Setup, cv::CoarseVector)
     if setup.test_vectors[1] isa WF3x1GPU
@@ -1642,9 +2017,9 @@ function prolongate_c2f(setup::DDalphaAMG_Setup, cv::CoarseVector)
 end
 
 """
-    prolongate_c2f!(f, setup, cv) 竊・WF3x1
+    prolongate_c2f!(f, setup, cv) -> WF3x1
 
-prolongate_c2f 縺ｮ in-place 迚医らｵ先棡繧・f 縺ｫ譖ｸ縺崎ｾｼ繧縲・
+In-place version of `prolongate_c2f`; writes the result into `f`.
 """
 function prolongate_c2f!(f::WF3x1, setup::DDalphaAMG_Setup, cv::CoarseVector)
     if f isa WF3x1GPU
@@ -1686,14 +2061,15 @@ end
 
 
 # ==========================================
-#  邊玲ｼ蟄先ｼ皮ｮ怜ｭ・(Coarse Grid Operator, matrix-free)
+#  Coarse Grid Operator, matrix-free
 # ==========================================
 
 """
-    coarse_apply(setup, D, cv) 竊・CoarseVector
+    coarse_apply(setup, D, cv) -> CoarseVector
 
-邊玲ｼ蟄織irac貍皮ｮ怜ｭ舌・驕ｩ逕ｨ: Dc = R ﾂｷ D ﾂｷ P
-  (Prolongate 竊・Apply D on fine grid 竊・Restrict)
+Apply the matrix-free coarse operator `Dc = R * D * P`.
+The restriction is `R = P'`. For paper chiral coarsening, the prolongator
+already contains separately coarsened chiral sectors.
 """
 function coarse_apply(setup::DDalphaAMG_Setup, D, cv::CoarseVector)
     fine_v = prolongate_c2f(setup, cv)
@@ -1703,12 +2079,10 @@ function coarse_apply(setup::DDalphaAMG_Setup, D, cv::CoarseVector)
 end
 
 """
-    coarse_apply!(result, setup, D, cv, fine_buf1, fine_buf2) 竊・CoarseVector
+    coarse_apply!(result, setup, D, cv, fine_buf1, fine_buf2) -> CoarseVector
 
-coarse_apply 縺ｮ in-place 迚医ゆｺ句燕遒ｺ菫昴＠縺・fine_buf1, fine_buf2 繧剃ｽ懈･ｭ繝舌ャ繝輔ぃ縺ｨ縺励※菴ｿ逕ｨ縺励・
-邨先棡繧・result 縺ｫ譖ｸ縺崎ｾｼ繧縲ゅΓ繝｢繝ｪ蜑ｲ繧雁ｽ薙※繧ｼ繝ｭ縲・
-  fine_buf1: prolongation 邨先棡逕ｨ
-  fine_buf2: D 驕ｩ逕ｨ邨先棡逕ｨ
+In-place coarse-operator application. `fine_buf1` stores the prolongated vector
+and `fine_buf2` stores the fine-grid Dirac application before restriction.
 """
 function coarse_apply!(result::CoarseVector, setup::DDalphaAMG_Setup, D, cv::CoarseVector,
                        fine_buf1::WF3x1, fine_buf2::WF3x1)
@@ -1720,14 +2094,15 @@ end
 
 
 # ==========================================
-#  邊玲ｼ蟄先ｼ皮ｮ怜ｭ舌・莠句燕險育ｮ・
+#  Coarse operator precomputation
 # ==========================================
 
 """
     precompute_coarse_operator!(setup, D; verbose=false, mode=:stencil)
 
-Build coarse operator in one of two forms:
-- `mode=:stencil` (default): block-stencil operator with Nvﾃ湧v couplings per block/neighbor.
+Build the coarse operator in one of two forms:
+
+- `mode=:stencil` (default): block-stencil operator with Nv x Nv couplings per block/neighbor.
 - `mode=:dense`: full dense matrix Dc (legacy path).
 """
 function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
@@ -1775,7 +2150,7 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
         end
 
         if verbose
-            println("  coarse operator direct GPU stencil assembly... blocks=$(Nblocks), Nv=$(Nv)")
+            println("  coarse operator direct GPU stencil assembly... blocks=$(Nblocks), Nv=$(Nv), R=P'")
         end
         threads = 128
         @cuda threads=threads blocks=(Nblocks, Nv, Nv) shmem=(9 * threads * sizeof(ComplexF64)) _amg_direct_wilson_stencil_kernel!(
@@ -1796,7 +2171,7 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
         if verbose
             nnz_blocks = Nblocks * (1 + 8)
             bytes_est = nnz_blocks * Nv * Nv * 16
-            println("  邊玲ｼ蟄先ｼ皮ｮ怜ｭ・stencil)繧剃ｺ句燕險育ｮ嶺ｸｭ... blocks=$(Nblocks), Nv=$(Nv), approx $(round(bytes_est/1024/1024, digits=1)) MB")
+            println("  precomputing coarse operator stencil... blocks=$(Nblocks), Nv=$(Nv), approx $(round(bytes_est/1024/1024, digits=1)) MB")
         end
 
         use_gpu = setup.test_vectors[1] isa WF3x1GPU
@@ -1862,7 +2237,7 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
         )
 
         if verbose
-            println("  邊玲ｼ蟄先ｼ皮ｮ怜ｭ・stencil)縺ｮ莠句燕險育ｮ怜ｮ御ｺ・")
+            println("  coarse operator stencil precompute done")
         end
         return setup
     elseif mode != :dense
@@ -1873,7 +2248,7 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
     end
 
     if verbose
-        println("  邊玲ｼ蟄先ｼ皮ｮ怜ｭ舌ｒ莠句燕險育ｮ嶺ｸｭ... ($(n)ﾃ・(n) 陦悟・, $(round(n*n*16/1024/1024, digits=1)) MB)")
+        println("  dense coarse operator precompute done")
     end
 
     Dc = zeros(ComplexF64, n, n)
@@ -1893,14 +2268,14 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
 
     setup.Dc_matrix = Dc
     if verbose
-        println("  邊玲ｼ蟄先ｼ皮ｮ怜ｭ舌・莠句燕險育ｮ怜ｮ御ｺ・")
+        println("  dense coarse operator precompute done")
     end
     return setup
 end
 
 
 # ==========================================
-#  繝ｩ繝ｳ繝繝繝輔ぉ繝ｫ繝溘が繝ｳ逕滓・ (Setup逕ｨ)
+#  Random fermion generation for setup
 # ==========================================
 
 function random_fermion!(x::WF3x1)
@@ -1926,18 +2301,18 @@ end
 
 
 # ==========================================
-#  繧ｹ繝繝ｼ繧ｶ繝ｼ (Smoothers)
+#  Smoothers
 # ==========================================
 
 """
     mr_smooth!(x, D, b; niter)
 
-Minimal Residual (MR) 繧ｹ繝繝ｼ繧ｶ繝ｼ縲・
-蜷・う繝・Ξ繝ｼ繧ｷ繝ｧ繝ｳ:
-  r = b - D*x,  ﾎｱ = 筺ｨD*r, r筺ｩ / 筺ｨD*r, D*r筺ｩ,  x += ﾎｱ*r
+Minimal Residual (MR) smoother. Each iteration computes
+`r = b - D*x`, `alpha = <D*r, r> / <D*r, D*r>`, then updates `x += alpha*r`.
 """
 function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4,
-                    fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+                    fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                    flop_counter::Union{Nothing,Ref{Int}}=nothing)
 
     Dr = similar(x)  # D*r work buffer
     r = similar(x)   # b - D*x work buffer
@@ -1946,167 +2321,212 @@ function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4,
     for _ = 1:niter
         # r = b - D * x
         _amg_mul_dirac!(r, D, x; fine_apply_counter=fine_apply_counter)
-        axpby!(1, b, -1, r)  # r = b - D*x  竊・axpby!(1, b, -1, r) => r = 1*b + (-1)*r
+        axpby!(1, b, -1, r)  # r = b - D*x
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
         # Dr = D * r
         _amg_mul_dirac!(Dr, D, r; fine_apply_counter=fine_apply_counter)
         num = inner_product(Dr, r)
         den = inner_product(Dr, Dr)
+        _amg_count_flops!(flop_counter, 2 * _amg_complex_dot_flops(_amg_fine_dofs(x)))
         if abs(den) < 1e-30
             break
         end
-        ﾎｱ = num / den
-        axpby!(ﾎｱ, r, 1, x)
+        α = num / den
+        axpby!(α, r, 1, x)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
     end
     return x
 end
 
+function _amg_local_gmres_block_solve!(
+        δ::WF3x1, D, rhs::WF3x1,
+        bx::Int, by::Int, bz::Int, bt::Int, r_blk::Int, restart::Int,
+        V::Vector{<:WF3x1}, w::WF3x1,
+        H::Matrix{ComplexF64}, e1::Vector{ComplexF64};
+        fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+        flop_counter::Union{Nothing,Ref{Int}}=nothing,
+        block_dofs::Int)
+    block_zero!(δ, bx, by, bz, bt, r_blk)
+    fill!(H, zero(ComplexF64))
+    fill!(e1, zero(ComplexF64))
+
+    block_project!(V[1], bx, by, bz, bt, r_blk)
+    block_copy!(V[1], rhs, bx, by, bz, bt, r_blk)
+    β = sqrt(real(block_inner_product(V[1], V[1], bx, by, bz, bt, r_blk)))
+    _amg_count_flops!(flop_counter, _amg_complex_norm_flops(block_dofs))
+    β < 1e-30 && return δ
+
+    block_axpby!(1 / β, V[1], 0, V[1], bx, by, bz, bt, r_blk)
+    _amg_count_flops!(flop_counter, 2 * block_dofs)
+
+    j_final = restart
+    for j = 1:restart
+        _amg_mul_dirac!(w, D, V[j]; fine_apply_counter=fine_apply_counter)
+        block_project!(w, bx, by, bz, bt, r_blk)
+
+        for i = 1:j
+            H[i,j] = block_inner_product(V[i], w, bx, by, bz, bt, r_blk)
+            block_axpby!(-H[i,j], V[i], 1, w, bx, by, bz, bt, r_blk)
+            _amg_count_flops!(flop_counter,
+                _amg_complex_dot_flops(block_dofs) + _amg_complex_axpby_flops(block_dofs))
+        end
+
+        H[j+1,j] = sqrt(real(block_inner_product(w, w, bx, by, bz, bt, r_blk)))
+        _amg_count_flops!(flop_counter, _amg_complex_norm_flops(block_dofs))
+        if abs(H[j+1,j]) < 1e-14
+            j_final = j
+            break
+        end
+
+        block_project!(V[j+1], bx, by, bz, bt, r_blk)
+        block_copy!(V[j+1], w, bx, by, bz, bt, r_blk)
+        block_axpby!(1 / H[j+1,j], V[j+1], 0, V[j+1], bx, by, bz, bt, r_blk)
+        _amg_count_flops!(flop_counter, 2 * block_dofs)
+    end
+
+    e1[1] = β
+    y = H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
+    _amg_count_flops!(flop_counter, 16 * j_final^3)
+
+    for k = 1:j_final
+        block_axpby!(y[k], V[k], 1, δ, bx, by, bz, bt, r_blk)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(block_dofs))
+    end
+    return δ
+end
+
 
 """
-    sap_smooth!(x, D, b, setup; niter, nblock_mr)
+    sap_smooth!(x, D, b, setup; niter, block_solver, nblock_mr, nblock_gmres)
 
-Schwarz Alternating Procedure (SAP) 繧ｹ繝繝ｼ繧ｶ繝ｼ縲・
-繝悶Ο繝・け豈弱↓繝ｭ繝ｼ繧ｫ繝ｫ Minimal Residual 繧ｹ繝・ャ繝励ｒ螳溯｡・(multiplicative Schwarz)縲・
-蜷・ヶ繝ｭ繝・け蜀・〒 Dirichlet B.C. 繧堤畑縺・．_BB * ﾎｴ 竕・r_B 繧定ｿ台ｼｼ逧・↓隗｣縺上・
-
-繝舌ャ繝輔ぃ繧剃ｺ句燕遒ｺ菫昴＠縲√ヶ繝ｭ繝・け繝ｫ繝ｼ繝怜・縺ｧ縺ｮ繝｡繝｢繝ｪ蜑ｲ繧雁ｽ薙※繧貞屓驕ｿ縲・
-蜀・ｩ阪・繝悶Ο繝・け繝ｭ繝ｼ繧ｫ繝ｫ縺ｧ險育ｮ励＠縲√ヵ繝ｫ譬ｼ蟄先ｼ皮ｮ励ｒ譛蟆丞喧縲・
+Schwarz Alternating Procedure (SAP) smoother. It sweeps over coarse blocks,
+approximates each block-local system with MR by default, matching the
+DD-alphaAMG paper parameters. Set `block_solver=:gmres` to use a stronger local
+GMRES variant.
 """
 function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
-                     niter::Int=1, nblock_mr::Int=4,
-                     fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+                     niter::Int=1,
+                     block_solver::Symbol=:mr,
+                     nblock_mr::Int=4,
+                     nblock_gmres::Int=nblock_mr,
+                     fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                     flop_counter::Union{Nothing,Ref{Int}}=nothing)
+    block_solver in (:mr, :gmres) ||
+        throw(ArgumentError("block_solver must be :mr or :gmres, got $block_solver"))
     if x isa WF3x1GPU && b isa WF3x1GPU && _amg_can_fuse_wilson(D, x, x)
-        return _sap_smooth_gpu_paper!(x, D, b, setup;
-                                      niter=niter, nblock_mr=nblock_mr,
-                                      fine_apply_counter=fine_apply_counter)
+        if block_solver == :mr
+            return _sap_smooth_gpu_mr_batched!(x, D, b, setup;
+                                               niter=niter,
+                                               nblock_mr=nblock_mr,
+                                               fine_apply_counter=fine_apply_counter,
+                                               flop_counter=flop_counter)
+        else
+            return _sap_smooth_gpu_gmres_batched!(x, D, b, setup;
+                                                  niter=niter,
+                                                  nblock_gmres=nblock_gmres,
+                                                  fine_apply_counter=fine_apply_counter,
+                                                  flop_counter=flop_counter)
+        end
     end
 
     r_blk = setup.r
     NBX, NBY, NBZ, NBT = setup.NBX, setup.NBY, setup.NBZ, setup.NBT
 
-    # 繝舌ャ繝輔ぃ繧剃ｺ句燕遒ｺ菫晢ｼ医Ν繝ｼ繝怜・縺ｧ蜀榊茜逕ｨ・・
-    ﾎｴ      = similar(x)
-    local_r = similar(x)
-    Alr    = similar(x)
+    # Preallocate reusable work buffers.
+    δ      = similar(x)
     res    = similar(x)
+    Ddelta = similar(x)
+    local_r = block_solver == :mr ? similar(x) : nothing
+    Alr = block_solver == :mr ? similar(x) : nothing
+    gmres_V = block_solver == :gmres ? [similar(x) for _ in 1:(nblock_gmres + 1)] : WF3x1[]
+    gmres_w = block_solver == :gmres ? similar(x) : nothing
+    gmres_H = block_solver == :gmres ? zeros(ComplexF64, nblock_gmres + 1, nblock_gmres) : zeros(ComplexF64, 0, 0)
+    gmres_e1 = block_solver == :gmres ? zeros(ComplexF64, nblock_gmres + 1) : ComplexF64[]
+    block_dofs = r_blk^4 * setup.NC * setup.NG
 
     for _ = 1:niter
-        # 繧ｰ繝ｭ繝ｼ繝舌Ν谿句ｷｮ: res = b - D*x
+        # Global residual: res = b - D*x
         _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)           # res = D*x
-        axpby!(1, b, -1, res)     # res = b - D*x  竊・axpby!(1, b, -1, res) => res = 1*b + (-1)*res
+        axpby!(1, b, -1, res)     # res = b - D*x
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
         # Red-black SAP. Same-color blocks are independent for nearest-neighbor Wilson D.
         for color in 0:1
             for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
                 ((bx + by + bz + bt) & 1) == color || continue
 
-                block_zero!(ﾎｴ, bx, by, bz, bt, r_blk)
-                block_project!(local_r, bx, by, bz, bt, r_blk)
-                block_copy!(local_r, res, bx, by, bz, bt, r_blk)
+                if block_solver == :gmres
+                    _amg_local_gmres_block_solve!(
+                        δ, D, res, bx, by, bz, bt, r_blk, nblock_gmres,
+                        gmres_V, gmres_w::WF3x1, gmres_H, gmres_e1;
+                        fine_apply_counter=fine_apply_counter,
+                        flop_counter=flop_counter,
+                        block_dofs=block_dofs)
+                else
+                    block_zero!(δ, bx, by, bz, bt, r_blk)
+                    block_project!(local_r::WF3x1, bx, by, bz, bt, r_blk)
+                    block_copy!(local_r::WF3x1, res, bx, by, bz, bt, r_blk)
 
-                for _ = 1:nblock_mr
-                    _amg_mul_dirac!(Alr, D, local_r; fine_apply_counter=fine_apply_counter)
-                    block_project!(Alr, bx, by, bz, bt, r_blk)
+                    for _ = 1:nblock_mr
+                        _amg_mul_dirac!(Alr::WF3x1, D, local_r::WF3x1;
+                                        fine_apply_counter=fine_apply_counter)
+                        block_project!(Alr::WF3x1, bx, by, bz, bt, r_blk)
 
-                    num = block_inner_product(Alr, local_r, bx, by, bz, bt, r_blk)
-                    den = block_inner_product(Alr, Alr, bx, by, bz, bt, r_blk)
-                    if abs(den) < 1e-30
-                        break
+                        num = block_inner_product(Alr::WF3x1, local_r::WF3x1, bx, by, bz, bt, r_blk)
+                        den = block_inner_product(Alr::WF3x1, Alr::WF3x1, bx, by, bz, bt, r_blk)
+                        _amg_count_flops!(flop_counter, 2 * _amg_complex_dot_flops(block_dofs))
+                        if abs(den) < 1e-30
+                            break
+                        end
+                        α = num / den
+
+                        block_axpby!(α, local_r::WF3x1, 1, δ, bx, by, bz, bt, r_blk)
+                        block_axpby!(-α, Alr::WF3x1, 1, local_r::WF3x1, bx, by, bz, bt, r_blk)
+                        _amg_count_flops!(flop_counter, 2 * _amg_complex_axpby_flops(block_dofs))
                     end
-                    ﾎｱ = num / den
-
-                    block_axpby!(ﾎｱ, local_r, 1, ﾎｴ, bx, by, bz, bt, r_blk)
-                    block_axpby!(-ﾎｱ, Alr, 1, local_r, bx, by, bz, bt, r_blk)
                 end
 
-                block_axpby!(1, ﾎｴ, 1, x, bx, by, bz, bt, r_blk)
-                block_project!(ﾎｴ, bx, by, bz, bt, r_blk)
-                _amg_mul_dirac!(Alr, D, ﾎｴ; fine_apply_counter=fine_apply_counter)
-                axpby!(-1, Alr, 1, res)
+                block_axpby!(1, δ, 1, x, bx, by, bz, bt, r_blk)
+                _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(block_dofs))
+                block_project!(δ, bx, by, bz, bt, r_blk)
+                _amg_mul_dirac!(Ddelta, D, δ; fine_apply_counter=fine_apply_counter)
+                axpby!(-1, Ddelta, 1, res)
+                _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
             end
         end
     end
     return x
 end
-
-function _sap_smooth_gpu_paper!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalphaAMG_Setup;
-                                niter::Int=1, nblock_mr::Int=4,
-                                fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
-    cache = _ensure_gpu_cache!(setup)
-    bi = x.blockinfo
-    total = Int32(length(x.f))
-    nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
-    threads = 256
-    grid = cld(Int(total), threads)
-    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ)
-
-    delta = similar(x)
-    local_r = similar(x)
-    Alr = similar(x)
-    res = similar(x)
-    Ddelta = similar(x)
-    num = CUDA.zeros(ComplexF64, setup.Nblocks)
-    den = CUDA.zeros(ComplexF64, setup.Nblocks)
-
-    for _ in 1:niter
-        _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)
-        axpby!(1, b, -1, res)
-
-        for color in Int32(0):Int32(1)
-            @cuda threads=threads blocks=grid _amg_init_color_fields_kernel!(
-                reshape(delta.f, :), reshape(local_r.f, :), reshape(res.f, :),
-                cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
-
-            for _ in 1:nblock_mr
-                @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
-                    Alr.f, local_r.f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
-                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, color, NBX, NBY, NBZ)
-
-                @cuda threads=threads blocks=setup.Nblocks shmem=(2 * threads * sizeof(ComplexF64)) _amg_block_mr_dot_kernel!(
-                    num, den, reshape(Alr.f, :), reshape(local_r.f, :),
-                    cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ)
-
-                @cuda threads=threads blocks=grid _amg_block_mr_update_kernel!(
-                    reshape(delta.f, :), reshape(local_r.f, :), reshape(Alr.f, :),
-                    num, den, cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
-            end
-
-            @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
-                reshape(x.f, :), reshape(delta.f, :), cache[:bmap],
-                nc_ng, total, color, NBX, NBY, NBZ)
-
-            _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
-            @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
-                reshape(res.f, :), reshape(Ddelta.f, :))
-        end
-    end
-    return x
-end
-
 
 # ==========================================
-#  邊玲ｼ蟄・GMRES (Coarse Grid Solver)
+#  Coarse Grid Solver: GMRES
 # ==========================================
 
 """
-    coarse_gmres(setup, D, b_c; maxiter, restart, tol, coarse_apply_counter) 竊・CoarseVector
+    coarse_gmres(setup, D, b_c; maxiter, restart, tol, coarse_apply_counter) -> CoarseVector
 
-邊玲ｼ蟄蝉ｸ翫・ GMRES 繧ｽ繝ｫ繝舌・縲・c * x_c = b_c 繧定ｧ｣縺上・
-Dc 縺ｯ matrix-free 縺ｧ驕ｩ逕ｨ: Dc(v) = R ﾂｷ D ﾂｷ P(v)
-    coarse_apply_counter 縺梧ｸ｡縺輔ｌ縺溷ｴ蜷医∫ｲ玲ｼ蟄先ｼ皮ｮ怜ｭ・Dc 縺ｮ驕ｩ逕ｨ蝗樊焚繧貞刈邂励☆繧九・
+Solve the coarse-grid system `Dc * x_c = b_c` with GMRES. `Dc` is applied either
+through a precomputed coarse operator or matrix-free as `R * D * P`.
 """
 function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
-                      maxiter::Int=50, restart::Int=20, tol::Float64=1e-1,
-                      coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+                      maxiter::Int=20, restart::Int=20, tol::Float64=1e-2,
+                      coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                      flop_counter::Union{Nothing,Ref{Int}}=nothing,
+                      profile::Union{Nothing,AMGProfile}=nothing)
     x_c = similar(b_c)
     zero!(x_c)
-    b_norm = coarse_norm(b_c)
+    b_norm = _amg_profile_time!(profile, :coarse_rhs_norm) do
+        coarse_norm(b_c)
+    end
+    ncoarse = length(b_c.data)
+    _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
     if b_norm < 1e-30
         return x_c
     end
     has_Dc = setup.Dc_matrix !== nothing
     has_stencil = setup.coarse_stencil !== nothing
 
-    # 莠句燕險育ｮ玲ｸ医∩陦悟・縺後↑縺・ｴ蜷医・縺ｿ邏ｰ譬ｼ蟄舌ヰ繝・ヵ繧｡繧堤｢ｺ菫・
+    # Allocate a fine-grid buffer only when no precomputed operator is available.
     local fine_buf1, fine_buf2
     if !has_Dc
         fine_buf1 = similar(setup.test_vectors[1])
@@ -2119,32 +2539,41 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
     H = setup._gmres_H
     e1 = setup._gmres_e1
 
-    # 邊玲ｼ蟄先ｼ皮ｮ怜ｭ宣←逕ｨ縺ｮ繝倥Ν繝代・
+    # Helper for coarse-operator application.
     @inline function apply_Dc!(w, v)
-        if has_stencil
-            apply_coarse_stencil!(w, setup.coarse_stencil, v)
-        elseif has_Dc
-            mul!(w.data, setup.Dc_matrix, v.data)
-        else
-            coarse_apply!(w, setup, D, v, fine_buf1, fine_buf2)
+        _amg_profile_time!(profile, :coarse_apply) do
+            if has_stencil
+                apply_coarse_stencil!(w, setup.coarse_stencil, v)
+            elseif has_Dc
+                mul!(w.data, setup.Dc_matrix, v.data)
+            else
+                coarse_apply!(w, setup, D, v, fine_buf1, fine_buf2)
+            end
         end
         coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
     end
 
-    for _ = 1:maxiter
-        # 谿句ｷｮ: r = b - Dc*x
+    for iter = 1:maxiter
+        # residual: r = b - Dc*x
         r_c.data .= b_c.data
         apply_Dc!(w_c, x_c)
-        coarse_axpby!(-1.0, w_c, 1.0, r_c)
+        _amg_profile_time!(profile, :coarse_residual_axpby) do
+            coarse_axpby!(-1.0, w_c, 1.0, r_c)
+        end
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
 
-        ﾎｲ = coarse_norm(r_c)
-        if ﾎｲ / b_norm < tol
+        β = _amg_profile_time!(profile, :coarse_residual_norm) do
+            coarse_norm(r_c)
+        end
+        _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
+        if β / b_norm < tol
             return x_c
         end
 
-        # Arnoldi 驕守ｨ・
+        # Arnoldi process
         fill!(H, zero(ComplexF64))
-        V[1].data .= r_c.data ./ ﾎｲ
+        V[1].data .= r_c.data ./ β
+        _amg_count_flops!(flop_counter, 2 * ncoarse)
 
         j_final = m
         for j = 1:m
@@ -2152,32 +2581,58 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
 
             # Modified Gram-Schmidt
             for i = 1:j
-                H[i,j] = coarse_dot(V[i], w_c)
-                coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
+                H[i,j] = _amg_profile_time!(profile, :coarse_mgs_dot) do
+                    coarse_dot(V[i], w_c)
+                end
+                _amg_profile_time!(profile, :coarse_mgs_axpby) do
+                    coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
+                end
+                _amg_count_flops!(flop_counter,
+                    _amg_complex_dot_flops(ncoarse) + _amg_complex_axpby_flops(ncoarse))
             end
-            H[j+1,j] = coarse_norm(w_c)
+            H[j+1,j] = _amg_profile_time!(profile, :coarse_mgs_norm) do
+                coarse_norm(w_c)
+            end
+            _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
 
             if abs(H[j+1,j]) < 1e-14
                 j_final = j
                 break
             end
-            V[j+1].data .= w_c.data ./ H[j+1,j]
+            _amg_profile_time!(profile, :coarse_mgs_normalize) do
+                V[j+1].data .= w_c.data ./ H[j+1,j]
+            end
+            _amg_count_flops!(flop_counter, 2 * ncoarse)
         end
 
-        # 譛蟆丈ｺ御ｹ怜撫鬘・ min ||ﾎｲ*e竄・- H*y||
+        # Least-squares solve: min ||beta*e1 - H*y||.
         fill!(e1, zero(ComplexF64))
-        e1[1] = ﾎｲ
-        y = H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
+        e1[1] = β
+        y = _amg_profile_time!(profile, :coarse_lstsq) do
+            H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
+        end
+        _amg_count_flops!(flop_counter, 16 * j_final^3)
 
         for k = 1:j_final
-            coarse_axpby!(y[k], V[k], 1.0, x_c)
+            _amg_profile_time!(profile, :coarse_solution_update) do
+                coarse_axpby!(y[k], V[k], 1.0, x_c)
+            end
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
         end
 
-        # 蜿取據遒ｺ隱・
+        # Convergence check
         r_c.data .= b_c.data
         apply_Dc!(w_c, x_c)
-        coarse_axpby!(-1.0, w_c, 1.0, r_c)
-        if coarse_norm(r_c) / b_norm < tol
+        _amg_profile_time!(profile, :coarse_check_axpby) do
+            coarse_axpby!(-1.0, w_c, 1.0, r_c)
+        end
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
+        res = _amg_profile_time!(profile, :coarse_check_norm) do
+            coarse_norm(r_c)
+        end / b_norm
+        _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
+        # println("res:$(res),iter:$(iter)")
+        if res < tol
             return x_c
         end
     end
@@ -2193,20 +2648,23 @@ end
 """
     vcycle(D, b, setup; pre_smooth, post_smooth, coarse_tol, smoother)
 
-1蝗槭・繝槭Ν繝√げ繝ｪ繝・ラ V-cycle 繧貞ｮ溯｡後＠縲．*x 竕・b 縺ｮ霑台ｼｼ隗｣繧定ｿ斐☆縲・
+Apply one DD-alphaAMG V-cycle and return an approximate solution to `D*x = b`.
 
-1. Pre-smoothing (MR or SAP)
-2. 谿句ｷｮ繧堤ｲ玲ｼ蟄舌↓蟆・ｽｱ: r_c = R(b - D*x)
-3. 邊玲ｼ蟄舌〒 GMRES: Dc * e_c = r_c
-4. 陬懈ｭ｣繧堤ｴｰ譬ｼ蟄舌↓謌ｻ縺・ x += P(e_c)
-5. Post-smoothing
+Steps:
+1. Pre-smooth on the fine grid.
+2. Restrict the residual: `r_c = R * (b - D*x)`.
+3. Solve the coarse system `Dc * e_c = r_c` with GMRES.
+4. Prolongate and add the correction: `x += P * e_c`.
+5. Post-smooth on the fine grid.
 """
 function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 pre_smooth::Int=4, post_smooth::Int=4,
-                coarse_maxiter::Int=50, coarse_tol::Float64=1e-1,
+                coarse_maxiter::Int=50, coarse_tol::Float64=1e-2,
                 smoother::Symbol=:mr,
                 coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
-                fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+                fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                flop_counter::Union{Nothing,Ref{Int}}=nothing,
+                profile::Union{Nothing,AMGProfile}=nothing)
     x = similar(b)
     zero_wf!(x)
 
@@ -2216,60 +2674,145 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
     r_coarse = _coarse_vector(setup)
 
     # 1. Pre-smoothing
-    if smoother == :sap
-        sap_smooth!(x, D, b, setup; niter=1, nblock_mr=pre_smooth,
-                    fine_apply_counter=fine_apply_counter)
-    else
-        mr_smooth!(x, D, b; niter=pre_smooth,
-                   fine_apply_counter=fine_apply_counter)
+    _amg_profile_time!(profile, :vcycle_pre_smooth) do
+        if smoother == :sap
+            sap_smooth!(x, D, b, setup; niter=1,
+                        block_solver=:mr, nblock_mr=pre_smooth,
+                        fine_apply_counter=fine_apply_counter,
+                        flop_counter=flop_counter)
+        else
+            mr_smooth!(x, D, b; niter=pre_smooth,
+                       fine_apply_counter=fine_apply_counter,
+                       flop_counter=flop_counter)
+        end
     end
 
-    # 2. 谿句ｷｮ險育ｮ・竊・邊玲ｼ蟄舌↓蟆・ｽｱ
-    _amg_mul_dirac!(r_fine, D, x; fine_apply_counter=fine_apply_counter)       # r_fine = D*x
-    axpby!(1, b, -1, r_fine) # r_fine = b - D*x
-    restrict_f2c!(r_coarse, setup, r_fine)
+    # 2. Compute residual and restrict it to the coarse grid.
+    _amg_profile_time!(profile, :vcycle_residual_restrict) do
+        _amg_mul_dirac!(r_fine, D, x; fine_apply_counter=fine_apply_counter)       # r_fine = D*x
+        axpby!(1, b, -1, r_fine) # r_fine = b - D*x
+        restrict_f2c!(r_coarse, setup, r_fine)
+    end
+    _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(b)))
+    _amg_count_flops!(flop_counter, _amg_restrict_flops(setup))
 
-    # 3. 邊玲ｼ蟄先ｱりｧ｣
-    e_coarse = coarse_gmres(setup, D, r_coarse;
-                            maxiter=coarse_maxiter, tol=coarse_tol,
-                            coarse_apply_counter=coarse_apply_counter)
+    # 3. Coarse-grid solve.
+    e_coarse = _amg_profile_time!(profile, :coarse_gmres_total) do
+        coarse_gmres(setup, D, r_coarse;
+                     maxiter=coarse_maxiter, tol=coarse_tol,
+                     coarse_apply_counter=coarse_apply_counter,
+                     flop_counter=flop_counter,
+                     profile=profile)
+    end
 
-    # 4. 邏ｰ譬ｼ蟄舌∈縺ｮ陬懈ｭ｣
-    prolongate_c2f!(correction, setup, e_coarse)
-    axpby!(1, correction, 1, x)
+    # 4. Prolongate the correction to the fine grid.
+    _amg_profile_time!(profile, :vcycle_prolongate_update) do
+        prolongate_c2f!(correction, setup, e_coarse)
+        axpby!(1, correction, 1, x)
+    end
+    _amg_count_flops!(flop_counter, _amg_prolongate_flops(setup))
+    _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(b)))
 
     # 5. Post-smoothing
-    if smoother == :sap
-        sap_smooth!(x, D, b, setup; niter=1, nblock_mr=post_smooth,
-                    fine_apply_counter=fine_apply_counter)
-    else
-        mr_smooth!(x, D, b; niter=post_smooth,
-                   fine_apply_counter=fine_apply_counter)
+    _amg_profile_time!(profile, :vcycle_post_smooth) do
+        if smoother == :sap
+            sap_smooth!(x, D, b, setup; niter=1,
+                        block_solver=:mr, nblock_mr=post_smooth,
+                        fine_apply_counter=fine_apply_counter,
+                        flop_counter=flop_counter)
+        else
+            mr_smooth!(x, D, b; niter=post_smooth,
+                       fine_apply_counter=fine_apply_counter,
+                       flop_counter=flop_counter)
+        end
     end
 
     return x
 end
 
+function _sap_smooth_gpu_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalphaAMG_Setup;
+                                     niter::Int=1, nblock_mr::Int=4,
+                                     fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                                     flop_counter::Union{Nothing,Ref{Int}}=nothing)
+    cache = _ensure_gpu_cache!(setup)
+    bi = x.blockinfo
+    total = Int32(length(x.f))
+    nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
+    threads = 256
+    grid = cld(Int(total), threads)
+    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ)
+
+    delta = similar(x)
+    local_r = similar(x)
+    Alr = similar(x)
+    res = similar(x)
+    Ddelta = similar(x)
+    num = CUDA.zeros(ComplexF64, setup.Nblocks)
+    den = CUDA.zeros(ComplexF64, setup.Nblocks)
+    block_dofs = setup.r^4 * setup.NC * setup.NG
+
+    for _ in 1:niter
+        _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)
+        axpby!(1, b, -1, res)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+        for color in Int32(0):Int32(1)
+            @cuda threads=threads blocks=grid _amg_init_color_fields_kernel!(
+                reshape(delta.f, :), reshape(local_r.f, :), reshape(res.f, :),
+                cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+
+            for _ in 1:nblock_mr
+                @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
+                    Alr.f, local_r.f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
+                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, color, NBX, NBY, NBZ)
+
+                @cuda threads=threads blocks=setup.Nblocks shmem=(2 * threads * sizeof(ComplexF64)) _amg_block_mr_dot_kernel!(
+                    num, den, reshape(Alr.f, :), reshape(local_r.f, :),
+                    cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ)
+                _amg_count_flops!(flop_counter,
+                    2 * setup.Nblocks * _amg_complex_dot_flops(block_dofs))
+
+                @cuda threads=threads blocks=grid _amg_block_mr_update_kernel!(
+                    reshape(delta.f, :), reshape(local_r.f, :), reshape(Alr.f, :),
+                    num, den, cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+                _amg_count_flops!(flop_counter,
+                    2 * setup.Nblocks * _amg_complex_axpby_flops(block_dofs))
+            end
+
+            @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
+                reshape(x.f, :), reshape(delta.f, :), cache[:bmap],
+                nc_ng, total, color, NBX, NBY, NBZ)
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+            _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
+            @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
+                reshape(res.f, :), reshape(Ddelta.f, :))
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+        end
+    end
+    return x
+end
+
 
 # ==========================================
-#  FGMRES (Flexible GMRES) 螟夜Κ繧ｽ繝ｫ繝舌・
+#  FGMRES outer solver
 # ==========================================
 
 """
     fgmres(D, b, setup; x0, maxiter, restart, tol, verbose, smoother, ...)
 
-Flexible GMRES (V-cycle 繝励Μ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・莉倥″)縲・
-D*x = b 繧定ｧ｣縺上・
-
-FGMRES 縺ｯ蜷・う繝・Ξ繝ｼ繧ｷ繝ｧ繝ｳ縺ｧ逡ｰ縺ｪ繧九・繝ｪ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・繧定ｨｱ螳ｹ縺吶ｋ縺溘ａ縲・
-髱樒ｷ壼ｽ｢繝槭Ν繝√げ繝ｪ繝・ラ V-cycle 繧貞､牙虚繝励Μ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・縺ｨ縺励※菴ｿ逕ｨ蜿ｯ閭ｽ縲・
+Flexible GMRES outer solver for `D*x = b`, using the DD-alphaAMG V-cycle as a
+right preconditioner. Flexible GMRES allows the preconditioner to vary between
+iterations, which is useful for nonlinear or inexact V-cycles.
 """
 function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 x0::Union{Nothing,WF3x1}=nothing,
                 maxiter::Int=100, restart::Int=20, tol::Float64=1e-10,
                 verbose::Bool=true, smoother::Symbol=:mr,
                 pre_smooth::Int=4, post_smooth::Int=4,
-                coarse_tol::Float64=1e-1)
+                coarse_tol::Float64=1e-1,
+                profile::Bool=false,
+                profile_synchronize::Bool=true)
 
     x = x0 === nothing ? similar(b) : _copy_wf(x0)
     x0 === nothing && zero_wf!(x)
@@ -2281,26 +2824,44 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
     r = _copy_wf(b)  # r = b - D*x buffer
     zero_wf!(r)
 
-    total_coarse_gmres = 0  # coarse GMRES 蜻ｼ蜃ｺ縺怜屓謨ｰ繧ｫ繧ｦ繝ｳ繧ｿ
-    _coarse_apply_counter = Ref(0)  # 邊玲ｼ蟄先ｼ皮ｮ怜ｭ・Dc 驕ｩ逕ｨ蝗樊焚繧ｫ繧ｦ繝ｳ繧ｿ
+    total_coarse_gmres = 0  # coarse GMRES call counter
+    _coarse_apply_counter = Ref(0)  # coarse operator application counter
     _fine_apply_counter = Ref(0)
+    _variable_coarse_apply_counter = Ref(0)
+    _variable_fine_apply_counter = Ref(0)
+    _variable_vector_flop_counter = Ref(0)
+    _outer_fine_apply_counter = Ref(0)
+    _outer_vector_flop_counter = Ref(0)
+    _profile = profile ? AMGProfile(synchronize=profile_synchronize) : nothing
+    nfine = _amg_fine_dofs(b)
 
     for cycle = 1:maxiter
         # r = b - D * x
-        _amg_mul_dirac!(r, D, x; fine_apply_counter=_fine_apply_counter)           # r = D*x
-        axpby!(1, b, -1, r)     # r = b - D*x  竊・axpby!(1, b, -1, r) => r = 1*b + (-1)*r
-        ﾎｲ = sqrt(real(inner_product(r, r)))
+        outer_fine_before = _fine_apply_counter[]
+        β = _amg_profile_time!(_profile, :outer_residual) do
+            _amg_mul_dirac!(r, D, x; fine_apply_counter=_fine_apply_counter)           # r = D*x
+            axpby!(1, b, -1, r)     # r = b - D*x
+            sqrt(real(inner_product(r, r)))
+        end
+        _outer_fine_apply_counter[] += _fine_apply_counter[] - outer_fine_before
+        _outer_vector_flop_counter[] += _amg_complex_axpby_flops(nfine) + _amg_complex_norm_flops(nfine)
 
         if verbose
-            println("FGMRES cycle $cycle: relative residual = $(ﾎｲ/b_norm)")
+            println("FGMRES cycle $cycle: relative residual = $(β/b_norm)")
         end
 
-        if ﾎｲ / b_norm < tol
+        if β / b_norm < tol
             if verbose
                 println("FGMRES converged! ($(cycle) cycles)")
-                println("  Total coarse GMRES calls: $total_coarse_gmres")
-                println("  Total coarse operator applications: $(_coarse_apply_counter[])")
-                println("  Total fine Dirac applications: $(_fine_apply_counter[])")
+                _amg_print_solver_counts(setup, total_coarse_gmres,
+                                         _coarse_apply_counter[],
+                                         _fine_apply_counter[],
+                                         _variable_coarse_apply_counter[],
+                                         _variable_fine_apply_counter[],
+                                         _variable_vector_flop_counter[],
+                                         _outer_fine_apply_counter[],
+                                         _outer_vector_flop_counter[])
+                _profile !== nothing && _amg_print_profile(stdout, _profile)
             end
             return x
         end
@@ -2313,30 +2874,48 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         cs = zeros(ComplexF64, m)
         sn = zeros(ComplexF64, m)
         g  = zeros(ComplexF64, m + 1)
-        g[1] = ﾎｲ
+        g[1] = β
 
-        V[1] = r / ﾎｲ
+        V[1] = r / β
+        _outer_vector_flop_counter[] += 2 * nfine
 
         j_final = m
         converged = false
         for j = 1:m
-            # V-cycle 繝励Μ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・: M竅ｻﾂｹ * v_j
-            Z[j] = vcycle(D, V[j], setup;
-                          pre_smooth=pre_smooth, post_smooth=post_smooth,
-                          coarse_tol=coarse_tol, smoother=smoother,
-                          coarse_apply_counter=_coarse_apply_counter,
-                          fine_apply_counter=_fine_apply_counter)
+            # V-cycle preconditioner: apply M^{-1} * v_j.
+            fine_before_vcycle = _fine_apply_counter[]
+            coarse_before_vcycle = _coarse_apply_counter[]
+            Z[j] = _amg_profile_time!(_profile, :vcycle_total) do
+                vcycle(D, V[j], setup;
+                       pre_smooth=pre_smooth, post_smooth=post_smooth,
+                       coarse_tol=coarse_tol, smoother=smoother,
+                       coarse_apply_counter=_coarse_apply_counter,
+                       fine_apply_counter=_fine_apply_counter,
+                       flop_counter=_variable_vector_flop_counter,
+                       profile=_profile)
+            end
             total_coarse_gmres += 1
+            _variable_fine_apply_counter[] += _fine_apply_counter[] - fine_before_vcycle
+            _variable_coarse_apply_counter[] += _coarse_apply_counter[] - coarse_before_vcycle
 
             w = similar(b)
-            _amg_mul_dirac!(w, D, Z[j]; fine_apply_counter=_fine_apply_counter)
+            outer_fine_before = _fine_apply_counter[]
+            _amg_profile_time!(_profile, :outer_apply_preconditioned_vector) do
+                _amg_mul_dirac!(w, D, Z[j]; fine_apply_counter=_fine_apply_counter)
+            end
+            _outer_fine_apply_counter[] += _fine_apply_counter[] - outer_fine_before
 
             # Modified Gram-Schmidt
-            for i = 1:j
-                H[i,j] = inner_product(V[i], w)
-                axpby!(-H[i,j], V[i], 1, w)
+            _amg_profile_time!(_profile, :outer_mgs) do
+                for i = 1:j
+                    H[i,j] = inner_product(V[i], w)
+                    axpby!(-H[i,j], V[i], 1, w)
+                end
+                H[j+1,j] = sqrt(real(inner_product(w, w)))
             end
-            H[j+1,j] = sqrt(real(inner_product(w, w)))
+            _outer_vector_flop_counter[] +=
+                j * (_amg_complex_dot_flops(nfine) + _amg_complex_axpby_flops(nfine)) +
+                _amg_complex_norm_flops(nfine)
 
             if abs(H[j+1,j]) < 1e-14
                 j_final = j
@@ -2349,6 +2928,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 break
             end
             V[j+1] = w / H[j+1,j]
+            _outer_vector_flop_counter[] += 2 * nfine
 
             for i = 1:(j-1)
                 tmp = cs[i] * H[i,j] + sn[i] * H[i+1,j]
@@ -2386,17 +2966,26 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
             y[i] /= H[i,i]
         end
 
-        # 隗｣縺ｮ譖ｴ譁ｰ: x += Z * y
-        for k = 1:j_final
-            axpby!(y[k], Z[k], 1, x)
+        # Update solution: x += Z * y.
+        _amg_profile_time!(_profile, :outer_solution_update) do
+            for k = 1:j_final
+                axpby!(y[k], Z[k], 1, x)
+            end
         end
+        _outer_vector_flop_counter[] += j_final * _amg_complex_axpby_flops(nfine)
 
         if converged
             if verbose
                 println("FGMRES converged at cycle $cycle, step $(j_final)!")
-                println("  Total coarse GMRES calls: $total_coarse_gmres")
-                println("  Total coarse operator applications: $(_coarse_apply_counter[])")
-                println("  Total fine Dirac applications: $(_fine_apply_counter[])")
+                _amg_print_solver_counts(setup, total_coarse_gmres,
+                                         _coarse_apply_counter[],
+                                         _fine_apply_counter[],
+                                         _variable_coarse_apply_counter[],
+                                         _variable_fine_apply_counter[],
+                                         _variable_vector_flop_counter[],
+                                         _outer_fine_apply_counter[],
+                                         _outer_vector_flop_counter[])
+                _profile !== nothing && _amg_print_profile(stdout, _profile)
             end
             return x
         end
@@ -2404,61 +2993,248 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
 
     if verbose
         r_final = similar(b)
+        outer_fine_before = _fine_apply_counter[]
         _amg_mul_dirac!(r_final, D, x; fine_apply_counter=_fine_apply_counter)
         axpby!(1, b, -1, r_final)
+        _outer_fine_apply_counter[] += _fine_apply_counter[] - outer_fine_before
+        _outer_vector_flop_counter[] += _amg_complex_axpby_flops(nfine) + _amg_complex_norm_flops(nfine)
         println("FGMRES: max iterations reached. " *
                 "Final relative residual = $(sqrt(real(inner_product(r_final, r_final)))/b_norm)")
-        println("  Total coarse GMRES calls: $total_coarse_gmres")
-        println("  Total coarse operator applications: $(_coarse_apply_counter[])")
-        println("  Total fine Dirac applications: $(_fine_apply_counter[])")
+        _amg_print_solver_counts(setup, total_coarse_gmres,
+                                 _coarse_apply_counter[],
+                                 _fine_apply_counter[],
+                                 _variable_coarse_apply_counter[],
+                                 _variable_fine_apply_counter[],
+                                 _variable_vector_flop_counter[],
+                                 _outer_fine_apply_counter[],
+                                 _outer_vector_flop_counter[])
+        _profile !== nothing && _amg_print_profile(stdout, _profile)
+    end
+    return x
+end
+
+function _amg_solve_batched_gmres_y!(yhost, Hhost, betahost,
+                                     m::Int, nblocks::Int,
+                                     active_blocks::Vector{Bool})
+    mplus = m + 1
+    fill!(yhost, zero(ComplexF64))
+    @inbounds for bid in 1:nblocks
+        active_blocks[bid] || continue
+        β = betahost[bid]
+        β > 1.0e-30 || continue
+        Hloc = Matrix{ComplexF64}(undef, mplus, m)
+        for col in 1:m, row in 1:mplus
+            Hloc[row, col] = Hhost[row + (col - 1) * mplus + (bid - 1) * mplus * m]
+        end
+        rhs = zeros(ComplexF64, mplus)
+        rhs[1] = β
+        try
+            y = Hloc \ rhs
+            for k in 1:m
+                yhost[k + (bid - 1) * m] = y[k]
+            end
+        catch
+        end
+    end
+    return yhost
+end
+
+function _sap_smooth_gpu_gmres_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
+                                        setup::DDalphaAMG_Setup;
+                                        niter::Int=1, nblock_gmres::Int=4,
+                                        fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                                        flop_counter::Union{Nothing,Ref{Int}}=nothing)
+    cache = _ensure_gpu_cache!(setup)
+    bi = x.blockinfo
+    total = Int32(length(x.f))
+    nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
+    threads = 256
+    grid = cld(Int(total), threads)
+    block_grid = cld(setup.Nblocks, threads)
+    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ)
+    m = Int32(nblock_gmres)
+    mplus = Int32(nblock_gmres + 1)
+
+    δ = similar(x)
+    res = similar(x)
+    Ddelta = similar(x)
+    w = similar(x)
+    V = [similar(x) for _ in 1:(nblock_gmres + 1)]
+    H = CUDA.zeros(ComplexF64, (nblock_gmres + 1) * nblock_gmres * setup.Nblocks)
+    beta = CUDA.zeros(Float64, setup.Nblocks)
+    dotbuf = CUDA.zeros(ComplexF64, setup.Nblocks)
+    coeff = CUDA.zeros(ComplexF64, setup.Nblocks)
+    ydev = CUDA.zeros(ComplexF64, nblock_gmres * setup.Nblocks)
+
+    active_by_color = [
+        [_amg_block_color_from_bid(bid, setup.NBX, setup.NBY, setup.NBZ) == color
+         for bid in 1:setup.Nblocks]
+        for color in 0:1
+    ]
+
+    for _ in 1:niter
+        _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)
+        axpby!(1, b, -1, res)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+        for color_i in 0:1
+            color = Int32(color_i)
+            fill!(H, zero(ComplexF64))
+            fill!(ydev, zero(ComplexF64))
+
+            @cuda threads=threads blocks=grid _amg_init_color_fields_kernel!(
+                reshape(δ.f, :), reshape(V[1].f, :), reshape(res.f, :),
+                cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+
+            @cuda threads=threads blocks=setup.Nblocks shmem=(threads * sizeof(ComplexF64)) _amg_color_block_dot_kernel!(
+                dotbuf, reshape(V[1].f, :), reshape(V[1].f, :),
+                cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ)
+            @cuda threads=threads blocks=block_grid _amg_color_invnorm_from_vec_kernel!(
+                coeff, beta, dotbuf, color, NBX, NBY, NBZ)
+            @cuda threads=threads blocks=grid _amg_color_block_axpby_coeff_kernel!(
+                reshape(V[1].f, :), reshape(V[1].f, :), coeff, cache[:bmap],
+                nc_ng, total, color, NBX, NBY, NBZ, ComplexF64(1.0), ComplexF64(0.0))
+
+            for j in 1:nblock_gmres
+                @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
+                    w.f, V[j].f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
+                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, color, NBX, NBY, NBZ)
+
+                for i in 1:j
+                    @cuda threads=threads blocks=setup.Nblocks shmem=(threads * sizeof(ComplexF64)) _amg_color_block_dot_h_kernel!(
+                        H, Int32(i), Int32(j), reshape(V[i].f, :), reshape(w.f, :),
+                        cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ,
+                        mplus, m)
+                    @cuda threads=threads blocks=grid _amg_color_block_axpby_h_kernel!(
+                        reshape(w.f, :), reshape(V[i].f, :), H, Int32(i), Int32(j),
+                        cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ,
+                        mplus, m, ComplexF64(-1.0), ComplexF64(1.0))
+                    _amg_count_flops!(flop_counter,
+                        setup.Nblocks * (_amg_complex_dot_flops(setup.r^4 * setup.NC * setup.NG) +
+                                         _amg_complex_axpby_flops(setup.r^4 * setup.NC * setup.NG)))
+                end
+
+                @cuda threads=threads blocks=setup.Nblocks shmem=(threads * sizeof(ComplexF64)) _amg_color_block_dot_h_kernel!(
+                    H, Int32(j + 1), Int32(j), reshape(w.f, :), reshape(w.f, :),
+                    cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ,
+                    mplus, m)
+                @cuda threads=threads blocks=block_grid _amg_color_invnorm_from_h_kernel!(
+                    coeff, H, Int32(j + 1), Int32(j), color, NBX, NBY, NBZ, mplus, m)
+                _amg_count_flops!(flop_counter,
+                    setup.Nblocks * _amg_complex_norm_flops(setup.r^4 * setup.NC * setup.NG))
+
+                if j < nblock_gmres
+                    @cuda threads=threads blocks=grid _amg_color_block_axpby_coeff_kernel!(
+                        reshape(V[j + 1].f, :), reshape(w.f, :), coeff, cache[:bmap],
+                        nc_ng, total, color, NBX, NBY, NBZ, ComplexF64(1.0), ComplexF64(0.0))
+                end
+            end
+
+            Hhost = Array(H)
+            betahost = Array(beta)
+            yhost = zeros(ComplexF64, nblock_gmres * setup.Nblocks)
+            _amg_solve_batched_gmres_y!(yhost, Hhost, betahost,
+                                        nblock_gmres, setup.Nblocks,
+                                        active_by_color[color_i + 1])
+            copyto!(ydev, CuArray(yhost))
+            fill!(δ.f, zero(ComplexF64))
+            for k in 1:nblock_gmres
+                @cuda threads=threads blocks=grid _amg_color_gmres_update_kernel!(
+                    reshape(δ.f, :), reshape(V[k].f, :), ydev, Int32(k),
+                    cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ, m)
+                _amg_count_flops!(flop_counter,
+                    setup.Nblocks * _amg_complex_axpby_flops(setup.r^4 * setup.NC * setup.NG))
+            end
+
+            @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
+                reshape(x.f, :), reshape(δ.f, :), cache[:bmap],
+                nc_ng, total, color, NBX, NBY, NBZ)
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+            _amg_mul_dirac!(Ddelta, D, δ; fine_apply_counter=fine_apply_counter)
+            @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
+                reshape(res.f, :), reshape(Ddelta.f, :))
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+        end
     end
     return x
 end
 
 
 # ==========================================
-#  繧ｻ繝・ヨ繧｢繝・・ (Full Setup)
+#  Full setup
 # ==========================================
 
 """
-    setup_DDalphaAMG(D, template, r, Nv; nsmooth, verbose, smoother, ...) 竊・DDalphaAMG_Setup
+    setup_DDalphaAMG(D, template, r, Nv; nsmooth, verbose, smoother, ...) -> DDalphaAMG_Setup
 
-DD-ﾎｱAMG 縺ｮ螳悟・繧ｻ繝・ヨ繧｢繝・・繧定｡後≧縲・
+Build a complete DD-alphaAMG setup.
 
-謇矩・
-1. 繝ｩ繝ｳ繝繝繝・せ繝医・繧ｯ繝医Ν繧・Nv 蛟狗函謌・
-2. 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｧ菴弱Δ繝ｼ繝画・蛻・ｒ蠑ｷ蛹・(D*ﾏ・竕・0 縺ｮ霑台ｼｼ豎りｧ｣)
-3. 繝悶Ο繝・け逶ｴ莠､豁｣隕丞喧
+Steps:
+1. Generate `Nv` random test vectors, unless `coarse_vectors` are provided.
+2. Smooth them so they approximate low modes (`D*psi ~= 0`).
+3. Block-orthonormalize the vectors.
+4. Precompute the coarse operator.
 
-蠑墓焚:
-- D: Dirac 貍皮ｮ怜ｭ・(Wilson_Dirac_operator 遲・
-- template: 譬ｼ蟄舌し繧､繧ｺ蜿ら・逕ｨ縺ｮ WF3x1
-- r: 蜷・婿蜷代・繝悶Ο繝・け繧ｵ繧､繧ｺ (NX,NY,NZ,NT 縺・r 縺ｧ蜑ｲ繧雁・繧後ｋ縺薙→)
-- Nv: 繝・せ繝医・繧ｯ繝医Ν謨ｰ (謗ｨ螂ｨ: 20縲・0)
-- nsmooth: 繧ｻ繝・ヨ繧｢繝・・繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｮ蜿榊ｾｩ謨ｰ (繝・ヵ繧ｩ繝ｫ繝・ 8)
-- smoother: :mr (繝・ヵ繧ｩ繝ｫ繝・, :sap, :vcycle
-  - :mr  窶・MR 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｮ縺ｿ
-  - :sap 窶・SAP 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｮ縺ｿ
-  - :vcycle 窶・MR 縺ｧ莠亥ｙ繧ｻ繝・ヨ繧｢繝・・蠕後〃-cycle 縺ｧ邊玲ｼ蟄先ｮ句ｷｮ謌仙・繧貞ｼｷ隱ｿ
-- nvcycle: V-cycle 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ縺ｮ蜿榊ｾｩ謨ｰ (smoother=:vcycle 譎ゅ√ョ繝輔か繝ｫ繝・ 4)
-- vcycle_pre_smooth, vcycle_post_smooth: V-cycle 蜀・・繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ蝗樊焚 (繝・ヵ繧ｩ繝ｫ繝・ 蜷・)
+Arguments:
+- `D`: Dirac operator.
+- `template`: WF3x1 field used for lattice/layout information.
+- `r`: block size in each direction.
+- `Nv`: number of test vectors.
+- `nsmooth`: setup smoothing iterations.
+- `smoother`: `:mr`, `:sap`, or `:vcycle`.
+- `nvcycle`: adaptive V-cycle setup iterations when `smoother=:vcycle`.
+- `vcycle_pre_smooth`, `vcycle_post_smooth`: V-cycle smoothing counts.
+- `setup_sap_iters`: red-black SAP sweeps used when setup smoothing uses SAP.
+- `setup_block_solver`: block-local solver inside setup SAP sweeps. `:mr`
+  matches the DD-alphaAMG paper default; `:gmres` keeps the stronger optional path.
+- `setup_block_mr_steps`: block-local MR steps inside each setup SAP sweep.
+- `setup_block_gmres_steps`: block-local GMRES steps inside each setup SAP sweep
+  when `setup_block_solver=:gmres`.
+- `vcycle_post_sap_iters`: red-black SAP sweeps used by the adaptive setup
+  V-cycle post-smoother when `vcycle_update_smoother=:sap`.
+- `vcycle_post_block_solver`: block-local solver inside each adaptive setup
+  V-cycle SAP post-smoothing sweep.
+- `vcycle_post_block_mr_steps`: block-local MR steps inside each adaptive setup
+  V-cycle SAP post-smoothing sweep.
+- `vcycle_post_block_gmres_steps`: block-local GMRES steps inside each adaptive setup
+  V-cycle SAP post-smoothing sweep when `vcycle_post_block_solver=:gmres`.
+- `use_chirality`: follow the paper's chiral coarsening: split each prototype
+  into upper/lower chiral components, yielding `2*Nv` coarse vectors. In this
+  basis `P' * gamma5 = sigma3 * P'`, so the gamma5 factors cancel in the
+  correction and the implemented restriction remains `R = P'`.
+- `precompute_coarse`: precompute the coarse operator stencil. Solves need this,
+  but matrix-free training losses can disable it.
+- `smooth_external_vectors`: when `coarse_vectors` are provided, apply the same
+  zero-RHS MR smoothing used for setup seeds before chiral splitting and block
+  orthonormalization.
 
-菴ｿ逕ｨ萓・
+Example:
 ```julia
 setup = setup_DDalphaAMG(D, x, 2, 24; nsmooth=16)
-setup = setup_DDalphaAMG(D, x, 2, 24; smoother=:vcycle, nsmooth=8, nvcycle=4)
-x = solve_DDalphaAMG(D, b, setup; tol=1e-10)
+solution = solve_DDalphaAMG(D, b, setup; tol=1e-10)
 ```
 """
 function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
-                          nsmooth::Int=8, verbose::Bool=true,
+                          nsmooth::Int=16, verbose::Bool=true,
                           coarse_vectors::Union{Nothing,Vector{<:WF3x1}}=nothing,
                           smoother::Symbol=:mr,
                           nvcycle::Int=4,
                           vcycle_pre_smooth::Int=4, vcycle_post_smooth::Int=4,
                           setup_smoother::Symbol=:mr,
+                          setup_sap_iters::Int=1,
+                          setup_block_solver::Symbol=:mr,
+                          setup_block_mr_steps::Int=4,
+                          setup_block_gmres_steps::Int=setup_block_mr_steps,
                           vcycle_update_smoother::Symbol=:sap,
-                          use_chirality::Bool=false)
+                          vcycle_post_sap_iters::Int=1,
+                          vcycle_post_block_solver::Symbol=setup_block_solver,
+                          vcycle_post_block_mr_steps::Int=4,
+                          vcycle_post_block_gmres_steps::Int=vcycle_post_block_mr_steps,
+                          use_chirality::Bool=false,
+                          precompute_coarse::Bool=true,
+                          block_normalize::Bool=true,
+                          smooth_external_vectors::Bool=true)
     NX, NY, NZ, NT = template.NX, template.NY, template.NZ, template.NT
     NC, NG = template.NC, template.NG
 
@@ -2467,12 +3243,6 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
     @assert NZ % r == 0 "NZ=$NZ must be divisible by r=$r"
     @assert NT % r == 0 "NT=$NT must be divisible by r=$r"
 
-    if use_chirality
-        @assert Nv % 2 == 0 "Nv must be even when use_chirality=true (Nv=$Nv)"
-    end
-    # Chiral setup also smooths Nv independent vectors.
-    # We then assign independent halves to P+ and P- sectors,
-    # instead of splitting each single vector into plus/minus copies.
     Nv_smooth = Nv
 
     NBX = NX ÷ r; NBY = NY ÷ r; NBZ = NZ ÷ r; NBT = NT ÷ r
@@ -2483,11 +3253,12 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         println("  fine lattice: $(NX)x$(NY)x$(NZ)x$(NT)")
         println("  block size: $(r)^4")
         println("  coarse lattice: $(NBX)x$(NBY)x$(NBZ)x$(NBT) = $(Nblocks) blocks")
-        println("  test vectors: $Nv", use_chirality ? " (chiral split: $(Nv_smooth) -> Nv)" : "")
-        println("  coarse dof: $(Nblocks * Nv)")
+        println("  test vectors: $Nv", use_chirality ? " prototypes -> $(2 * Nv) chiral coarse vectors" : "")
+        println("  coarse dof: $(Nblocks * (use_chirality ? 2 * Nv : Nv))")
+        println("  restriction: R = P'")
     end
 
-    # 1. 繝ｩ繝ｳ繝繝繝・せ繝医・繧ｯ繝医Ν逕滓・
+    # 1. Generate or load test vectors.
     if coarse_vectors !== nothing
         @assert length(coarse_vectors) == Nv "length(coarse_vectors) must match Nv"
         # Keep caller-provided vectors immutable from the setup's point of view.
@@ -2497,13 +3268,50 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         if verbose
             println("  using externally provided test vectors")
         end
+        if smooth_external_vectors && nsmooth > 0
+            zero_rhs = similar(template)
+            zero_wf!(zero_rhs)
+            setup_smoother in (:mr, :sap) ||
+                throw(ArgumentError("setup_smoother must be :mr or :sap, got $setup_smoother"))
+            if setup_smoother == :sap
+                setup_sap_iters > 0 ||
+                    throw(ArgumentError("setup_sap_iters must be positive, got $setup_sap_iters"))
+                setup_block_solver in (:mr, :gmres) ||
+                    throw(ArgumentError("setup_block_solver must be :mr or :gmres, got $setup_block_solver"))
+                setup_block_mr_steps > 0 ||
+                    throw(ArgumentError("setup_block_mr_steps must be positive, got $setup_block_mr_steps"))
+                setup_block_gmres_steps > 0 ||
+                    throw(ArgumentError("setup_block_gmres_steps must be positive, got $setup_block_gmres_steps"))
+                block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
+                block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
+                verbose && println("  smoothing external test vectors with SAP ($(setup_sap_iters) sweeps, $(block_steps) $(block_name) steps)...")
+                sap_setup = DDalphaAMG_Setup{typeof(template)}(
+                    test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
+                    NBX, NBY, NBZ, NBT, Nblocks, nothing,
+                    nothing,
+                    CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
+                )
+                for v in 1:Nv_smooth
+                    sap_smooth!(test_vectors[v], D, zero_rhs, sap_setup;
+                                niter=setup_sap_iters,
+                                block_solver=setup_block_solver,
+                                nblock_mr=setup_block_mr_steps,
+                                nblock_gmres=setup_block_gmres_steps)
+                end
+            else
+                verbose && println("  smoothing external test vectors with MR ($nsmooth iterations)...")
+                for v in 1:Nv_smooth
+                    mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
+                end
+            end
+        end
     else
         test_vectors = [similar(template) for _ in 1:Nv_smooth]
         for v in 1:Nv_smooth
             random_fermion!(test_vectors[v])
         end
 
-        # 2. 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ: D*ﾏ・竕・0 繧定ｿ台ｼｼ豎りｧ｣ 竊・菴弱Δ繝ｼ繝画・蛻・歓蜃ｺ
+        # 2. Smooth test vectors so they approximate low modes.
         zero_rhs = similar(template)
         zero_wf!(zero_rhs)
 
@@ -2523,14 +3331,45 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                 throw(ArgumentError("setup_smoother must be :mr or :sap, got $setup_smoother"))
             vcycle_update_smoother in (:mr, :sap) ||
                 throw(ArgumentError("vcycle_update_smoother must be :mr or :sap, got $vcycle_update_smoother"))
+            setup_block_solver in (:mr, :gmres) ||
+                throw(ArgumentError("setup_block_solver must be :mr or :gmres, got $setup_block_solver"))
+            vcycle_post_block_solver in (:mr, :gmres) ||
+                throw(ArgumentError("vcycle_post_block_solver must be :mr or :gmres, got $vcycle_post_block_solver"))
+            setup_sap_iters > 0 ||
+                throw(ArgumentError("setup_sap_iters must be positive, got $setup_sap_iters"))
+            setup_block_mr_steps > 0 ||
+                throw(ArgumentError("setup_block_mr_steps must be positive, got $setup_block_mr_steps"))
+            setup_block_gmres_steps > 0 ||
+                throw(ArgumentError("setup_block_gmres_steps must be positive, got $setup_block_gmres_steps"))
+            vcycle_post_sap_iters > 0 ||
+                throw(ArgumentError("vcycle_post_sap_iters must be positive, got $vcycle_post_sap_iters"))
+            vcycle_post_block_mr_steps > 0 ||
+                throw(ArgumentError("vcycle_post_block_mr_steps must be positive, got $vcycle_post_block_mr_steps"))
+            vcycle_post_block_gmres_steps > 0 ||
+                throw(ArgumentError("vcycle_post_block_gmres_steps must be positive, got $vcycle_post_block_gmres_steps"))
             if verbose
-                println("  [Algorithm 16 setup] Phase 1: $(setup_smoother) smoothing ($nsmooth steps)...")
-                println("  [Algorithm 16 setup] adaptive post-smoother: $(vcycle_update_smoother) ($vcycle_post_smooth steps)")
+                if setup_smoother == :sap
+                    setup_block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
+                    setup_block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
+                    println("  [Algorithm 16 setup] Phase 1: SAP ($(setup_sap_iters) sweeps, $(setup_block_steps) $(setup_block_name) steps)...")
+                else
+                    println("  [Algorithm 16 setup] Phase 1: MR ($nsmooth steps)...")
+                end
+                if vcycle_update_smoother == :sap
+                    post_block_steps = vcycle_post_block_solver == :mr ? vcycle_post_block_mr_steps : vcycle_post_block_gmres_steps
+                    post_block_name = vcycle_post_block_solver == :mr ? "block-MR" : "block-GMRES"
+                    println("  [Algorithm 16 setup] adaptive post-smoother: SAP ($(vcycle_post_sap_iters) sweeps, $(post_block_steps) $(post_block_name) steps)")
+                else
+                    println("  [Algorithm 16 setup] adaptive post-smoother: MR ($vcycle_post_smooth steps)")
+                end
             end
             for v in 1:Nv_smooth
                 if setup_smoother == :sap
                     sap_smooth!(test_vectors[v], D, zero_rhs, sap_setup;
-                                niter=1, nblock_mr=nsmooth,
+                                niter=setup_sap_iters,
+                                block_solver=setup_block_solver,
+                                nblock_mr=setup_block_mr_steps,
+                                nblock_gmres=setup_block_gmres_steps,
                                 fine_apply_counter=_setup_fine_apply_counter)
                 else
                     mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth,
@@ -2540,18 +3379,24 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
 
             r_fine = _copy_wf(zero_rhs)
             correction = _copy_wf(zero_rhs)
-            r_coarse = _coarse_vector(Nv_smooth, Nblocks, template)
 
             for iter in 1:nvcycle
                 cur_vectors = _copy_wf_vector(test_vectors)
-                block_orthonormalize!(cur_vectors, r)
+                if use_chirality
+                    cur_vectors = _chiral_split_vectors(cur_vectors)
+                    _block_orthonormalize_chiral_split!(cur_vectors, r; normalize=block_normalize)
+                else
+                    block_orthonormalize!(cur_vectors, r; normalize=block_normalize)
+                end
+                cur_Nv = length(cur_vectors)
                 cur_setup = DDalphaAMG_Setup{typeof(template)}(
-                    cur_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
+                    cur_vectors, r, cur_Nv, NX, NY, NZ, NT, NC, NG,
                     NBX, NBY, NBZ, NBT, Nblocks, nothing,
                     nothing,
                     CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
                 )
                 precompute_coarse_operator!(cur_setup, D; mode=:direct_stencil)
+                r_coarse = _coarse_vector(cur_Nv, Nblocks, template)
 
                 for v in 1:Nv_smooth
                     _amg_mul_dirac!(r_fine, D, test_vectors[v];
@@ -2559,11 +3404,14 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                     axpby!(1, test_vectors[v], -1, r_fine)
                     restrict_f2c!(r_coarse, cur_setup, r_fine)
                     e_coarse = coarse_gmres(cur_setup, D, r_coarse;
-                                            maxiter=50, tol=1e-1)
+                                            maxiter=50, tol=1e-2)
                     prolongate_c2f!(correction, cur_setup, e_coarse)
                     if vcycle_update_smoother == :sap
                         sap_smooth!(correction, D, r_fine, cur_setup;
-                                    niter=1, nblock_mr=vcycle_post_smooth,
+                                    niter=vcycle_post_sap_iters,
+                                    block_solver=vcycle_post_block_solver,
+                                    nblock_mr=vcycle_post_block_mr_steps,
+                                    nblock_gmres=vcycle_post_block_gmres_steps,
                                     fine_apply_counter=_setup_fine_apply_counter)
                     else
                         mr_smooth!(correction, D, r_fine; niter=vcycle_post_smooth,
@@ -2579,11 +3427,21 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             end
             verbose && println("  [Algorithm 16 setup] fine Dirac applications: $(_setup_fine_apply_counter[])")
         elseif smoother == :sap
+            setup_block_solver in (:mr, :gmres) ||
+                throw(ArgumentError("setup_block_solver must be :mr or :gmres, got $setup_block_solver"))
+            setup_sap_iters > 0 ||
+                throw(ArgumentError("setup_sap_iters must be positive, got $setup_sap_iters"))
+            setup_block_mr_steps > 0 ||
+                throw(ArgumentError("setup_block_mr_steps must be positive, got $setup_block_mr_steps"))
+            setup_block_gmres_steps > 0 ||
+                throw(ArgumentError("setup_block_gmres_steps must be positive, got $setup_block_gmres_steps"))
             if verbose
-                println("  smoothing test vectors with SAP ($nsmooth iterations)...")
+                setup_block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
+                setup_block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
+                println("  smoothing test vectors with SAP ($(setup_sap_iters) sweeps, $(setup_block_steps) $(setup_block_name) steps)...")
             end
-            # SAP 縺ｫ縺ｯ繧ｻ繝・ヨ繧｢繝・・縺悟ｿ・ｦ・竊・縺ｾ縺壻ｻｮ繧ｻ繝・ヨ繧｢繝・・繧呈ｧ狗ｯ・
-            block_orthonormalize!(test_vectors, r)
+            # SAP needs a temporary setup for block-local smoothing.
+            block_orthonormalize!(test_vectors, r; normalize=block_normalize)
             pre_setup = DDalphaAMG_Setup{typeof(template)}(
                 test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
                 NBX, NBY, NBZ, NBT, Nblocks, nothing,
@@ -2591,9 +3449,13 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                 CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
             )
             for v in 1:Nv_smooth
-                sap_smooth!(test_vectors[v], D, zero_rhs, pre_setup; niter=1, nblock_mr=nsmooth)
+                sap_smooth!(test_vectors[v], D, zero_rhs, pre_setup;
+                            niter=setup_sap_iters,
+                            block_solver=setup_block_solver,
+                            nblock_mr=setup_block_mr_steps,
+                            nblock_gmres=setup_block_gmres_steps)
             end
-        else  # :mr (繝・ヵ繧ｩ繝ｫ繝・
+        else  # :mr (default)
             if verbose
                 println("  smoothing test vectors with MR ($nsmooth iterations)...")
             end
@@ -2603,51 +3465,36 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         end
     end
 
-
-
-    # 2.5. 繧ｫ繧､繝ｩ繝ｫ蛻・牡 (chiral splitting)
-    if use_chirality && coarse_vectors === nothing
+    if use_chirality
+        test_vectors = _chiral_split_vectors(test_vectors)
         if verbose
-            println("  applying chiral split...")
+            println("  chiral split: $Nv prototypes -> $(length(test_vectors)) coarse vectors")
         end
-        chiral_vectors = Vector{typeof(template)}(undef, Nv)
-        half = Nv ÷ 2
-        # First half -> P+ sector, second half -> P- sector.
-        for v in 1:half
-            chiral_vectors[v] = _copy_wf(test_vectors[v])
-            chiral_project!(chiral_vectors[v], :plus)   # ig=3,4 菫晄戟
-        end
-        for v in 1:half
-            chiral_vectors[half + v] = _copy_wf(test_vectors[half + v])
-            chiral_project!(chiral_vectors[half + v], :minus)    # ig=1,2 菫晄戟
-        end
-        test_vectors = chiral_vectors
     end
+    Nv_setup = length(test_vectors)
 
-    # 3. 繝悶Ο繝・け逶ｴ莠､豁｣隕丞喧
+    # 3. Block orthogonalization / orthonormalization
     if verbose
-        println("  block orthonormalizing...")
+        println(block_normalize ? "  block orthonormalizing..." : "  block orthogonalizing without normalization...")
     end
     if use_chirality
-        # P竄・縺ｨ P竄・繧ｻ繧ｯ繧ｿ繝ｼ繧貞挨縲・↓逶ｴ莠､豁｣隕丞喧 竊・繧ｫ繧､繝ｩ繝ｫ讒矩繧剃ｿ晄戟
-        half = Nv ÷ 2
-        plus_vectors  = test_vectors[1:half]       # P竄・(ig=3,4)
-        minus_vectors = test_vectors[half+1:end]   # P竄・(ig=1,2)
-        block_orthonormalize!(plus_vectors, r)
-        block_orthonormalize!(minus_vectors, r)
+        _block_orthonormalize_chiral_split!(test_vectors, r; normalize=block_normalize)
     else
-        block_orthonormalize!(test_vectors, r)
+        block_orthonormalize!(test_vectors, r; normalize=block_normalize)
     end
 
     setup = DDalphaAMG_Setup{typeof(template)}(
-        test_vectors, r, Nv, NX, NY, NZ, NT, NC, NG,
+        test_vectors, r, Nv_setup, NX, NY, NZ, NT, NC, NG,
         NBX, NBY, NBZ, NBT, Nblocks, nothing,
         nothing,
         CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
     )
 
-    # 邊玲ｼ蟄先ｼ皮ｮ怜ｭ舌ｒ莠句燕險育ｮ・
-    precompute_coarse_operator!(setup, D; verbose=verbose, mode=:direct_stencil)
+    # Precompute the coarse operator for AMG solves. Matrix-free training losses
+    # can skip this expensive assembly.
+    if precompute_coarse
+        precompute_coarse_operator!(setup, D; verbose=verbose, mode=:direct_stencil)
+    end
 
     if verbose
         println("  setup done")
@@ -2658,140 +3505,47 @@ end
 
 
 # ==========================================
-#  螳悟・繧ｽ繝ｫ繝舌・ (Full Solve)
+#  Full solve
 # ==========================================
 
 """
     solve_DDalphaAMG(D, b, setup; x0, tol, maxiter, restart, verbose, smoother, ...)
 
-DD-ﾎｱAMG 繧堤畑縺・※ D*x = b 繧定ｧ｣縺上・
-FGMRES 螟夜Κ繧ｽ繝ｫ繝舌・ + V-cycle 繝励Μ繧ｳ繝ｳ繝・ぅ繧ｷ繝ｧ繝翫・繧剃ｽｿ逕ｨ縲・
+Solve `D*x = b` using DD-alphaAMG: FGMRES as the outer solver and a V-cycle as
+the preconditioner.
 
-蠑墓焚:
-- D: Dirac 貍皮ｮ怜ｭ・
-- b: 蜿ｳ霎ｺ繝吶け繝医Ν (WF3x1)
-- setup: DDalphaAMG_Setup (setup_DDalphaAMG 縺ｧ逕滓・)
-- tol: 蜿取據險ｱ螳ｹ隱､蟾ｮ (繝・ヵ繧ｩ繝ｫ繝・ 1e-10)
-- smoother: :mr (Minimal Residual, 繝・ヵ繧ｩ繝ｫ繝・ 縺ｾ縺溘・ :sap (Schwarz Alternating Procedure)
-- pre_smooth, post_smooth: 繧ｹ繝繝ｼ繧ｸ繝ｳ繧ｰ蜿榊ｾｩ謨ｰ (繝・ヵ繧ｩ繝ｫ繝・ 蜷・)
-
-菴ｿ逕ｨ萓・
-```julia
-setup = setup_DDalphaAMG(D, x, 2, 24)
-solution = solve_DDalphaAMG(D, b, setup; tol=1e-10, smoother=:mr)
-residual = norm2(D * solution - b)
-```
+Arguments:
+- `D`: Dirac operator.
+- `b`: right-hand side vector.
+- `setup`: `DDalphaAMG_Setup` from `setup_DDalphaAMG`.
+- `tol`: relative residual tolerance.
+- `smoother`: `:mr` or `:sap` for fine-grid smoothing.
+- `pre_smooth`, `post_smooth`: smoothing counts inside the V-cycle.
 """
 function solve_DDalphaAMG(D, b::WF3x1, setup::DDalphaAMG_Setup;
                           x0::Union{Nothing,WF3x1}=nothing,
                           tol::Float64=1e-10, maxiter::Int=100, restart::Int=20,
                           verbose::Bool=true, smoother::Symbol=:mr,
-                          pre_smooth::Int=4, post_smooth::Int=4)
+                          pre_smooth::Int=4, post_smooth::Int=4,
+                          profile::Bool=false,
+                          profile_synchronize::Bool=true)
     return fgmres(D, b, setup;
                   x0=x0, tol=tol, maxiter=maxiter, restart=restart,
                   verbose=verbose, smoother=smoother,
-                  pre_smooth=pre_smooth, post_smooth=post_smooth)
+                  pre_smooth=pre_smooth, post_smooth=post_smooth,
+                  profile=profile,
+                  profile_synchronize=profile_synchronize)
 end
-
-function _debug_field_relerr(cpu_ref::WF3x1CPU, val::WF3x1, cpu_template::WF3x1CPU)
-    val_cpu = val isa WF3x1CPU ? val : begin
-        tmp = similar(cpu_template)
-        substitute_fermion!(tmp, val)
-        CUDA.synchronize()
-        tmp
-    end
-    diff = deepcopy(cpu_ref)
-    axpby!(-1, val_cpu, 1, diff)
-    num = sqrt(real(inner_product(diff, diff)))
-    den = sqrt(real(inner_product(cpu_ref, cpu_ref)))
-    return num / max(den, eps(Float64))
-end
-
-function _debug_coarse_relerr(cpu_ref::CoarseVector, val::CoarseVector)
-    vdata = val.data isa CuArray ? Array(val.data) : val.data
-    return norm(cpu_ref.data .- vdata) / max(norm(cpu_ref.data), eps(Float64))
-end
-
-function _debug_report!(rows, name, err)
-    push!(rows, (name=name, relerr=err))
-    println(rpad(name, 28), " relerr = ", err)
-    return err
-end
-
-function compare_ddalphaamg_cpu_gpu(Dcpu, Dgpu,
-                                    bcpu::WF3x1CPU, bgpu::WF3x1GPU,
-                                    setup_cpu::DDalphaAMG_Setup,
-                                    setup_gpu::DDalphaAMG_Setup;
-                                    pre_smooth::Int=4,
-                                    post_smooth::Int=4,
-                                    coarse_tol::Float64=1e-1,
-                                    coarse_maxiter::Int=50)
-    rows = NamedTuple[]
-    println("CPU b size = ", size(bcpu.f))
-    println("GPU b size = ", size(bgpu.f),
-            " blocksize=", bgpu.blockinfo.blocksize,
-            " rsize=", bgpu.blockinfo.rsize)
-    println("CPU setup: Nv=", setup_cpu.Nv, " Nblocks=", setup_cpu.Nblocks)
-    println("GPU setup: Nv=", setup_gpu.Nv, " Nblocks=", setup_gpu.Nblocks)
-
-    _assert_same_wf_layout("setup_gpu.test_vectors[1]", setup_gpu.test_vectors[1], "bgpu", bgpu)
-
-    ntv = min(length(setup_cpu.test_vectors), length(setup_gpu.test_vectors))
-    for i in 1:ntv
-        _debug_report!(rows, "test_vector[$i]",
-            _debug_field_relerr(setup_cpu.test_vectors[i], setup_gpu.test_vectors[i], bcpu))
-    end
-
-    db_cpu = similar(bcpu)
-    db_gpu = similar(bgpu)
-    mul!(db_cpu, Dcpu, bcpu)
-    mul!(db_gpu, Dgpu, bgpu)
-    CUDA.synchronize()
-    _debug_report!(rows, "D*b", _debug_field_relerr(db_cpu, db_gpu, bcpu))
-
-    rc_cpu = restrict_f2c(setup_cpu, bcpu)
-    rc_gpu = restrict_f2c(setup_gpu, bgpu)
-    CUDA.synchronize()
-    _debug_report!(rows, "restrict_f2c(b)", _debug_coarse_relerr(rc_cpu, rc_gpu))
-
-    cg_cpu = coarse_gmres(setup_cpu, Dcpu, rc_cpu; maxiter=coarse_maxiter, tol=coarse_tol)
-    cg_gpu = coarse_gmres(setup_gpu, Dgpu, rc_gpu; maxiter=coarse_maxiter, tol=coarse_tol)
-    CUDA.synchronize()
-    _debug_report!(rows, "coarse_gmres(Rb)", _debug_coarse_relerr(cg_cpu, cg_gpu))
-
-    pc_cpu = prolongate_c2f(setup_cpu, cg_cpu)
-    pc_gpu = prolongate_c2f(setup_gpu, cg_gpu)
-    CUDA.synchronize()
-    _debug_report!(rows, "prolongate(coarse)", _debug_field_relerr(pc_cpu, pc_gpu, bcpu))
-
-    vc_cpu = vcycle(Dcpu, bcpu, setup_cpu;
-        pre_smooth=pre_smooth, post_smooth=post_smooth,
-        coarse_maxiter=coarse_maxiter, coarse_tol=coarse_tol)
-    vc_gpu = vcycle(Dgpu, bgpu, setup_gpu;
-        pre_smooth=pre_smooth, post_smooth=post_smooth,
-        coarse_maxiter=coarse_maxiter, coarse_tol=coarse_tol)
-    CUDA.synchronize()
-    _debug_report!(rows, "vcycle(b)", _debug_field_relerr(vc_cpu, vc_gpu, bcpu))
-
-    return rows
-end
-
 
 # ==========================================
-#  Deflation: 蛻晄悄謗ｨ螳壹・繧ｯ繝医Ν逕滓・
+#  Deflation initial guess
 # ==========================================
 """
     deflated_initial_guess(D, b, test_vectors; verbose=false)
 
-繝・せ繝医・繧ｯ繝医Ν {v_i} 縺九ｉ蟆・ｽｱ陦悟・ G[i,j] = 筺ｨv_i, D v_j筺ｩ 繧呈ｧ狗ｯ峨＠縲・
-蝗ｺ譛牙､蛻・ｧ｣ G = U ﾎ・U窶 繧定｡後▲縺ｦ縲‥eflation 蛻晄悄謗ｨ螳壹ｒ逕滓・縺吶ｋ縲・
-
-謇矩・
-1. G[i,j] = 筺ｨv_i, D v_j筺ｩ,  rhs[i] = 筺ｨv_i, b筺ｩ
-2. 蝗ｺ譛牙､蛻・ｧ｣:  G = U ﾎ・U窶
-3. 蝗ｺ譛牙､蝓ｺ蠎輔〒縺ｮ蟆・ｽｱ:  ﾎｱ_k = (U窶 rhs)_k / ﾎｻ_k
-4. 蜈・・蝓ｺ蠎輔↓謌ｻ縺・  c = U ﾎｱ
-5. x竄 = ﾎ｣_j c_j v_j
+Build a deflated initial guess from test vectors. It forms
+`G[i,j] = <v_i, D*v_j>` and `rhs[i] = <v_i, b>`, solves `G*c = rhs`, and returns
+`x0 = sum_j c_j * v_j`.
 """
 function _assert_same_wf_layout(label_a, a::WF3x1, label_b, b::WF3x1)
     typeof(a) == typeof(b) ||
@@ -2835,10 +3589,10 @@ function deflated_initial_guess(D, b::WF3x1, test_vectors::Vector{T};
         rhs[j] = inner_product(test_vectors[j], b)
     end
 
-    # G c = rhs 繧定ｧ｣縺・
+    # Solve G*c = rhs.
     c = G \ rhs
 
-    # x竄 = ﾎ｣ c_j v_j
+    # x0 = Σ c_j v_j
     x0 = similar(b)
     zero_wf!(x0)
     for j in 1:Nv

@@ -33,9 +33,11 @@ export DenseLinearLayer
 export PTLayer
 export fermionfield_Layer
 export Orthogonal_Layer
-export Ritz_Layer  
+export Ritz_Layer
+export ZeroMode_Layer
 export GramSchmidt_Layer
 export BlockScalar_Layer
+export BlockMatrix_Layer
 
 struct Identity <: ActivationFunction end
 
@@ -428,6 +430,22 @@ mutable struct Ritz_Layer <: Layer
 end 
 
 
+mutable struct ZeroMode_Layer <: Layer
+    D::Any
+    activation::ActivationFunction
+    Out::Int
+    _Dz::Vector{Any}
+    _DdagDz::Vector{Any}
+    _delta::Vector{Any}
+    _losses::Vector{Float64}
+    _denoms::Vector{Float64}
+    _zeromode_init::Bool
+    function ZeroMode_Layer(D::Any, activation::ActivationFunction=Identity(), Out=1)
+        new(D, activation, Out, Any[], Any[], Any[], Float64[], Float64[], false)
+    end
+end
+
+
 mutable struct GramSchmidt_Layer <: Layer
     x::Vector{WF3x1}           # forward에서 직교화 결과 캐시 (backward에서 재사용)
     activation::ActivationFunction
@@ -656,6 +674,53 @@ mutable struct BlockScalar_Layer <: Layer
     end
 end
 
+"""
+    BlockMatrix_Layer(x, n, r; residual=false, activation=Identity())
+    BlockMatrix_Layer(x, nin, nout, r; residual=false, activation=Identity())
+
+Block-local complex matrix mixing layer for a vector of fermion fields.
+
+For each coarse block `B`, this applies
+
+```julia
+y[o]|_B = sum_i W[B, o, i] * x[i]|_B
+```
+
+The default square constructor initializes each block matrix to the identity.
+"""
+mutable struct BlockMatrix_Layer <: Layer
+    W::Array{ComplexF64,3}   # (nblocks, nout, nin)
+    r::Int
+    residual::Bool
+    activation::ActivationFunction
+    _result::Vector{WF3x1}
+    _block_map::Vector{Int}
+    _gpu_block_map::Vector{Int}
+    _gpu_w_buf::Any
+    _gpu_w_cpu::Matrix{ComplexF64}
+    _initialized::Bool
+    _grad_W::Array{ComplexF64,3}
+
+    function BlockMatrix_Layer(x::WF3x1, nin::Int, nout::Int, r::Int,
+                               residual::Bool=false,
+                               activation::ActivationFunction=Identity())
+        nblocks = (x.NX ÷ r) * (x.NY ÷ r) * (x.NZ ÷ r) * (x.NT ÷ r)
+        W = zeros(ComplexF64, nblocks, nout, nin)
+        @inbounds for b in 1:nblocks, i in 1:min(nin, nout)
+            W[b, i, i] = 1 + 0im
+        end
+        new(W, r, residual, activation,
+            WF3x1[], Int[], Int[], nothing, Matrix{ComplexF64}(undef, 0, 0), false,
+            Array{ComplexF64,3}(undef, 0, 0, 0))
+    end
+end
+
+function BlockMatrix_Layer(x::WF3x1, n::Int, r::Int,
+                           residual::Bool=false,
+                           activation::ActivationFunction=Identity())
+    return BlockMatrix_Layer(x, n, n, r, residual, activation)
+end
+
 
 
 
@@ -670,6 +735,10 @@ end
 # --- CuArray 표시 시 CUDA context 에러 방지 ---
 function Base.show(io::IO, layer::Ritz_Layer)
     print(io, "Ritz_Layer(Out=$(layer.Out))")
+end
+
+function Base.show(io::IO, layer::ZeroMode_Layer)
+    print(io, "ZeroMode_Layer(Out=$(layer.Out))")
 end
 
 function Base.show(io::IO, layer::PTLayer)
