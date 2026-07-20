@@ -168,15 +168,7 @@ end
             sap_schedule=:boundary8)
 end
 
-@inline function _amg_solve_defaults(mode::Symbol)
-    _amg_validate_setup_mode(mode)
-    if mode == :direct_near_null
-        return (; restart=50, smoother=:mr, pre_smooth=4, post_smooth=4,
-                coarse_tol=1e-1, coarse_maxiter=50, coarse_restart=20,
-                coarse_odd_even=false, coarse_gmres_mode=:restart_boundary,
-                sap_odd_even=false,
-                sap_schedule=:twocolor)
-    end
+@inline function _amg_solve_defaults()
     return (; restart=25, smoother=:sap, pre_smooth=0, post_smooth=2,
             coarse_tol=5e-2, coarse_maxiter=50, coarse_restart=30,
             coarse_odd_even=true, coarse_gmres_mode=:incremental,
@@ -184,8 +176,7 @@ end
             sap_schedule=:boundary8)
 end
 
-function _amg_resolve_solve_options(mode::Symbol;
-                                    restart::Union{Nothing,Int}=nothing,
+function _amg_resolve_solve_options(; restart::Union{Nothing,Int}=nothing,
                                     smoother::Union{Nothing,Symbol}=nothing,
                                     pre_smooth::Union{Nothing,Int}=nothing,
                                     post_smooth::Union{Nothing,Int}=nothing,
@@ -196,7 +187,7 @@ function _amg_resolve_solve_options(mode::Symbol;
                                     coarse_gmres_mode::Union{Nothing,Symbol}=nothing,
                                     sap_odd_even::Union{Nothing,Bool}=nothing,
                                     sap_schedule::Union{Nothing,Symbol}=nothing)
-    defaults = _amg_solve_defaults(mode)
+    defaults = _amg_solve_defaults()
     return (;
         restart=something(restart, defaults.restart),
         smoother=something(smoother, defaults.smoother),
@@ -4966,8 +4957,8 @@ Arguments:
 - `smoother`: `:mr` or `:sap` for fine-grid smoothing.
 - `pre_smooth`, `post_smooth`: smoothing counts inside the V-cycle.
 
-Mode-dependent options default from `setup.setup_mode`. Explicit keyword values
-always take precedence over those defaults.
+Solve options are independent of `setup.setup_mode`. Explicit keyword values
+always take precedence over the common solver defaults.
 """
 function solve_DDalphaAMG(D, b::WF3x1, setup::DDalphaAMG_Setup;
                           x0::Union{Nothing,WF3x1}=nothing,
@@ -4987,7 +4978,7 @@ function solve_DDalphaAMG(D, b::WF3x1, setup::DDalphaAMG_Setup;
                           sap_schedule::Union{Nothing,Symbol}=nothing,
                           profile::Bool=false,
                           profile_synchronize::Bool=true)
-    options = _amg_resolve_solve_options(setup.setup_mode;
+    options = _amg_resolve_solve_options(;
         restart=restart,
         smoother=smoother,
         pre_smooth=pre_smooth,

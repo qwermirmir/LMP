@@ -176,7 +176,7 @@ end
     @test field_distance(actual, expected) < 1e-11
 end
 
-@testset "DDalphaAMG mode-specific solve defaults" begin
+@testset "DDalphaAMG setup mode does not change solve defaults" begin
     @test DDAMG._amg_setup_defaults(:inverse_sap) == (
         vcycle_post_sap_iters=2,
         coarse_tol=5e-2,
@@ -191,7 +191,7 @@ end
         coarse_restart=20,
         sap_schedule=:twocolor,
     )
-    @test DDAMG._amg_solve_defaults(:inverse_sap) == (
+    @test DDAMG._amg_solve_defaults() == (
         restart=25,
         smoother=:sap,
         pre_smooth=0,
@@ -204,37 +204,25 @@ end
         sap_odd_even=true,
         sap_schedule=:boundary8,
     )
-    @test DDAMG._amg_solve_defaults(:direct_near_null) == (
-        restart=50,
-        smoother=:mr,
-        pre_smooth=4,
-        post_smooth=4,
-        coarse_tol=1e-1,
-        coarse_maxiter=50,
-        coarse_restart=20,
-        coarse_odd_even=false,
-        coarse_gmres_mode=:restart_boundary,
-        sap_odd_even=false,
-        sap_schedule=:twocolor,
-    )
 end
 
 @testset "DDalphaAMG solve options preserve explicit overrides" begin
-    direct = DDAMG._amg_resolve_solve_options(:direct_near_null)
-    @test direct == DDAMG._amg_solve_defaults(:direct_near_null)
+    defaults = DDAMG._amg_resolve_solve_options()
+    @test defaults == DDAMG._amg_solve_defaults()
 
-    overridden = DDAMG._amg_resolve_solve_options(:direct_near_null;
-        restart=25,
+    overridden = DDAMG._amg_resolve_solve_options(;
+        restart=50,
         coarse_odd_even=true,
-        coarse_gmres_mode=:incremental)
-    @test overridden.restart == 25
+        coarse_gmres_mode=:incremental,
+        sap_odd_even=true,
+        sap_schedule=:boundary8)
+    @test overridden.restart == 50
     @test overridden.coarse_odd_even
-    @test overridden.smoother == :mr
-    @test overridden.coarse_restart == 20
+    @test overridden.smoother == :sap
+    @test overridden.coarse_restart == 30
     @test overridden.coarse_gmres_mode == :incremental
-
-    inverse = DDAMG._amg_resolve_solve_options(:inverse_sap)
-    @test inverse == DDAMG._amg_solve_defaults(:inverse_sap)
+    @test overridden.sap_odd_even
+    @test overridden.sap_schedule == :boundary8
 end
 
 @testset "DDalphaAMG direct solve uses restart-boundary coarse GMRES" begin

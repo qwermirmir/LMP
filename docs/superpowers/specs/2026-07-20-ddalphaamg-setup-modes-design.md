@@ -24,9 +24,9 @@ The supported values are:
 The selected mode is stored in `DDalphaAMG_Setup`. Existing positional setup
 constructors remain source-compatible and default to `:inverse_sap`.
 
-`solve_DDalphaAMG` reads the setup mode automatically. Mode-dependent keyword
-arguments may still be supplied explicitly; explicit values override mode
-defaults.
+`solve_DDalphaAMG` reports the stored setup mode for provenance, but the mode
+does not alter any solver option. Solver keywords use one common set of
+defaults, and explicit values override those defaults.
 
 ## Inverse-SAP Mode
 
@@ -83,27 +83,32 @@ overridden:
 
 ## Solve Defaults
 
-When solving a setup in `:direct_near_null` mode and no corresponding override
-is supplied, `solve_DDalphaAMG` uses the settings from the plotted experiment:
+`setup_mode` controls only test-vector setup. It does not select or alter the
+outer solver, fine smoother, coarse solver, odd-even preconditioning, or SAP
+schedule. Both setup modes therefore use the same validated solver defaults:
 
-- outer FGMRES restart `50`;
-- fine smoother `:mr`;
-- pre-smoothing steps `4`;
-- post-smoothing steps `4`;
-- coarse tolerance `1e-1`;
+- outer FGMRES restart `25`;
+- fine smoother `:sap`;
+- pre-smoothing steps `0`;
+- post-smoothing steps `2`;
+- coarse tolerance `5e-2`;
 - coarse maximum cycles `50`;
-- coarse restart length `20`;
-- restart-boundary scalar coarse GMRES, matching `ff3d1bf` rather than the
-  newer incremental-Givens implementation;
-- coarse odd-even disabled;
-- SAP odd-even disabled;
-- two-color SAP schedule.
+- coarse restart length `30`;
+- incremental coarse GMRES;
+- coarse odd-even enabled;
+- SAP odd-even enabled;
+- boundary-8 SAP schedule.
+
+All explicit `solve_DDalphaAMG` keywords take precedence. To reproduce the
+historical full pipeline rather than only its setup algorithm, pass its solver
+settings explicitly (`restart=50`, `smoother=:mr`, `pre_smooth=4`,
+`post_smooth=4`, `coarse_tol=1e-1`, `coarse_restart=20`,
+`coarse_odd_even=false`, `coarse_gmres_mode=:restart_boundary`,
+`sap_odd_even=false`, and `sap_schedule=:twocolor`).
 
 The convergence tolerance and outer maximum cycles remain ordinary experiment
 parameters. The 2026-07-14 comparison explicitly used `tol=1e-10` and
 `maxiter=200`.
-
-For `:inverse_sap`, all current solve defaults remain unchanged.
 
 The modes can therefore be switched without checking out another revision:
 
@@ -115,7 +120,7 @@ setup = setup_DDalphaAMG(D, x, 4, Nv;
 ```
 
 Changing only `setup_mode` to `:inverse_sap` selects the validated paper-style
-path. The selected mode is carried by `setup` into `solve_DDalphaAMG`.
+setup while leaving every solve option unchanged.
 
 ## LMP Initial Guess
 
