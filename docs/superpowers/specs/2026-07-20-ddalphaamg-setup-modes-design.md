@@ -93,6 +93,8 @@ is supplied, `solve_DDalphaAMG` uses the settings from the plotted experiment:
 - coarse tolerance `1e-1`;
 - coarse maximum cycles `50`;
 - coarse restart length `20`;
+- restart-boundary scalar coarse GMRES, matching `ff3d1bf` rather than the
+  newer incremental-Givens implementation;
 - coarse odd-even disabled;
 - SAP odd-even disabled;
 - two-color SAP schedule.
@@ -102,6 +104,18 @@ parameters. The 2026-07-14 comparison explicitly used `tol=1e-10` and
 `maxiter=200`.
 
 For `:inverse_sap`, all current solve defaults remain unchanged.
+
+The modes can therefore be switched without checking out another revision:
+
+```julia
+setup = setup_DDalphaAMG(D, x, 4, Nv;
+    setup_mode=:direct_near_null,
+    # remaining experiment settings
+)
+```
+
+Changing only `setup_mode` to `:inverse_sap` selects the validated paper-style
+path. The selected mode is carried by `setup` into `solve_DDalphaAMG`.
 
 ## LMP Initial Guess
 

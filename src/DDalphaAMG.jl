@@ -143,6 +143,73 @@ mutable struct DDalphaAMG_Setup{T<:WF3x1}
     _gmres_e1::Vector{ComplexF64}
     _gmres_restart::Int
     _gpu_cache::Any
+    setup_mode::Symbol
+end
+
+# Preserve the pre-mode positional constructor used by internal helpers and tests.
+DDalphaAMG_Setup{T}(args::Vararg{Any,23}) where {T<:WF3x1} =
+    DDalphaAMG_Setup{T}(args..., :inverse_sap)
+
+@inline function _amg_validate_setup_mode(mode::Symbol)
+    mode in (:inverse_sap, :direct_near_null) && return mode
+    throw(ArgumentError(
+        "setup_mode must be :inverse_sap or :direct_near_null, got $mode"))
+end
+
+@inline function _amg_setup_defaults(mode::Symbol)
+    _amg_validate_setup_mode(mode)
+    if mode == :direct_near_null
+        return (; vcycle_post_sap_iters=1,
+                coarse_tol=1e-2, coarse_maxiter=50, coarse_restart=20,
+                sap_schedule=:twocolor)
+    end
+    return (; vcycle_post_sap_iters=2,
+            coarse_tol=5e-2, coarse_maxiter=5, coarse_restart=30,
+            sap_schedule=:boundary8)
+end
+
+@inline function _amg_solve_defaults(mode::Symbol)
+    _amg_validate_setup_mode(mode)
+    if mode == :direct_near_null
+        return (; restart=50, smoother=:mr, pre_smooth=4, post_smooth=4,
+                coarse_tol=1e-1, coarse_maxiter=50, coarse_restart=20,
+                coarse_odd_even=false, coarse_gmres_mode=:restart_boundary,
+                sap_odd_even=false,
+                sap_schedule=:twocolor)
+    end
+    return (; restart=25, smoother=:sap, pre_smooth=0, post_smooth=2,
+            coarse_tol=5e-2, coarse_maxiter=50, coarse_restart=30,
+            coarse_odd_even=true, coarse_gmres_mode=:incremental,
+            sap_odd_even=true,
+            sap_schedule=:boundary8)
+end
+
+function _amg_resolve_solve_options(mode::Symbol;
+                                    restart::Union{Nothing,Int}=nothing,
+                                    smoother::Union{Nothing,Symbol}=nothing,
+                                    pre_smooth::Union{Nothing,Int}=nothing,
+                                    post_smooth::Union{Nothing,Int}=nothing,
+                                    coarse_tol::Union{Nothing,Float64}=nothing,
+                                    coarse_maxiter::Union{Nothing,Int}=nothing,
+                                    coarse_restart::Union{Nothing,Int}=nothing,
+                                    coarse_odd_even::Union{Nothing,Bool}=nothing,
+                                    coarse_gmres_mode::Union{Nothing,Symbol}=nothing,
+                                    sap_odd_even::Union{Nothing,Bool}=nothing,
+                                    sap_schedule::Union{Nothing,Symbol}=nothing)
+    defaults = _amg_solve_defaults(mode)
+    return (;
+        restart=something(restart, defaults.restart),
+        smoother=something(smoother, defaults.smoother),
+        pre_smooth=something(pre_smooth, defaults.pre_smooth),
+        post_smooth=something(post_smooth, defaults.post_smooth),
+        coarse_tol=something(coarse_tol, defaults.coarse_tol),
+        coarse_maxiter=something(coarse_maxiter, defaults.coarse_maxiter),
+        coarse_restart=something(coarse_restart, defaults.coarse_restart),
+        coarse_odd_even=something(coarse_odd_even, defaults.coarse_odd_even),
+        coarse_gmres_mode=something(coarse_gmres_mode, defaults.coarse_gmres_mode),
+        sap_odd_even=something(sap_odd_even, defaults.sap_odd_even),
+        sap_schedule=something(sap_schedule, defaults.sap_schedule),
+    )
 end
 
 mutable struct AMGProfile
@@ -3268,6 +3335,90 @@ function _amg_initial_inverse_smooth!(test_vectors::Vector{T}, D,
     return test_vectors
 end
 
+function _amg_initial_direct_smooth!(test_vectors::Vector{T}, D,
+                                     setup::DDalphaAMG_Setup;
+                                     smoother::Symbol=:sap,
+                                     niter::Int=3,
+                                     block_solver::Symbol=:mr,
+                                     nblock_mr::Int=4,
+                                     nblock_gmres::Int=nblock_mr,
+                                     sap_schedule::Symbol=:twocolor,
+                                     fine_apply_counter::Union{Nothing,Ref{Int}}=nothing) where {T<:WF3x1}
+    niter > 0 || throw(ArgumentError("niter must be positive, got $niter"))
+    zero_rhs = similar(test_vectors[1])
+    zero_wf!(zero_rhs)
+    for vector in test_vectors
+        if smoother == :sap
+            sap_smooth!(vector, D, zero_rhs, setup;
+                        niter=niter,
+                        block_solver=block_solver,
+                        nblock_mr=nblock_mr,
+                        nblock_gmres=nblock_gmres,
+                        odd_even=false,
+                        sap_schedule=sap_schedule,
+                        fine_apply_counter=fine_apply_counter)
+        elseif smoother == :mr
+            mr_smooth!(vector, D, zero_rhs;
+                       niter=niter,
+                       fine_apply_counter=fine_apply_counter)
+        else
+            throw(ArgumentError("initial direct smoother must be :sap or :mr, got $smoother"))
+        end
+    end
+    return test_vectors
+end
+
+function _amg_direct_near_null_update!(vector::WF3x1, D,
+                                       setup::DDalphaAMG_Setup,
+                                       r_fine::WF3x1,
+                                       r_coarse::CoarseVector,
+                                       correction::WF3x1;
+                                       update_smoother::Symbol=:sap,
+                                       post_sap_iters::Int=1,
+                                       post_smooth::Int=4,
+                                       block_solver::Symbol=:mr,
+                                       nblock_mr::Int=4,
+                                       nblock_gmres::Int=nblock_mr,
+                                       coarse_tol::Float64=1e-2,
+                                       coarse_maxiter::Int=50,
+                                       coarse_restart::Int=20,
+                                       sap_schedule::Symbol=:twocolor,
+                                       arnoldi_mode::Symbol=:scalar,
+                                       fine_apply_counter::Union{Nothing,Ref{Int}}=nothing)
+    _amg_mul_dirac!(r_fine, D, vector;
+                    fine_apply_counter=fine_apply_counter)
+    axpby!(1, vector, -1, r_fine)
+    restrict_f2c!(r_coarse, setup, r_fine)
+    arnoldi_mode == :scalar || throw(ArgumentError(
+        "direct near-null setup requires arnoldi_mode=:scalar"))
+    e_coarse = _amg_coarse_gmres_restart_boundary(
+        setup, D, r_coarse;
+        maxiter=coarse_maxiter,
+        restart=coarse_restart,
+        tol=coarse_tol)
+    prolongate_c2f!(correction, setup, e_coarse)
+    if update_smoother == :sap
+        sap_smooth!(correction, D, r_fine, setup;
+                    niter=post_sap_iters,
+                    block_solver=block_solver,
+                    nblock_mr=nblock_mr,
+                    nblock_gmres=nblock_gmres,
+                    odd_even=false,
+                    sap_schedule=sap_schedule,
+                    fine_apply_counter=fine_apply_counter)
+    elseif update_smoother == :mr
+        mr_smooth!(correction, D, r_fine;
+                   niter=post_smooth,
+                   fine_apply_counter=fine_apply_counter)
+    else
+        throw(ArgumentError(
+            "direct near-null update smoother must be :sap or :mr, got $update_smoother"))
+    end
+    axpby!(1, correction, 1, vector)
+    normalize_fermion!(vector)
+    return vector
+end
+
 # ==========================================
 #  Coarse Grid Solver: GMRES
 # ==========================================
@@ -3544,6 +3695,124 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
     return finalize_solution!(x_c)
 end
 
+function _amg_coarse_gmres_restart_boundary(
+        setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
+        maxiter::Int=50, restart::Int=20, tol::Float64=1e-2,
+        coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+        flop_counter::Union{Nothing,Ref{Int}}=nothing,
+        profile::Union{Nothing,AMGProfile}=nothing)
+    x_c = similar(b_c)
+    zero!(x_c)
+    b_norm = _amg_profile_time!(profile, :coarse_rhs_norm) do
+        coarse_norm(b_c)
+    end
+    ncoarse = length(b_c.data)
+    _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
+    b_norm < 1e-30 && return x_c
+
+    has_Dc = setup.Dc_matrix !== nothing
+    has_stencil = setup.coarse_stencil !== nothing
+    local fine_buf1, fine_buf2
+    if !has_Dc && !has_stencil
+        fine_buf1 = similar(setup.test_vectors[1])
+        fine_buf2 = similar(setup.test_vectors[1])
+    end
+
+    m = ensure_coarse_gmres_cache!(setup, b_c, restart)
+    V = setup._gmres_V
+    w_c = setup._gmres_w::CoarseVector
+    r_c = setup._gmres_r::CoarseVector
+    H = setup._gmres_H
+    e1 = setup._gmres_e1
+
+    @inline function apply_Dc!(w, v)
+        _amg_profile_time!(profile, :coarse_apply) do
+            if has_stencil
+                apply_coarse_stencil!(w, setup.coarse_stencil, v)
+            elseif has_Dc
+                mul!(w.data, setup.Dc_matrix, v.data)
+            else
+                coarse_apply!(w, setup, D, v, fine_buf1, fine_buf2)
+            end
+        end
+        coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
+        return w
+    end
+
+    for _ in 1:maxiter
+        r_c.data .= b_c.data
+        apply_Dc!(w_c, x_c)
+        _amg_profile_time!(profile, :coarse_residual_axpby) do
+            coarse_axpby!(-1.0, w_c, 1.0, r_c)
+        end
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
+
+        β = _amg_profile_time!(profile, :coarse_residual_norm) do
+            coarse_norm(r_c)
+        end
+        _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
+        β / b_norm < tol && return x_c
+
+        fill!(H, zero(ComplexF64))
+        V[1].data .= r_c.data ./ β
+        _amg_count_flops!(flop_counter, 2 * ncoarse)
+
+        j_final = m
+        for j in 1:m
+            apply_Dc!(w_c, V[j])
+            for i in 1:j
+                H[i,j] = _amg_profile_time!(profile, :coarse_mgs_dot) do
+                    coarse_dot(V[i], w_c)
+                end
+                _amg_profile_time!(profile, :coarse_mgs_axpby) do
+                    coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
+                end
+                _amg_count_flops!(flop_counter,
+                    _amg_complex_dot_flops(ncoarse) +
+                    _amg_complex_axpby_flops(ncoarse))
+            end
+            H[j+1,j] = _amg_profile_time!(profile, :coarse_mgs_norm) do
+                coarse_norm(w_c)
+            end
+            _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
+            if abs(H[j+1,j]) < 1e-14
+                j_final = j
+                break
+            end
+            _amg_profile_time!(profile, :coarse_mgs_normalize) do
+                V[j+1].data .= w_c.data ./ H[j+1,j]
+            end
+            _amg_count_flops!(flop_counter, 2 * ncoarse)
+        end
+
+        fill!(e1, zero(ComplexF64))
+        e1[1] = β
+        y = _amg_profile_time!(profile, :coarse_lstsq) do
+            H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
+        end
+        _amg_count_flops!(flop_counter, 16 * j_final^3)
+        for k in 1:j_final
+            _amg_profile_time!(profile, :coarse_solution_update) do
+                coarse_axpby!(y[k], V[k], 1.0, x_c)
+            end
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
+        end
+
+        r_c.data .= b_c.data
+        apply_Dc!(w_c, x_c)
+        _amg_profile_time!(profile, :coarse_check_axpby) do
+            coarse_axpby!(-1.0, w_c, 1.0, r_c)
+        end
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
+        residual = _amg_profile_time!(profile, :coarse_check_norm) do
+            coarse_norm(r_c)
+        end / b_norm
+        _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
+        residual < tol && return x_c
+    end
+    return x_c
+end
+
 
 # ==========================================
 #  V-cycle
@@ -3568,6 +3837,7 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 coarse_tol::Float64=5e-2,
                 smoother::Symbol=:sap,
                 coarse_odd_even::Bool=true,
+                coarse_gmres_mode::Symbol=:incremental,
                 sap_odd_even::Bool=true,
                 sap_schedule::Symbol=:boundary8,
                 sparse_residual_update::Bool=true,
@@ -3576,6 +3846,9 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                 flop_counter::Union{Nothing,Ref{Int}}=nothing,
                 profile::Union{Nothing,AMGProfile}=nothing)
+    coarse_gmres_mode in (:incremental, :restart_boundary) ||
+        throw(ArgumentError(
+            "coarse_gmres_mode must be :incremental or :restart_boundary, got $coarse_gmres_mode"))
     x = similar(b)
     zero_wf!(x)
 
@@ -3614,13 +3887,24 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
 
     # 3. Coarse-grid solve.
     e_coarse = _amg_profile_time!(profile, :coarse_gmres_total) do
-        coarse_gmres(setup, D, r_coarse;
-                     maxiter=coarse_maxiter, restart=coarse_restart, tol=coarse_tol,
-                     coarse_odd_even=coarse_odd_even,
-                     arnoldi_mode=coarse_arnoldi_mode,
-                     coarse_apply_counter=coarse_apply_counter,
-                     flop_counter=flop_counter,
-                     profile=profile)
+        if coarse_gmres_mode == :restart_boundary
+            coarse_odd_even && throw(ArgumentError(
+                "coarse_gmres_mode=:restart_boundary does not support coarse_odd_even=true"))
+            _amg_coarse_gmres_restart_boundary(
+                setup, D, r_coarse;
+                maxiter=coarse_maxiter, restart=coarse_restart, tol=coarse_tol,
+                coarse_apply_counter=coarse_apply_counter,
+                flop_counter=flop_counter,
+                profile=profile)
+        else
+            coarse_gmres(setup, D, r_coarse;
+                         maxiter=coarse_maxiter, restart=coarse_restart, tol=coarse_tol,
+                         coarse_odd_even=coarse_odd_even,
+                         arnoldi_mode=coarse_arnoldi_mode,
+                         coarse_apply_counter=coarse_apply_counter,
+                         flop_counter=flop_counter,
+                         profile=profile)
+        end
     end
 
     # 4. Prolongate the correction to the fine grid.
@@ -3853,6 +4137,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 coarse_maxiter::Int=50,
                 coarse_restart::Int=30,
                 coarse_odd_even::Bool=true,
+                coarse_gmres_mode::Symbol=:incremental,
                 sap_odd_even::Bool=true,
                 sap_schedule::Symbol=:boundary8,
                 profile::Bool=false,
@@ -3937,6 +4222,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                        coarse_restart=coarse_restart,
                        coarse_tol=coarse_tol, smoother=smoother,
                        coarse_odd_even=coarse_odd_even,
+                       coarse_gmres_mode=coarse_gmres_mode,
                        sap_odd_even=sap_odd_even,
                        sap_schedule=sap_schedule,
                        coarse_apply_counter=_coarse_apply_counter,
@@ -4234,6 +4520,9 @@ Arguments:
 - `template`: WF3x1 field used for lattice/layout information.
 - `r`: block size in each direction.
 - `Nv`: number of test vectors.
+- `setup_mode`: `:inverse_sap` keeps the validated paper-style setup;
+  `:direct_near_null` restores the direct near-null setup used by the
+  2026-07-14 comparison.
 - `nsmooth`: setup smoothing iterations.
 - `smoother`: `:mr`, `:sap`, or `:vcycle`.
 - `nvcycle`: adaptive V-cycle setup iterations when `smoother=:vcycle`.
@@ -4267,8 +4556,8 @@ Arguments:
   correction and the implemented restriction remains `R = P'`.
 - `precompute_coarse`: precompute the coarse operator stencil. Solves need this,
   but matrix-free training losses can disable it.
-- `smooth_external_vectors`: when `coarse_vectors` are provided, apply the same
-  inverse setup smoothing used for setup seeds before chiral splitting and block
+- `smooth_external_vectors`: when `coarse_vectors` are provided, apply the
+  mode-specific setup smoothing before chiral splitting and block
   orthonormalization.
 
 Example:
@@ -4278,6 +4567,7 @@ solution = solve_DDalphaAMG(D, b, setup; tol=1e-10)
 ```
 """
 function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
+                          setup_mode::Symbol=:inverse_sap,
                           nsmooth::Int=16, verbose::Bool=true,
                           coarse_vectors::Union{Nothing,Vector{<:WF3x1}}=nothing,
                           smoother::Symbol=:mr,
@@ -4289,18 +4579,30 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                           setup_block_mr_steps::Int=4,
                           setup_block_gmres_steps::Int=setup_block_mr_steps,
                           vcycle_update_smoother::Symbol=:sap,
-                          vcycle_post_sap_iters::Int=2,
+                          vcycle_post_sap_iters::Union{Nothing,Int}=nothing,
                           vcycle_post_block_solver::Symbol=setup_block_solver,
                           vcycle_post_block_mr_steps::Int=4,
                           vcycle_post_block_gmres_steps::Int=vcycle_post_block_mr_steps,
-                          setup_coarse_tol::Float64=5e-2,
-                          setup_coarse_maxiter::Int=5,
-                          setup_coarse_restart::Int=30,
-                          sap_schedule::Symbol=:boundary8,
+                          setup_coarse_tol::Union{Nothing,Float64}=nothing,
+                          setup_coarse_maxiter::Union{Nothing,Int}=nothing,
+                          setup_coarse_restart::Union{Nothing,Int}=nothing,
+                          sap_schedule::Union{Nothing,Symbol}=nothing,
                           use_chirality::Bool=false,
                           precompute_coarse::Bool=true,
                           block_normalize::Bool=true,
                           smooth_external_vectors::Bool=true)
+    _amg_validate_setup_mode(setup_mode)
+    direct_mode = setup_mode == :direct_near_null
+    setup_defaults = _amg_setup_defaults(setup_mode)
+    vcycle_post_sap_iters = something(
+        vcycle_post_sap_iters, setup_defaults.vcycle_post_sap_iters)
+    setup_coarse_tol = something(setup_coarse_tol, setup_defaults.coarse_tol)
+    setup_coarse_maxiter = something(
+        setup_coarse_maxiter, setup_defaults.coarse_maxiter)
+    setup_coarse_restart = something(
+        setup_coarse_restart, setup_defaults.coarse_restart)
+    sap_schedule = something(sap_schedule, setup_defaults.sap_schedule)
+
     NX, NY, NZ, NT = template.NX, template.NY, template.NZ, template.NT
     NC, NG = template.NC, template.NG
 
@@ -4317,6 +4619,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
 
     if verbose
         println("DD-alphaAMG Setup:")
+        println("  setup mode: $setup_mode")
         println("  fine lattice: $(NX)x$(NY)x$(NZ)x$(NT)")
         println("  block size: $(r)^4")
         println("  coarse lattice: $(NBX)x$(NBY)x$(NBZ)x$(NBT) = $(Nblocks) blocks")
@@ -4349,31 +4652,59 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                     throw(ArgumentError("setup_block_gmres_steps must be positive, got $setup_block_gmres_steps"))
                 block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
                 block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
-                verbose && println("  inverse-smoothing external test vectors with SAP stages 1:$(setup_sap_iters) ($(block_steps) $(block_name) steps per local block solve)...")
+                if verbose
+                    if direct_mode
+                        println("  homogeneous-smoothing external test vectors with SAP ($(setup_sap_iters) sweeps, $(block_steps) $(block_name) steps)...")
+                    else
+                        println("  inverse-smoothing external test vectors with SAP stages 1:$(setup_sap_iters) ($(block_steps) $(block_name) steps per local block solve)...")
+                    end
+                end
                 sap_setup = DDalphaAMG_Setup{typeof(template)}(
                     test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
                     NBX, NBY, NBZ, NBT, Nblocks, nothing,
                     nothing,
                     CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
                 )
-                _amg_initial_inverse_smooth!(test_vectors, D, sap_setup;
-                                             smoother=:sap,
-                                             nstages=setup_sap_iters,
-                                             block_solver=setup_block_solver,
-                                             nblock_mr=setup_block_mr_steps,
-                                             nblock_gmres=setup_block_gmres_steps,
-                                             sap_schedule=sap_schedule)
+                if direct_mode
+                    _amg_initial_direct_smooth!(test_vectors, D, sap_setup;
+                                                smoother=:sap,
+                                                niter=setup_sap_iters,
+                                                block_solver=setup_block_solver,
+                                                nblock_mr=setup_block_mr_steps,
+                                                nblock_gmres=setup_block_gmres_steps,
+                                                sap_schedule=sap_schedule)
+                else
+                    _amg_initial_inverse_smooth!(test_vectors, D, sap_setup;
+                                                 smoother=:sap,
+                                                 nstages=setup_sap_iters,
+                                                 block_solver=setup_block_solver,
+                                                 nblock_mr=setup_block_mr_steps,
+                                                 nblock_gmres=setup_block_gmres_steps,
+                                                 sap_schedule=sap_schedule)
+                end
             else
-                verbose && println("  inverse-smoothing external test vectors with MR stages 1:$nsmooth...")
+                if verbose
+                    if direct_mode
+                        println("  homogeneous-smoothing external test vectors with MR ($nsmooth iterations)...")
+                    else
+                        println("  inverse-smoothing external test vectors with MR stages 1:$nsmooth...")
+                    end
+                end
                 external_setup = DDalphaAMG_Setup{typeof(template)}(
                     test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
                     NBX, NBY, NBZ, NBT, Nblocks, nothing,
                     nothing,
                     CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
                 )
-                _amg_initial_inverse_smooth!(test_vectors, D, external_setup;
-                                             smoother=:mr,
-                                             nstages=nsmooth)
+                if direct_mode
+                    _amg_initial_direct_smooth!(test_vectors, D, external_setup;
+                                                smoother=:mr,
+                                                niter=nsmooth)
+                else
+                    _amg_initial_inverse_smooth!(test_vectors, D, external_setup;
+                                                 smoother=:mr,
+                                                 nstages=nsmooth)
+                end
             end
         end
     else
@@ -4382,15 +4713,14 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             random_fermion!(test_vectors[v])
         end
 
-            # 2. Smooth test vectors so they approximate low modes.
-            zero_rhs = similar(template)
-            zero_wf!(zero_rhs)
+        # 2. Smooth test vectors so they approximate low modes.
+        zero_rhs = similar(template)
+        zero_wf!(zero_rhs)
 
         if smoother == :vcycle
             _setup_fine_apply_counter = Ref(0)
-            # DD-alphaAMG adaptive setup:
-            # first apply inverse SAP/MR stages to random seeds, then update
-            # v_j <- normalize(V^(nu) v_j) in the adaptive setup loop.
+            # Build near-null seeds and refine them with the selected adaptive
+            # setup algorithm.
             sap_setup = DDalphaAMG_Setup{typeof(template)}(
                 test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
                 NBX, NBY, NBZ, NBT, Nblocks, nothing,
@@ -4424,31 +4754,54 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             setup_coarse_restart > 0 ||
                 throw(ArgumentError("setup_coarse_restart must be positive, got $setup_coarse_restart"))
             if verbose
+                setup_label = direct_mode ? "direct near-null setup" : "inverse-SAP setup"
                 if setup_smoother == :sap
                     setup_block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
                     setup_block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
-                    println("  [Algorithm 16 setup] Phase 1: inverse SAP stages 1:$(setup_sap_iters) ($(setup_block_steps) $(setup_block_name) steps per local block solve)...")
+                    if direct_mode
+                        println("  [direct near-null setup] Phase 1: homogeneous SAP ($(setup_sap_iters) sweeps, $(setup_block_steps) $(setup_block_name) steps)...")
+                    else
+                        println("  [inverse-SAP setup] Phase 1: inverse SAP stages 1:$(setup_sap_iters) ($(setup_block_steps) $(setup_block_name) steps per local block solve)...")
+                    end
                 else
-                    println("  [Algorithm 16 setup] Phase 1: inverse MR stages 1:$nsmooth...")
+                    if direct_mode
+                        println("  [direct near-null setup] Phase 1: homogeneous MR ($nsmooth iterations)...")
+                    else
+                        println("  [inverse-SAP setup] Phase 1: inverse MR stages 1:$nsmooth...")
+                    end
                 end
                 if vcycle_update_smoother == :sap
                     post_block_steps = vcycle_post_block_solver == :mr ? vcycle_post_block_mr_steps : vcycle_post_block_gmres_steps
                     post_block_name = vcycle_post_block_solver == :mr ? "block-MR" : "block-GMRES"
-                    println("  [Algorithm 16 setup] adaptive post-smoother: SAP ($(vcycle_post_sap_iters) sweeps, $(post_block_steps) $(post_block_name) steps)")
+                    println("  [$setup_label] adaptive post-smoother: SAP ($(vcycle_post_sap_iters) sweeps, $(post_block_steps) $(post_block_name) steps)")
                 else
-                    println("  [Algorithm 16 setup] adaptive post-smoother: MR ($vcycle_post_smooth steps)")
+                    println("  [$setup_label] adaptive post-smoother: MR ($vcycle_post_smooth steps)")
                 end
-                println("  [Algorithm 16 setup] adaptive coarse solve: tol=$(setup_coarse_tol), restart=$(setup_coarse_restart), max cycles=$(setup_coarse_maxiter)")
+                println("  [$setup_label] adaptive coarse solve: tol=$(setup_coarse_tol), restart=$(setup_coarse_restart), max cycles=$(setup_coarse_maxiter)")
             end
-            initial_stages = setup_smoother == :sap ? setup_sap_iters : nsmooth
-            _amg_initial_inverse_smooth!(test_vectors, D, sap_setup;
-                                         smoother=setup_smoother,
-                                         nstages=initial_stages,
-                                         block_solver=setup_block_solver,
-                                         nblock_mr=setup_block_mr_steps,
-                                         nblock_gmres=setup_block_gmres_steps,
-                                         sap_schedule=sap_schedule,
-                                         fine_apply_counter=_setup_fine_apply_counter)
+            initial_steps = setup_smoother == :sap ? setup_sap_iters : nsmooth
+            if direct_mode
+                _amg_initial_direct_smooth!(test_vectors, D, sap_setup;
+                                            smoother=setup_smoother,
+                                            niter=initial_steps,
+                                            block_solver=setup_block_solver,
+                                            nblock_mr=setup_block_mr_steps,
+                                            nblock_gmres=setup_block_gmres_steps,
+                                            sap_schedule=sap_schedule,
+                                            fine_apply_counter=_setup_fine_apply_counter)
+            else
+                _amg_initial_inverse_smooth!(test_vectors, D, sap_setup;
+                                             smoother=setup_smoother,
+                                             nstages=initial_steps,
+                                             block_solver=setup_block_solver,
+                                             nblock_mr=setup_block_mr_steps,
+                                             nblock_gmres=setup_block_gmres_steps,
+                                             sap_schedule=sap_schedule,
+                                             fine_apply_counter=_setup_fine_apply_counter)
+            end
+
+            r_fine = direct_mode ? similar(template) : nothing
+            correction = direct_mode ? similar(template) : nothing
 
             for iter in 1:nvcycle
                 cur_vectors = _copy_wf_vector(test_vectors)
@@ -4463,33 +4816,58 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                     cur_vectors, r, cur_Nv, NX, NY, NZ, NT, NC, NG,
                     NBX, NBY, NBZ, NBT, Nblocks, nothing,
                     nothing,
-                    CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
+                    CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing,
+                    setup_mode
                 )
                 precompute_coarse_operator!(cur_setup, D; mode=:direct_stencil)
+                r_coarse = direct_mode ? _coarse_vector(cur_Nv, Nblocks, template) : nothing
 
                 for v in 1:Nv_smooth
-                    updated = vcycle(D, test_vectors[v], cur_setup;
-                                     pre_smooth=0,
-                                     post_smooth=(vcycle_update_smoother == :sap ?
-                                                  vcycle_post_sap_iters : vcycle_post_smooth),
-                                     sap_block_mr_steps=vcycle_post_block_mr_steps,
-                                     coarse_maxiter=setup_coarse_maxiter,
-                                     coarse_restart=setup_coarse_restart,
-                                     coarse_tol=setup_coarse_tol,
-                                     smoother=vcycle_update_smoother,
-                                     coarse_odd_even=true,
-                                     sap_odd_even=true,
-                                     sap_schedule=sap_schedule,
-                                     fine_apply_counter=_setup_fine_apply_counter)
-                    LatticeDiracOperators.substitute_fermion!(test_vectors[v], updated)
-                    normalize_fermion!(test_vectors[v])
+                    if direct_mode
+                        _amg_direct_near_null_update!(
+                            test_vectors[v], D, cur_setup,
+                            r_fine::WF3x1, r_coarse::CoarseVector,
+                            correction::WF3x1;
+                            update_smoother=vcycle_update_smoother,
+                            post_sap_iters=vcycle_post_sap_iters,
+                            post_smooth=vcycle_post_smooth,
+                            block_solver=vcycle_post_block_solver,
+                            nblock_mr=vcycle_post_block_mr_steps,
+                            nblock_gmres=vcycle_post_block_gmres_steps,
+                            coarse_tol=setup_coarse_tol,
+                            coarse_maxiter=setup_coarse_maxiter,
+                            coarse_restart=setup_coarse_restart,
+                            sap_schedule=sap_schedule,
+                            arnoldi_mode=:scalar,
+                            fine_apply_counter=_setup_fine_apply_counter)
+                    else
+                        updated = vcycle(D, test_vectors[v], cur_setup;
+                                         pre_smooth=0,
+                                         post_smooth=(vcycle_update_smoother == :sap ?
+                                                      vcycle_post_sap_iters : vcycle_post_smooth),
+                                         sap_block_mr_steps=vcycle_post_block_mr_steps,
+                                         coarse_maxiter=setup_coarse_maxiter,
+                                         coarse_restart=setup_coarse_restart,
+                                         coarse_tol=setup_coarse_tol,
+                                         smoother=vcycle_update_smoother,
+                                         coarse_odd_even=true,
+                                         sap_odd_even=true,
+                                         sap_schedule=sap_schedule,
+                                         fine_apply_counter=_setup_fine_apply_counter)
+                        LatticeDiracOperators.substitute_fermion!(test_vectors[v], updated)
+                        normalize_fermion!(test_vectors[v])
+                    end
                 end
 
                 if verbose
-                    println("  [Algorithm 16 setup] iteration $iter/$nvcycle done")
+                    setup_label = direct_mode ? "direct near-null setup" : "inverse-SAP setup"
+                    println("  [$setup_label] iteration $iter/$nvcycle done")
                 end
             end
-            verbose && println("  [Algorithm 16 setup] fine Dirac applications: $(_setup_fine_apply_counter[])")
+            if verbose
+                setup_label = direct_mode ? "direct near-null setup" : "inverse-SAP setup"
+                println("  [$setup_label] fine Dirac applications: $(_setup_fine_apply_counter[])")
+            end
         elseif smoother == :sap
             setup_block_solver in (:mr, :gmres) ||
                 throw(ArgumentError("setup_block_solver must be :mr or :gmres, got $setup_block_solver"))
@@ -4552,7 +4930,8 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         test_vectors, r, Nv_setup, NX, NY, NZ, NT, NC, NG,
         NBX, NBY, NBZ, NBT, Nblocks, nothing,
         nothing,
-        CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
+        CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing,
+        setup_mode
     )
 
     # Precompute the coarse operator for AMG solves. Matrix-free training losses
@@ -4586,32 +4965,60 @@ Arguments:
 - `tol`: relative residual tolerance.
 - `smoother`: `:mr` or `:sap` for fine-grid smoothing.
 - `pre_smooth`, `post_smooth`: smoothing counts inside the V-cycle.
+
+Mode-dependent options default from `setup.setup_mode`. Explicit keyword values
+always take precedence over those defaults.
 """
 function solve_DDalphaAMG(D, b::WF3x1, setup::DDalphaAMG_Setup;
                           x0::Union{Nothing,WF3x1}=nothing,
-                          tol::Float64=1e-10, maxiter::Int=100, restart::Int=25,
-                          verbose::Bool=true, smoother::Symbol=:sap,
-                          pre_smooth::Int=0, post_smooth::Int=2,
+                          tol::Float64=1e-10, maxiter::Int=100,
+                          restart::Union{Nothing,Int}=nothing,
+                          verbose::Bool=true,
+                          smoother::Union{Nothing,Symbol}=nothing,
+                          pre_smooth::Union{Nothing,Int}=nothing,
+                          post_smooth::Union{Nothing,Int}=nothing,
                           sap_block_mr_steps::Int=4,
-                          coarse_tol::Float64=5e-2,
-                          coarse_maxiter::Int=50,
-                          coarse_restart::Int=30,
-                          coarse_odd_even::Bool=true,
-                          sap_odd_even::Bool=true,
-                          sap_schedule::Symbol=:boundary8,
+                          coarse_tol::Union{Nothing,Float64}=nothing,
+                          coarse_maxiter::Union{Nothing,Int}=nothing,
+                          coarse_restart::Union{Nothing,Int}=nothing,
+                          coarse_odd_even::Union{Nothing,Bool}=nothing,
+                          coarse_gmres_mode::Union{Nothing,Symbol}=nothing,
+                          sap_odd_even::Union{Nothing,Bool}=nothing,
+                          sap_schedule::Union{Nothing,Symbol}=nothing,
                           profile::Bool=false,
                           profile_synchronize::Bool=true)
+    options = _amg_resolve_solve_options(setup.setup_mode;
+        restart=restart,
+        smoother=smoother,
+        pre_smooth=pre_smooth,
+        post_smooth=post_smooth,
+        coarse_tol=coarse_tol,
+        coarse_maxiter=coarse_maxiter,
+        coarse_restart=coarse_restart,
+        coarse_odd_even=coarse_odd_even,
+        coarse_gmres_mode=coarse_gmres_mode,
+        sap_odd_even=sap_odd_even,
+        sap_schedule=sap_schedule)
+    if verbose
+        println("DD-alphaAMG Solve settings:")
+        println("  setup mode: $(setup.setup_mode)")
+        println("  outer: tol=$tol, max cycles=$maxiter, restart=$(options.restart)")
+        println("  fine smoother: $(options.smoother), pre=$(options.pre_smooth), post=$(options.post_smooth), block MR steps=$sap_block_mr_steps")
+        println("  SAP: schedule=$(options.sap_schedule), odd-even=$(options.sap_odd_even)")
+        println("  coarse: tol=$(options.coarse_tol), max cycles=$(options.coarse_maxiter), restart=$(options.coarse_restart), odd-even=$(options.coarse_odd_even), GMRES mode=$(options.coarse_gmres_mode)")
+    end
     return fgmres(D, b, setup;
-                  x0=x0, tol=tol, maxiter=maxiter, restart=restart,
-                  verbose=verbose, smoother=smoother,
-                  pre_smooth=pre_smooth, post_smooth=post_smooth,
+                  x0=x0, tol=tol, maxiter=maxiter, restart=options.restart,
+                  verbose=verbose, smoother=options.smoother,
+                  pre_smooth=options.pre_smooth, post_smooth=options.post_smooth,
                   sap_block_mr_steps=sap_block_mr_steps,
-                  coarse_tol=coarse_tol,
-                  coarse_maxiter=coarse_maxiter,
-                  coarse_restart=coarse_restart,
-                  coarse_odd_even=coarse_odd_even,
-                  sap_odd_even=sap_odd_even,
-                  sap_schedule=sap_schedule,
+                  coarse_tol=options.coarse_tol,
+                  coarse_maxiter=options.coarse_maxiter,
+                  coarse_restart=options.coarse_restart,
+                  coarse_odd_even=options.coarse_odd_even,
+                  coarse_gmres_mode=options.coarse_gmres_mode,
+                  sap_odd_even=options.sap_odd_even,
+                  sap_schedule=options.sap_schedule,
                   profile=profile,
                   profile_synchronize=profile_synchronize)
 end
