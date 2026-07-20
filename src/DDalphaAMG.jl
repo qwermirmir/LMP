@@ -418,6 +418,152 @@ function apply_coarse_stencil!(out::CoarseVector, op::CoarseStencilOperator, x::
     return out
 end
 
+function _amg_coarse_self_inverse_gpu(self::CuArray{ComplexF64,3})
+    self_lu = copy(self)
+    self_inv = similar(self)
+    pivot, factor_info = CUDA.CUBLAS.getrf_strided_batched!(self_lu, true)
+    factor_status = Array(factor_info)
+    failed = findfirst(!iszero, factor_status)
+    failed === nothing || throw(SingularException(failed))
+
+    inverse_info = CUDA.CUBLAS.getri_strided_batched!(self_lu, self_inv, pivot)
+    inverse_status = Array(inverse_info)
+    failed = findfirst(!iszero, inverse_status)
+    failed === nothing || throw(SingularException(failed))
+    return self_inv
+end
+
+function _amg_coarse_self_inverse(op::CoarseStencilOperator)
+    if op.self isa CuArray
+        return _amg_coarse_self_inverse_gpu(op.self)
+    end
+    inv_host = similar(op.self)
+    @inbounds for b in 1:op.Nblocks
+        inv_host[:, :, b] .= inv(Matrix(view(op.self, :, :, b)))
+    end
+    return inv_host
+end
+
+function _amg_coarse_self_inverse!(setup::DDalphaAMG_Setup, op::CoarseStencilOperator)
+    cache = setup._gpu_cache isa Dict ? setup._gpu_cache : Dict{Symbol,Any}()
+    key = (objectid(op), objectid(op.self), op.Nv, op.Nblocks,
+           op.NBX, op.NBY, op.NBZ, op.NBT, op.self isa CuArray)
+    if get(cache, :coarse_self_inv_key, nothing) == key
+        return cache[:coarse_self_inv]
+    end
+    self_inv = _amg_coarse_self_inverse(op)
+    cache[:coarse_self_inv_key] = key
+    cache[:coarse_self_inv] = self_inv
+    setup._gpu_cache = cache
+    return self_inv
+end
+
+function _amg_can_coarse_odd_even(op::CoarseStencilOperator)
+    # Periodic nearest-neighbor odd-even splitting is bipartite only on even extents.
+    return iseven(op.NBX) && iseven(op.NBY) && iseven(op.NBZ) && iseven(op.NBT)
+end
+
+function _amg_coarse_color_mask!(out::CoarseVector, op::CoarseStencilOperator,
+                                 x::CoarseVector, color::Integer)
+    fill!(out.data, zero(ComplexF64))
+    if out.data isa CuArray
+        threads = 256
+        @cuda threads=threads blocks=cld(length(out.data), threads) _amg_coarse_color_mask_kernel!(
+            out.data, x.data, Int32(op.Nv), Int32(op.Nblocks),
+            Int32(op.NBX), Int32(op.NBY), Int32(op.NBZ), Int32(color))
+        return out
+    end
+    Nv = op.Nv
+    @inbounds for b in 1:op.Nblocks
+        _amg_block_color_from_bid(b, op.NBX, op.NBY, op.NBZ) == color || continue
+        src_base = (b - 1) * Nv
+        for i in 1:Nv
+            out.data[src_base + i] = x.data[src_base + i]
+        end
+    end
+    return out
+end
+
+function _amg_coarse_color_diff!(out::CoarseVector, op::CoarseStencilOperator,
+                                 x::CoarseVector, y::CoarseVector, color::Integer)
+    fill!(out.data, zero(ComplexF64))
+    if out.data isa CuArray
+        threads = 256
+        @cuda threads=threads blocks=cld(length(out.data), threads) _amg_coarse_color_diff_kernel!(
+            out.data, x.data, y.data, Int32(op.Nv), Int32(op.Nblocks),
+            Int32(op.NBX), Int32(op.NBY), Int32(op.NBZ), Int32(color))
+        return out
+    end
+    Nv = op.Nv
+    @inbounds for b in 1:op.Nblocks
+        _amg_block_color_from_bid(b, op.NBX, op.NBY, op.NBZ) == color || continue
+        src_base = (b - 1) * Nv
+        for i in 1:Nv
+            out.data[src_base + i] = x.data[src_base + i] - y.data[src_base + i]
+        end
+    end
+    return out
+end
+
+function _amg_coarse_blockdiag_solve!(out::CoarseVector, op::CoarseStencilOperator,
+                                      self_inv, rhs::CoarseVector, color::Integer)
+    fill!(out.data, zero(ComplexF64))
+    if out.data isa CuArray
+        threads = max(32, min(256, op.Nv))
+        @cuda threads=threads blocks=op.Nblocks _amg_coarse_blockdiag_solve_kernel!(
+            out.data, self_inv, rhs.data, Int32(op.Nv), Int32(op.Nblocks),
+            Int32(op.NBX), Int32(op.NBY), Int32(op.NBZ), Int32(color))
+        return out
+    end
+    Nv = op.Nv
+    @inbounds for b in 1:op.Nblocks
+        _amg_block_color_from_bid(b, op.NBX, op.NBY, op.NBZ) == color || continue
+        base = (b - 1) * Nv
+        for i in 1:Nv
+            acc = zero(ComplexF64)
+            for j in 1:Nv
+                acc += self_inv[i, j, b] * rhs.data[base + j]
+            end
+            out.data[base + i] = acc
+        end
+    end
+    return out
+end
+
+function _amg_coarse_odd_even_rhs!(out::CoarseVector, op::CoarseStencilOperator,
+                                   self_inv, rhs::CoarseVector,
+                                   tmp1::CoarseVector, tmp2::CoarseVector,
+                                   tmp3::CoarseVector)
+    _amg_coarse_color_mask!(tmp1, op, rhs, 1)
+    _amg_coarse_blockdiag_solve!(tmp2, op, self_inv, tmp1, 1)
+    apply_coarse_stencil!(tmp3, op, tmp2)
+    _amg_coarse_color_diff!(out, op, rhs, tmp3, 0)
+    return out
+end
+
+function _amg_apply_coarse_odd_even_schur!(out::CoarseVector, op::CoarseStencilOperator,
+                                           self_inv, x_even::CoarseVector,
+                                           tmp1::CoarseVector, tmp2::CoarseVector,
+                                           tmp3::CoarseVector)
+    apply_coarse_stencil!(tmp1, op, x_even)
+    _amg_coarse_blockdiag_solve!(tmp2, op, self_inv, tmp1, 1)
+    apply_coarse_stencil!(tmp3, op, tmp2)
+    _amg_coarse_color_diff!(out, op, tmp1, tmp3, 0)
+    return out
+end
+
+function _amg_coarse_odd_even_reconstruct!(out::CoarseVector, op::CoarseStencilOperator,
+                                           self_inv, x_even::CoarseVector,
+                                           rhs::CoarseVector, tmp1::CoarseVector,
+                                           tmp2::CoarseVector, tmp3::CoarseVector)
+    apply_coarse_stencil!(tmp1, op, x_even)
+    _amg_coarse_color_diff!(tmp2, op, rhs, tmp1, 1)
+    _amg_coarse_blockdiag_solve!(tmp3, op, self_inv, tmp2, 1)
+    out.data .= x_even.data
+    coarse_axpby!(1.0, tmp3, 1.0, out)
+    return out
+end
+
 
 function ensure_coarse_gmres_cache!(setup::DDalphaAMG_Setup, template::CoarseVector, restart::Int)
     m = min(restart, length(template.data))
@@ -432,6 +578,28 @@ function ensure_coarse_gmres_cache!(setup::DDalphaAMG_Setup, template::CoarseVec
     return m
 end
 
+function _amg_gpu_batched_orthogonalize!(w::CuArray{ComplexF64,1},
+                                         basis::CuArray{ComplexF64,2},
+                                         j::Int,
+                                         coeff_dev::CuArray{ComplexF64,1},
+                                         coeff_host::Vector{ComplexF64})
+    1 <= j <= size(basis, 2) || throw(ArgumentError("invalid Arnoldi column count: $j"))
+    length(coeff_dev) >= 2j || throw(ArgumentError("device coefficient buffer is too small"))
+    length(coeff_host) >= j || throw(ArgumentError("host coefficient buffer is too small"))
+
+    basis_j = view(basis, :, 1:j)
+    coeff_total = view(coeff_dev, 1:j)
+    coeff_pass2 = view(coeff_dev, j+1:2j)
+
+    mul!(coeff_total, adjoint(basis_j), w)
+    mul!(w, basis_j, coeff_total, ComplexF64(-1), ComplexF64(1))
+    mul!(coeff_pass2, adjoint(basis_j), w)
+    mul!(w, basis_j, coeff_pass2, ComplexF64(-1), ComplexF64(1))
+    coeff_total .+= coeff_pass2
+    copyto!(coeff_host, 1, coeff_dev, 1, j)
+    return norm(w)
+end
+
 
 # ==========================================
 #  Block utilities
@@ -441,10 +609,42 @@ end
     return (bt-1)*NBZ*NBY*NBX + (bz-1)*NBY*NBX + (by-1)*NBX + bx
 end
 
+function _amg_build_boundary8_affected_sites(bmap::Vector{Int32}, blockinfo, setup)
+    schedule_code = _amg_sap_schedule_code(:boundary8)
+    affected = [Int32[] for _ in 0:7]
+    blocksize = Int(blockinfo.blocksize)
+
+    @inbounds for site in eachindex(bmap)
+        b = (site - 1) % blocksize + 1
+        r = (site - 1) ÷ blocksize + 1
+        neighboring_bids = Int32[bmap[site]]
+        for mu in Int32(1):Int32(4)
+            bp, rp = _amg_shift_site(b, r, mu, Int32(1), blockinfo)
+            bm, rm = _amg_shift_site(b, r, mu, -Int32(1), blockinfo)
+            push!(neighboring_bids, bmap[(rp - 1) * blocksize + bp])
+            push!(neighboring_bids, bmap[(rm - 1) * blocksize + bm])
+        end
+
+        for step in 0:7
+            if any(bid -> _amg_sap_block_active_from_bid(
+                       bid, step, setup.NBX, setup.NBY, setup.NBZ, setup.NBT,
+                       schedule_code), neighboring_bids)
+                push!(affected[step + 1], Int32(site))
+            end
+        end
+    end
+
+    return CuArray.(affected)
+end
+
 function _ensure_gpu_cache!(setup)
     setup.test_vectors[1] isa WF3x1GPU || return nothing
     cache = hasproperty(setup, :_gpu_cache) ? setup._gpu_cache : nothing
     if cache isa Dict && get(cache, :r, nothing) == setup.r
+        if !haskey(cache, :boundary8_affected_sites)
+            cache[:boundary8_affected_sites] = _amg_build_boundary8_affected_sites(
+                Array(cache[:bmap]), setup.test_vectors[1].blockinfo, setup)
+        end
         return cache
     end
 
@@ -498,6 +698,7 @@ function _ensure_gpu_cache!(setup)
         :block_sites => CuArray(sites),
         :block_counts => CuArray(counts),
         :max_count => Int(max_count),
+        :boundary8_affected_sites => _amg_build_boundary8_affected_sites(bmap, bi, setup),
     )
     if hasproperty(setup, :_gpu_cache)
         setup._gpu_cache = cache
@@ -629,6 +830,37 @@ function _amg_block_project_kernel!(x, bmap, nc_ng::Int32, total::Int32, bid_tar
             if !inside
                 x[idx] = ComplexF64(0.0)
             end
+        end
+    end
+    return nothing
+end
+
+@inline function _amg_fine_site_parity(b, r, blockinfo)
+    ix = _amg_cvt_x(b, blockinfo.blocks[1], blockinfo.blocks_s[1]) +
+         _amg_cvt_x(r, blockinfo.blocknumbers[1], blockinfo.blocknumbers_s[1]) *
+         blockinfo.blocks[1]
+    iy = _amg_cvt_x(b, blockinfo.blocks[2], blockinfo.blocks_s[2]) +
+         _amg_cvt_x(r, blockinfo.blocknumbers[2], blockinfo.blocknumbers_s[2]) *
+         blockinfo.blocks[2]
+    iz = _amg_cvt_x(b, blockinfo.blocks[3], blockinfo.blocks_s[3]) +
+         _amg_cvt_x(r, blockinfo.blocknumbers[3], blockinfo.blocknumbers_s[3]) *
+         blockinfo.blocks[3]
+    it = _amg_cvt_x(b, blockinfo.blocks[4], blockinfo.blocks_s[4]) +
+         _amg_cvt_x(r, blockinfo.blocknumbers[4], blockinfo.blocknumbers_s[4]) *
+         blockinfo.blocks[4]
+    return (ix + iy + iz + it) & 1
+end
+
+function _amg_block_parity_project_kernel!(x, bmap, nc_ng::Int32, total::Int32,
+                                           bid_target::Int32, parity::Int32, blockinfo)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        b = Int64((site - Int32(1)) % Int32(blockinfo.blocksize) + Int32(1))
+        r = Int64((site - Int32(1)) ÷ Int32(blockinfo.blocksize) + Int32(1))
+        keep = bmap[site] == bid_target && Int32(_amg_fine_site_parity(b, r, blockinfo)) == parity
+        if !keep
+            x[idx] = zero(ComplexF64)
         end
     end
     return nothing
@@ -816,6 +1048,56 @@ function _amg_coarse_stencil_kernel!(out, self, plus, minus, nb_plus, nb_minus, 
             end
         end
         out[dst] = acc
+    end
+    return nothing
+end
+
+function _amg_coarse_color_mask_kernel!(out, x, Nv::Int32, Nblocks::Int32,
+                                        NBX::Int32, NBY::Int32, NBZ::Int32,
+                                        color::Int32)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= length(out)
+        bid = (idx - Int32(1)) ÷ Nv + Int32(1)
+        if bid <= Nblocks && Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            out[idx] = x[idx]
+        else
+            out[idx] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_coarse_color_diff_kernel!(out, x, y, Nv::Int32, Nblocks::Int32,
+                                        NBX::Int32, NBY::Int32, NBZ::Int32,
+                                        color::Int32)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= length(out)
+        bid = (idx - Int32(1)) ÷ Nv + Int32(1)
+        if bid <= Nblocks && Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            out[idx] = x[idx] - y[idx]
+        else
+            out[idx] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_coarse_blockdiag_solve_kernel!(out, self_inv, rhs, Nv::Int32, Nblocks::Int32,
+                                             NBX::Int32, NBY::Int32, NBZ::Int32,
+                                             color::Int32)
+    bid = Int32(blockIdx().x)
+    i = Int32(threadIdx().x)
+    if bid <= Nblocks && i <= Nv
+        dst = (bid - Int32(1)) * Nv + i
+        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+            acc = zero(ComplexF64)
+            for j in Int32(1):Nv
+                acc += self_inv[i, j, bid] * rhs[(bid - Int32(1)) * Nv + j]
+            end
+            out[dst] = acc
+        else
+            out[dst] = zero(ComplexF64)
+        end
     end
     return nothing
 end
@@ -1091,14 +1373,82 @@ end
     return (bx + by + bz + bt) & 1
 end
 
+@inline _amg_sap_schedule_code(::Val{:twocolor}) = Int32(0)
+@inline _amg_sap_schedule_code(::Val{:boundary8}) = Int32(1)
+@inline function _amg_sap_schedule_code(schedule::Symbol)
+    schedule == :twocolor && return Int32(0)
+    schedule == :boundary8 && return Int32(1)
+    throw(ArgumentError("sap_schedule must be :boundary8 or :twocolor, got $schedule"))
+end
+
+@inline function _amg_sap_schedule_steps(schedule::Symbol)
+    schedule == :twocolor && return 0:1
+    schedule == :boundary8 && return 0:7
+    throw(ArgumentError("sap_schedule must be :boundary8 or :twocolor, got $schedule"))
+end
+
+@inline function _amg_sap_color(bx::Integer, by::Integer, bz::Integer, bt::Integer)
+    return (bx + by + bz + bt) & 1
+end
+
+@inline function _amg_sap_block_step_code(bx::Integer, by::Integer, bz::Integer, bt::Integer,
+                                          NBX::Integer, NBY::Integer, NBZ::Integer, NBT::Integer,
+                                          schedule_code::Integer)
+    color = _amg_sap_color(bx, by, bz, bt)
+    schedule_code == 0 && return color
+
+    count_plus = (bx == NBX ? 1 : 0) + (by == NBY ? 1 : 0) +
+                 (bz == NBZ ? 1 : 0) + (bt == NBT ? 1 : 0)
+    count_minus = (bx == 1 ? 1 : 0) + (by == 1 ? 1 : 0) +
+                  (bz == 1 ? 1 : 0) + (bt == 1 ? 1 : 0)
+    count_inner = (1 < bx < NBX ? 1 : 0) + (1 < by < NBY ? 1 : 0) +
+                  (1 < bz < NBZ ? 1 : 0) + (1 < bt < NBT ? 1 : 0)
+
+    if count_inner == 4
+        return 4 * color
+    elseif count_minus == 0
+        return color == 0 ? 1 : 7
+    elseif count_plus == 0
+        return color == 0 ? 3 : 5
+    else
+        return 2 + 4 * color
+    end
+end
+
+@inline function _amg_sap_block_step(bx::Integer, by::Integer, bz::Integer, bt::Integer,
+                                     NBX::Integer, NBY::Integer, NBZ::Integer, NBT::Integer,
+                                     schedule::Symbol)
+    return _amg_sap_block_step_code(bx, by, bz, bt, NBX, NBY, NBZ, NBT,
+                                    _amg_sap_schedule_code(schedule))
+end
+
+@inline function _amg_sap_block_step_from_bid(bid::Integer, NBX::Integer, NBY::Integer,
+                                             NBZ::Integer, NBT::Integer,
+                                             schedule_code::Integer)
+    b0 = bid - 1
+    bx = b0 % NBX + 1
+    by = (b0 ÷ NBX) % NBY + 1
+    bz = (b0 ÷ (NBX * NBY)) % NBZ + 1
+    bt = b0 ÷ (NBX * NBY * NBZ) + 1
+    return _amg_sap_block_step_code(bx, by, bz, bt, NBX, NBY, NBZ, NBT, schedule_code)
+end
+
+@inline function _amg_sap_block_active_from_bid(bid::Integer, step::Integer,
+                                               NBX::Integer, NBY::Integer,
+                                               NBZ::Integer, NBT::Integer,
+                                               schedule_code::Integer)
+    return _amg_sap_block_step_from_bid(bid, NBX, NBY, NBZ, NBT, schedule_code) == step
+end
+
 function _amg_init_color_fields_kernel!(delta, local_r, res, bmap,
-                                        nc_ng::Int32, total::Int32, color::Int32,
-                                        NBX::Int32, NBY::Int32, NBZ::Int32)
+                                        nc_ng::Int32, total::Int32, step::Int32,
+                                        NBX::Int32, NBY::Int32, NBZ::Int32,
+                                        NBT::Int32, schedule_code::Int32)
     idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if idx <= total
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         bid = bmap[site]
-        use = Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        use = _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
         delta[idx] = zero(ComplexF64)
         local_r[idx] = use ? res[idx] : zero(ComplexF64)
     end
@@ -1106,13 +1456,14 @@ function _amg_init_color_fields_kernel!(delta, local_r, res, bmap,
 end
 
 function _amg_add_color_field_kernel!(x, delta, bmap,
-                                      nc_ng::Int32, total::Int32, color::Int32,
-                                      NBX::Int32, NBY::Int32, NBZ::Int32)
+                                      nc_ng::Int32, total::Int32, step::Int32,
+                                      NBX::Int32, NBY::Int32, NBZ::Int32,
+                                      NBT::Int32, schedule_code::Int32)
     idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if idx <= total
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         bid = bmap[site]
-        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
             x[idx] += delta[idx]
         end
     end
@@ -1127,10 +1478,115 @@ function _amg_sub_field_kernel!(y, x)
     return nothing
 end
 
+function _amg_oe_init_fields_kernel!(delta, schur_r, b_odd, res, bmap,
+                                     nc_ng::Int32, total::Int32, step::Int32,
+                                     NBX::Int32, NBY::Int32, NBZ::Int32,
+                                     NBT::Int32, schedule_code::Int32,
+                                     blockinfo)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        b = Int64((site - Int32(1)) % Int32(blockinfo.blocksize) + Int32(1))
+        r = Int64((site - Int32(1)) ÷ Int32(blockinfo.blocksize) + Int32(1))
+        bid = bmap[site]
+        active = _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
+        parity = Int32(_amg_fine_site_parity(b, r, blockinfo))
+        delta[idx] = zero(ComplexF64)
+        schur_r[idx] = active && parity == Int32(0) ? res[idx] : zero(ComplexF64)
+        b_odd[idx] = active && parity == Int32(1) ? res[idx] : zero(ComplexF64)
+    end
+    return nothing
+end
+
+function _amg_oe_sub_even_kernel!(schur_r, A_b_odd, bmap,
+                                  nc_ng::Int32, total::Int32, step::Int32,
+                                  NBX::Int32, NBY::Int32, NBZ::Int32,
+                                  NBT::Int32, schedule_code::Int32,
+                                  blockinfo)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        b = Int64((site - Int32(1)) % Int32(blockinfo.blocksize) + Int32(1))
+        r = Int64((site - Int32(1)) ÷ Int32(blockinfo.blocksize) + Int32(1))
+        bid = bmap[site]
+        active = _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
+        parity = Int32(_amg_fine_site_parity(b, r, blockinfo))
+        if active && parity == Int32(0)
+            schur_r[idx] -= A_b_odd[idx]
+        else
+            schur_r[idx] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_oe_extract_odd_kernel!(odd_part, schur_Ax, bmap,
+                                     nc_ng::Int32, total::Int32, step::Int32,
+                                     NBX::Int32, NBY::Int32, NBZ::Int32,
+                                     NBT::Int32, schedule_code::Int32,
+                                     blockinfo)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        b = Int64((site - Int32(1)) % Int32(blockinfo.blocksize) + Int32(1))
+        r = Int64((site - Int32(1)) ÷ Int32(blockinfo.blocksize) + Int32(1))
+        bid = bmap[site]
+        active = _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
+        parity = Int32(_amg_fine_site_parity(b, r, blockinfo))
+        odd_part[idx] = active && parity == Int32(1) ? schur_Ax[idx] : zero(ComplexF64)
+    end
+    return nothing
+end
+
+function _amg_oe_finish_schur_kernel!(schur_Ax, A_odd_part, bmap,
+                                      nc_ng::Int32, total::Int32, step::Int32,
+                                      NBX::Int32, NBY::Int32, NBZ::Int32,
+                                      NBT::Int32, schedule_code::Int32,
+                                      blockinfo)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        b = Int64((site - Int32(1)) % Int32(blockinfo.blocksize) + Int32(1))
+        r = Int64((site - Int32(1)) ÷ Int32(blockinfo.blocksize) + Int32(1))
+        bid = bmap[site]
+        active = _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
+        parity = Int32(_amg_fine_site_parity(b, r, blockinfo))
+        if active && parity == Int32(0)
+            schur_Ax[idx] -= A_odd_part[idx]
+        else
+            schur_Ax[idx] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
+function _amg_oe_reconstruct_odd_kernel!(delta, b_odd, A_delta, bmap,
+                                         nc_ng::Int32, total::Int32, step::Int32,
+                                         NBX::Int32, NBY::Int32, NBZ::Int32,
+                                         NBT::Int32, schedule_code::Int32,
+                                         blockinfo)
+    idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if idx <= total
+        site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
+        b = Int64((site - Int32(1)) % Int32(blockinfo.blocksize) + Int32(1))
+        r = Int64((site - Int32(1)) ÷ Int32(blockinfo.blocksize) + Int32(1))
+        bid = bmap[site]
+        active = _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
+        parity = Int32(_amg_fine_site_parity(b, r, blockinfo))
+        if active && parity == Int32(1)
+            delta[idx] = b_odd[idx] - A_delta[idx]
+        elseif !active
+            delta[idx] = zero(ComplexF64)
+        end
+    end
+    return nothing
+end
+
 function _amg_block_mr_dot_kernel!(num, den, Alr, local_r,
                                    block_sites, block_counts,
-                                   nc_ng::Int32, color::Int32,
-                                   NBX::Int32, NBY::Int32, NBZ::Int32)
+                                   nc_ng::Int32, step::Int32,
+                                   NBX::Int32, NBY::Int32, NBZ::Int32,
+                                   NBT::Int32, schedule_code::Int32)
     bid = Int32(blockIdx().x)
     tid = Int32(threadIdx().x)
     bsz = Int32(blockDim().x)
@@ -1138,7 +1594,7 @@ function _amg_block_mr_dot_kernel!(num, den, Alr, local_r,
     sh_den = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz), Int(bsz) * sizeof(ComplexF64))
     acc_num = zero(ComplexF64)
     acc_den = zero(ComplexF64)
-    if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+    if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
         total = block_counts[bid] * nc_ng
         p = tid
         while p <= total
@@ -1173,13 +1629,14 @@ function _amg_block_mr_dot_kernel!(num, den, Alr, local_r,
 end
 
 function _amg_block_mr_update_kernel!(delta, local_r, Alr, num, den, bmap,
-                                      nc_ng::Int32, total::Int32, color::Int32,
-                                      NBX::Int32, NBY::Int32, NBZ::Int32)
+                                      nc_ng::Int32, total::Int32, step::Int32,
+                                      NBX::Int32, NBY::Int32, NBZ::Int32,
+                                      NBT::Int32, schedule_code::Int32)
     idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if idx <= total
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         bid = bmap[site]
-        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
             d = den[bid]
             if abs(d) > 1.0e-30
                 alpha = num[bid] / d
@@ -1192,14 +1649,15 @@ function _amg_block_mr_update_kernel!(delta, local_r, Alr, num, den, bmap,
 end
 
 function _amg_color_block_dot_kernel!(out, x, y, block_sites, block_counts,
-                                      nc_ng::Int32, color::Int32,
-                                      NBX::Int32, NBY::Int32, NBZ::Int32)
+                                      nc_ng::Int32, step::Int32,
+                                      NBX::Int32, NBY::Int32, NBZ::Int32,
+                                      NBT::Int32, schedule_code::Int32)
     bid = Int32(blockIdx().x)
     tid = Int32(threadIdx().x)
     bsz = Int32(blockDim().x)
     sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
     acc = zero(ComplexF64)
-    if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+    if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
         total = block_counts[bid] * nc_ng
         p = tid
         while p <= total
@@ -1234,15 +1692,16 @@ end
 
 function _amg_color_block_dot_h_kernel!(H, row::Int32, col::Int32,
                                         x, y, block_sites, block_counts,
-                                        nc_ng::Int32, color::Int32,
+                                        nc_ng::Int32, step::Int32,
                                         NBX::Int32, NBY::Int32, NBZ::Int32,
+                                        NBT::Int32, schedule_code::Int32,
                                         mplus::Int32, m::Int32)
     bid = Int32(blockIdx().x)
     tid = Int32(threadIdx().x)
     bsz = Int32(blockDim().x)
     sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
     acc = zero(ComplexF64)
-    if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+    if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
         total = block_counts[bid] * nc_ng
         p = tid
         while p <= total
@@ -1271,11 +1730,12 @@ function _amg_color_block_dot_h_kernel!(H, row::Int32, col::Int32,
 end
 
 function _amg_color_invnorm_from_vec_kernel!(coeff, norm_out, dotvals,
-                                             color::Int32,
-                                             NBX::Int32, NBY::Int32, NBZ::Int32)
+                                             step::Int32,
+                                             NBX::Int32, NBY::Int32, NBZ::Int32,
+                                             NBT::Int32, schedule_code::Int32)
     bid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if bid <= length(coeff)
-        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
             nrm = sqrt(max(real(dotvals[bid]), 0.0))
             norm_out[bid] = nrm
             coeff[bid] = nrm > 1.0e-30 ? ComplexF64(1.0 / nrm) : zero(ComplexF64)
@@ -1288,12 +1748,13 @@ function _amg_color_invnorm_from_vec_kernel!(coeff, norm_out, dotvals,
 end
 
 function _amg_color_invnorm_from_h_kernel!(coeff, H, row::Int32, col::Int32,
-                                           color::Int32,
+                                           step::Int32,
                                            NBX::Int32, NBY::Int32, NBZ::Int32,
+                                           NBT::Int32, schedule_code::Int32,
                                            mplus::Int32, m::Int32)
     bid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if bid <= length(coeff)
-        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
             idx = _amg_gmres_h_index(row, col, bid, mplus, m)
             nrm = sqrt(max(real(H[idx]), 0.0))
             H[idx] = ComplexF64(nrm)
@@ -1307,14 +1768,15 @@ end
 
 function _amg_color_block_axpby_coeff_kernel!(y, x, coeff, bmap,
                                               nc_ng::Int32, total::Int32,
-                                              color::Int32,
+                                              step::Int32,
                                               NBX::Int32, NBY::Int32, NBZ::Int32,
+                                              NBT::Int32, schedule_code::Int32,
                                               α, β)
     idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if idx <= total
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         bid = bmap[site]
-        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
             y[idx] = α * coeff[bid] * x[idx] + β * y[idx]
         elseif β == zero(β)
             y[idx] = zero(ComplexF64)
@@ -1325,15 +1787,16 @@ end
 
 function _amg_color_block_axpby_h_kernel!(y, x, H, row::Int32, col::Int32,
                                           bmap, nc_ng::Int32, total::Int32,
-                                          color::Int32,
+                                          step::Int32,
                                           NBX::Int32, NBY::Int32, NBZ::Int32,
+                                          NBT::Int32, schedule_code::Int32,
                                           mplus::Int32, m::Int32,
                                           α, β)
     idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if idx <= total
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         bid = bmap[site]
-        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
             c = H[_amg_gmres_h_index(row, col, bid, mplus, m)]
             y[idx] = α * c * x[idx] + β * y[idx]
         elseif β == zero(β)
@@ -1345,14 +1808,15 @@ end
 
 function _amg_color_gmres_update_kernel!(delta, v, ycoeff, k::Int32,
                                          bmap, nc_ng::Int32, total::Int32,
-                                         color::Int32,
+                                         step::Int32,
                                          NBX::Int32, NBY::Int32, NBZ::Int32,
+                                         NBT::Int32, schedule_code::Int32,
                                          m::Int32)
     idx = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if idx <= total
         site = (idx - Int32(1)) ÷ nc_ng + Int32(1)
         bid = bmap[site]
-        if Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+        if _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
             delta[idx] += ycoeff[k + (bid - Int32(1)) * m] * v[idx]
         end
     end
@@ -1361,12 +1825,13 @@ end
 
 function _amg_local_wilson_block_kernel!(yf, xf, U1, U2, U3, U4, bmap,
                                          κ::Float64, blockinfo,
-                                         color::Int32, NBX::Int32, NBY::Int32, NBZ::Int32)
+                                         step::Int32, NBX::Int32, NBY::Int32, NBZ::Int32,
+                                         NBT::Int32, schedule_code::Int32)
     b = Int64(threadIdx().x)
     r = Int64(blockIdx().x)
     site = Int32((r - 1) * blockinfo.blocksize + b)
     bid = bmap[site]
-    active = Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ)) == color
+    active = _amg_sap_block_active_from_bid(bid, step, NBX, NBY, NBZ, NBT, schedule_code)
 
     if !active
         @inbounds begin
@@ -1454,6 +1919,109 @@ function _amg_local_wilson_block_kernel!(yf, xf, U1, U2, U3, U4, bmap,
     return nothing
 end
 
+function _amg_boundary8_residual_update_kernel!(res, delta, affected_sites,
+                                                 U1, U2, U3, U4,
+                                                 κ::Float64, blockinfo,
+                                                 naffected::Int32)
+    affected_idx = Int32(threadIdx().x) +
+                   (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if affected_idx > naffected
+        return nothing
+    end
+
+    site = affected_sites[affected_idx]
+    b = Int64((site - Int32(1)) % Int32(blockinfo.blocksize) + Int32(1))
+    r = Int64((site - Int32(1)) ÷ Int32(blockinfo.blocksize) + Int32(1))
+
+    @inbounds begin
+        x11 = delta[1,1,b,r]; x21 = delta[2,1,b,r]; x31 = delta[3,1,b,r]
+        x12 = delta[1,2,b,r]; x22 = delta[2,2,b,r]; x32 = delta[3,2,b,r]
+        x13 = delta[1,3,b,r]; x23 = delta[2,3,b,r]; x33 = delta[3,3,b,r]
+        x14 = delta[1,4,b,r]; x24 = delta[2,4,b,r]; x34 = delta[3,4,b,r]
+    end
+
+    a11=zero(ComplexF64); a21=zero(ComplexF64); a31=zero(ComplexF64)
+    a12=zero(ComplexF64); a22=zero(ComplexF64); a32=zero(ComplexF64)
+    a13=zero(ComplexF64); a23=zero(ComplexF64); a33=zero(ComplexF64)
+    a14=zero(ComplexF64); a24=zero(ComplexF64); a34=zero(ComplexF64)
+
+    for mu in Int32(1):Int32(4)
+        U = mu == Int32(1) ? U1 : (mu == Int32(2) ? U2 : (mu == Int32(3) ? U3 : U4))
+
+        bf, rf = _amg_shift_site(b, r, mu, Int32(1), blockinfo)
+        fac = _amg_bc_factor_site(b, r, mu, Int32(1), blockinfo)
+        @inbounds begin
+            xp11 = delta[1,1,bf,rf]*fac; xp21 = delta[2,1,bf,rf]*fac; xp31 = delta[3,1,bf,rf]*fac
+            xp12 = delta[1,2,bf,rf]*fac; xp22 = delta[2,2,bf,rf]*fac; xp32 = delta[3,2,bf,rf]*fac
+            xp13 = delta[1,3,bf,rf]*fac; xp23 = delta[2,3,bf,rf]*fac; xp33 = delta[3,3,bf,rf]*fac
+            xp14 = delta[1,4,bf,rf]*fac; xp24 = delta[2,4,bf,rf]*fac; xp34 = delta[3,4,bf,rf]*fac
+            u11=U[1,1,b,r]; u12=U[1,2,b,r]; u13=U[1,3,b,r]
+            u21=U[2,1,b,r]; u22=U[2,2,b,r]; u23=U[2,3,b,r]
+            u31=U[3,1,b,r]; u32=U[3,2,b,r]; u33=U[3,3,b,r]
+        end
+        t11 = u11*xp11 + u12*xp21 + u13*xp31; t21 = u21*xp11 + u22*xp21 + u23*xp31; t31 = u31*xp11 + u32*xp21 + u33*xp31
+        t12 = u11*xp12 + u12*xp22 + u13*xp32; t22 = u21*xp12 + u22*xp22 + u23*xp32; t32 = u31*xp12 + u32*xp22 + u33*xp32
+        t13 = u11*xp13 + u12*xp23 + u13*xp33; t23 = u21*xp13 + u22*xp23 + u23*xp33; t33 = u31*xp13 + u32*xp23 + u33*xp33
+        t14 = u11*xp14 + u12*xp24 + u13*xp34; t24 = u21*xp14 + u22*xp24 + u23*xp34; t34 = u31*xp14 + u32*xp24 + u33*xp34
+        p11,p12,p13,p14 = _amg_project_minus(mu, t11,t12,t13,t14)
+        p21,p22,p23,p24 = _amg_project_minus(mu, t21,t22,t23,t24)
+        p31,p32,p33,p34 = _amg_project_minus(mu, t31,t32,t33,t34)
+        a11 += κ*p11; a21 += κ*p21; a31 += κ*p31
+        a12 += κ*p12; a22 += κ*p22; a32 += κ*p32
+        a13 += κ*p13; a23 += κ*p23; a33 += κ*p33
+        a14 += κ*p14; a24 += κ*p24; a34 += κ*p34
+
+        bb, rb = _amg_shift_site(b, r, mu, -Int32(1), blockinfo)
+        fac = _amg_bc_factor_site(b, r, mu, -Int32(1), blockinfo)
+        @inbounds begin
+            xm11 = delta[1,1,bb,rb]*fac; xm21 = delta[2,1,bb,rb]*fac; xm31 = delta[3,1,bb,rb]*fac
+            xm12 = delta[1,2,bb,rb]*fac; xm22 = delta[2,2,bb,rb]*fac; xm32 = delta[3,2,bb,rb]*fac
+            xm13 = delta[1,3,bb,rb]*fac; xm23 = delta[2,3,bb,rb]*fac; xm33 = delta[3,3,bb,rb]*fac
+            xm14 = delta[1,4,bb,rb]*fac; xm24 = delta[2,4,bb,rb]*fac; xm34 = delta[3,4,bb,rb]*fac
+            v11=conj(U[1,1,bb,rb]); v12=conj(U[2,1,bb,rb]); v13=conj(U[3,1,bb,rb])
+            v21=conj(U[1,2,bb,rb]); v22=conj(U[2,2,bb,rb]); v23=conj(U[3,2,bb,rb])
+            v31=conj(U[1,3,bb,rb]); v32=conj(U[2,3,bb,rb]); v33=conj(U[3,3,bb,rb])
+        end
+        q11 = v11*xm11 + v12*xm21 + v13*xm31; q21 = v21*xm11 + v22*xm21 + v23*xm31; q31 = v31*xm11 + v32*xm21 + v33*xm31
+        q12 = v11*xm12 + v12*xm22 + v13*xm32; q22 = v21*xm12 + v22*xm22 + v23*xm32; q32 = v31*xm12 + v32*xm22 + v33*xm32
+        q13 = v11*xm13 + v12*xm23 + v13*xm33; q23 = v21*xm13 + v22*xm23 + v23*xm33; q33 = v31*xm13 + v32*xm23 + v33*xm33
+        q14 = v11*xm14 + v12*xm24 + v13*xm34; q24 = v21*xm14 + v22*xm24 + v23*xm34; q34 = v31*xm14 + v32*xm24 + v33*xm34
+        p11,p12,p13,p14 = _amg_project_plus(mu, q11,q12,q13,q14)
+        p21,p22,p23,p24 = _amg_project_plus(mu, q21,q22,q23,q24)
+        p31,p32,p33,p34 = _amg_project_plus(mu, q31,q32,q33,q34)
+        a11 += κ*p11; a21 += κ*p21; a31 += κ*p31
+        a12 += κ*p12; a22 += κ*p22; a32 += κ*p32
+        a13 += κ*p13; a23 += κ*p23; a33 += κ*p33
+        a14 += κ*p14; a24 += κ*p24; a34 += κ*p34
+    end
+
+    @inbounds begin
+        res[1,1,b,r] -= x11 - a11; res[2,1,b,r] -= x21 - a21; res[3,1,b,r] -= x31 - a31
+        res[1,2,b,r] -= x12 - a12; res[2,2,b,r] -= x22 - a22; res[3,2,b,r] -= x32 - a32
+        res[1,3,b,r] -= x13 - a13; res[2,3,b,r] -= x23 - a23; res[3,3,b,r] -= x33 - a33
+        res[1,4,b,r] -= x14 - a14; res[2,4,b,r] -= x24 - a24; res[3,4,b,r] -= x34 - a34
+    end
+    return nothing
+end
+
+function _amg_boundary8_residual_update!(res::WF3x1, delta::WF3x1, D,
+                                         setup::DDalphaAMG_Setup, step::Integer)
+    if !(res isa WF3x1GPU && delta isa WF3x1GPU && 0 <= step <= 7 &&
+         _amg_can_fuse_wilson(D, res, delta))
+        return false
+    end
+
+    affected_sites = _ensure_gpu_cache!(setup)[:boundary8_affected_sites][step + 1]
+    naffected = length(affected_sites)
+    naffected == 0 && return true
+    threads = 256
+    @cuda threads=threads blocks=cld(naffected, threads) _amg_boundary8_residual_update_kernel!(
+        res.f, delta.f, affected_sites,
+        D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
+        Float64(_amg_dirac_kappa(D)), res.blockinfo, Int32(naffected))
+    return true
+end
+
 function _amg_gamma5_kernel!(x, total_sites::Int32, nc::Int32, ng::Int32)
     site = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
     if site <= total_sites
@@ -1505,6 +2073,43 @@ function block_project!(f::WF3x1, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
                 for ix = 1:NX
                     if !(ix_lo <= ix <= ix_hi && iy_lo <= iy <= iy_hi &&
                          iz_lo <= iz <= iz_hi && it_lo <= it <= it_hi)
+                        for ig = 1:NG
+                            @simd for ic = 1:NC
+                                f[ic, ix, iy, iz, it, ig] = zero(ComplexF64)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return f
+end
+
+"""
+    block_parity_project!(f, bx, by, bz, bt, r, parity)
+
+Keep only fine-grid sites of the selected parity inside the selected block.
+The parity is `(x + y + z + t) & 1` in zero-based fine coordinates.
+"""
+function block_parity_project!(f::WF3x1, bx::Int, by::Int, bz::Int, bt::Int,
+                               r::Int, parity::Int)
+    NX, NY, NZ, NT = f.NX, f.NY, f.NZ, f.NT
+    NC, NG = f.NC, f.NG
+
+    ix_lo = (bx-1)*r + 1; ix_hi = bx*r
+    iy_lo = (by-1)*r + 1; iy_hi = by*r
+    iz_lo = (bz-1)*r + 1; iz_hi = bz*r
+    it_lo = (bt-1)*r + 1; it_hi = bt*r
+
+    @inbounds for it = 1:NT
+        for iz = 1:NZ
+            for iy = 1:NY
+                for ix = 1:NX
+                    keep = ix_lo <= ix <= ix_hi && iy_lo <= iy <= iy_hi &&
+                           iz_lo <= iz <= iz_hi && it_lo <= it <= it_hi &&
+                           (((ix - 1) + (iy - 1) + (iz - 1) + (it - 1)) & 1) == parity
+                    if !keep
                         for ig = 1:NG
                             @simd for ic = 1:NC
                                 f[ic, ix, iy, iz, it, ig] = zero(ComplexF64)
@@ -1649,6 +2254,17 @@ function block_project!(f::WF3x1GPU, bx::Int, by::Int, bz::Int, bt::Int, r::Int)
     bid = _gpu_bid(setup_like, bx, by, bz, bt)
     @cuda threads=256 blocks=cld(Int(total), 256) _amg_block_project_kernel!(
         reshape(f.f, :), cache[:bmap], nc_ng, total, bid, false, nothing)
+    return f
+end
+
+function block_parity_project!(f::WF3x1GPU, bx::Int, by::Int, bz::Int, bt::Int,
+                               r::Int, parity::Int)
+    setup_like, cache = _gpu_block_context_from_field(f, r)
+    nc_ng = Int32(size(f.f, 1) * size(f.f, 2))
+    total = Int32(length(f.f))
+    bid = _gpu_bid(setup_like, bx, by, bz, bt)
+    @cuda threads=256 blocks=cld(Int(total), 256) _amg_block_parity_project_kernel!(
+        reshape(f.f, :), cache[:bmap], nc_ng, total, bid, Int32(parity), f.blockinfo)
     return f
 end
 
@@ -2395,6 +3011,88 @@ function _amg_local_gmres_block_solve!(
     return δ
 end
 
+function _amg_apply_block_odd_even_schur!(
+        out::WF3x1, D, x_even::WF3x1,
+        bx::Int, by::Int, bz::Int, bt::Int, r_blk::Int,
+        odd_part::WF3x1, A_odd_part::WF3x1;
+        fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+        flop_counter::Union{Nothing,Ref{Int}}=nothing,
+        block_dofs::Int)
+    _amg_mul_dirac!(out, D, x_even; fine_apply_counter=fine_apply_counter)
+    block_project!(out, bx, by, bz, bt, r_blk)
+
+    block_copy!(odd_part, out, bx, by, bz, bt, r_blk)
+    block_parity_project!(odd_part, bx, by, bz, bt, r_blk, 1)
+
+    _amg_mul_dirac!(A_odd_part, D, odd_part; fine_apply_counter=fine_apply_counter)
+    block_project!(A_odd_part, bx, by, bz, bt, r_blk)
+
+    block_axpby!(-1, A_odd_part, 1, out, bx, by, bz, bt, r_blk)
+    block_parity_project!(out, bx, by, bz, bt, r_blk, 0)
+    _amg_count_flops!(flop_counter, 2 * _amg_complex_axpby_flops(block_dofs))
+    return out
+end
+
+function _amg_local_odd_even_mr_block_solve!(
+        δ::WF3x1, D, rhs::WF3x1,
+        bx::Int, by::Int, bz::Int, bt::Int, r_blk::Int, nblock_mr::Int,
+        local_b::WF3x1, b_odd::WF3x1, A_b_odd::WF3x1,
+        schur_r::WF3x1, schur_Ar::WF3x1,
+        odd_part::WF3x1, A_odd_part::WF3x1, delta_odd::WF3x1;
+        fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+        flop_counter::Union{Nothing,Ref{Int}}=nothing,
+        block_dofs::Int)
+    block_zero!(δ, bx, by, bz, bt, r_blk)
+
+    block_project!(local_b, bx, by, bz, bt, r_blk)
+    block_copy!(local_b, rhs, bx, by, bz, bt, r_blk)
+
+    # Schur RHS on even sites: b_e - A_eo A_oo^{-1} b_o.
+    block_copy!(b_odd, local_b, bx, by, bz, bt, r_blk)
+    block_parity_project!(b_odd, bx, by, bz, bt, r_blk, 1)
+    _amg_mul_dirac!(A_b_odd, D, b_odd; fine_apply_counter=fine_apply_counter)
+    block_project!(A_b_odd, bx, by, bz, bt, r_blk)
+
+    block_copy!(schur_r, local_b, bx, by, bz, bt, r_blk)
+    block_parity_project!(schur_r, bx, by, bz, bt, r_blk, 0)
+    block_axpby!(-1, A_b_odd, 1, schur_r, bx, by, bz, bt, r_blk)
+    block_parity_project!(schur_r, bx, by, bz, bt, r_blk, 0)
+    _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(block_dofs))
+
+    for _ = 1:nblock_mr
+        _amg_apply_block_odd_even_schur!(
+            schur_Ar, D, schur_r, bx, by, bz, bt, r_blk,
+            odd_part, A_odd_part;
+            fine_apply_counter=fine_apply_counter,
+            flop_counter=flop_counter,
+            block_dofs=block_dofs)
+
+        num = block_inner_product(schur_Ar, schur_r, bx, by, bz, bt, r_blk)
+        den = block_inner_product(schur_Ar, schur_Ar, bx, by, bz, bt, r_blk)
+        _amg_count_flops!(flop_counter, 2 * _amg_complex_dot_flops(block_dofs))
+        if abs(den) < 1e-30
+            break
+        end
+        α = num / den
+
+        block_axpby!(α, schur_r, 1, δ, bx, by, bz, bt, r_blk)
+        block_axpby!(-α, schur_Ar, 1, schur_r, bx, by, bz, bt, r_blk)
+        block_parity_project!(schur_r, bx, by, bz, bt, r_blk, 0)
+        _amg_count_flops!(flop_counter, 2 * _amg_complex_axpby_flops(block_dofs))
+    end
+
+    # Reconstruct odd part: x_o = A_oo^{-1}(b_o - A_oe x_e).
+    _amg_mul_dirac!(A_odd_part, D, δ; fine_apply_counter=fine_apply_counter)
+    block_project!(A_odd_part, bx, by, bz, bt, r_blk)
+    block_copy!(delta_odd, local_b, bx, by, bz, bt, r_blk)
+    block_axpby!(-1, A_odd_part, 1, delta_odd, bx, by, bz, bt, r_blk)
+    block_parity_project!(delta_odd, bx, by, bz, bt, r_blk, 1)
+    block_axpby!(1, delta_odd, 1, δ, bx, by, bz, bt, r_blk)
+    block_project!(δ, bx, by, bz, bt, r_blk)
+    _amg_count_flops!(flop_counter, 2 * _amg_complex_axpby_flops(block_dofs))
+    return δ
+end
+
 
 """
     sap_smooth!(x, D, b, setup; niter, block_solver, nblock_mr, nblock_gmres)
@@ -2409,21 +3107,40 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
                      block_solver::Symbol=:mr,
                      nblock_mr::Int=4,
                      nblock_gmres::Int=nblock_mr,
+                     odd_even::Bool=true,
+                     sap_schedule::Symbol=:boundary8,
+                     sparse_residual_update::Bool=true,
                      fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                      flop_counter::Union{Nothing,Ref{Int}}=nothing)
     block_solver in (:mr, :gmres) ||
         throw(ArgumentError("block_solver must be :mr or :gmres, got $block_solver"))
+    _amg_sap_schedule_code(sap_schedule)
+    if odd_even && block_solver != :mr
+        throw(ArgumentError("odd-even SAP is currently implemented for block_solver=:mr"))
+    end
     if x isa WF3x1GPU && b isa WF3x1GPU && _amg_can_fuse_wilson(D, x, x)
+        if odd_even
+            return _sap_smooth_gpu_odd_even_mr_batched!(x, D, b, setup;
+                                                        niter=niter,
+                                                        nblock_mr=nblock_mr,
+                                                        sap_schedule=sap_schedule,
+                                                        sparse_residual_update=sparse_residual_update,
+                                                        fine_apply_counter=fine_apply_counter,
+                                                        flop_counter=flop_counter)
+        end
         if block_solver == :mr
             return _sap_smooth_gpu_mr_batched!(x, D, b, setup;
                                                niter=niter,
                                                nblock_mr=nblock_mr,
+                                               sap_schedule=sap_schedule,
+                                               sparse_residual_update=sparse_residual_update,
                                                fine_apply_counter=fine_apply_counter,
                                                flop_counter=flop_counter)
         else
             return _sap_smooth_gpu_gmres_batched!(x, D, b, setup;
                                                   niter=niter,
                                                   nblock_gmres=nblock_gmres,
+                                                  sap_schedule=sap_schedule,
                                                   fine_apply_counter=fine_apply_counter,
                                                   flop_counter=flop_counter)
         end
@@ -2438,6 +3155,13 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
     Ddelta = similar(x)
     local_r = block_solver == :mr ? similar(x) : nothing
     Alr = block_solver == :mr ? similar(x) : nothing
+    oe_b_odd = odd_even ? similar(x) : nothing
+    oe_A_b_odd = odd_even ? similar(x) : nothing
+    oe_schur_r = odd_even ? similar(x) : nothing
+    oe_schur_Ar = odd_even ? similar(x) : nothing
+    oe_odd_part = odd_even ? similar(x) : nothing
+    oe_A_odd_part = odd_even ? similar(x) : nothing
+    oe_delta_odd = odd_even ? similar(x) : nothing
     gmres_V = block_solver == :gmres ? [similar(x) for _ in 1:(nblock_gmres + 1)] : WF3x1[]
     gmres_w = block_solver == :gmres ? similar(x) : nothing
     gmres_H = block_solver == :gmres ? zeros(ComplexF64, nblock_gmres + 1, nblock_gmres) : zeros(ComplexF64, 0, 0)
@@ -2450,15 +3174,24 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
         axpby!(1, b, -1, res)     # res = b - D*x
         _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
-        # Red-black SAP. Same-color blocks are independent for nearest-neighbor Wilson D.
-        for color in 0:1
+        # Boundary-aware red-black SAP follows the 8-list ordering used by DD-alphaAMG.
+        for step in _amg_sap_schedule_steps(sap_schedule)
             for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
-                ((bx + by + bz + bt) & 1) == color || continue
+                _amg_sap_block_step(bx, by, bz, bt, NBX, NBY, NBZ, NBT, sap_schedule) == step || continue
 
                 if block_solver == :gmres
                     _amg_local_gmres_block_solve!(
                         δ, D, res, bx, by, bz, bt, r_blk, nblock_gmres,
                         gmres_V, gmres_w::WF3x1, gmres_H, gmres_e1;
+                        fine_apply_counter=fine_apply_counter,
+                        flop_counter=flop_counter,
+                        block_dofs=block_dofs)
+                elseif odd_even
+                    _amg_local_odd_even_mr_block_solve!(
+                        δ, D, res, bx, by, bz, bt, r_blk, nblock_mr,
+                        local_r::WF3x1, oe_b_odd::WF3x1, oe_A_b_odd::WF3x1,
+                        oe_schur_r::WF3x1, oe_schur_Ar::WF3x1,
+                        oe_odd_part::WF3x1, oe_A_odd_part::WF3x1, oe_delta_odd::WF3x1;
                         fine_apply_counter=fine_apply_counter,
                         flop_counter=flop_counter,
                         block_dofs=block_dofs)
@@ -2498,9 +3231,63 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
     return x
 end
 
+function _amg_initial_inverse_smooth!(test_vectors::Vector{T}, D,
+                                      setup::DDalphaAMG_Setup;
+                                      smoother::Symbol=:sap,
+                                      nstages::Int=3,
+                                      block_solver::Symbol=:mr,
+                                      nblock_mr::Int=4,
+                                      nblock_gmres::Int=nblock_mr,
+                                      sap_schedule::Symbol=:boundary8,
+                                      fine_apply_counter::Union{Nothing,Ref{Int}}=nothing) where {T<:WF3x1}
+    nstages > 0 || throw(ArgumentError("nstages must be positive, got $nstages"))
+    _amg_sap_schedule_code(sap_schedule)
+    work = similar(test_vectors[1])
+    for v in eachindex(test_vectors)
+        for stage in 1:nstages
+            zero_wf!(work)
+            if smoother == :sap
+                sap_smooth!(work, D, test_vectors[v], setup;
+                            niter=stage,
+                            block_solver=block_solver,
+                            nblock_mr=nblock_mr,
+                            nblock_gmres=nblock_gmres,
+                            sap_schedule=sap_schedule,
+                            fine_apply_counter=fine_apply_counter)
+            elseif smoother == :mr
+                mr_smooth!(work, D, test_vectors[v];
+                           niter=stage,
+                           fine_apply_counter=fine_apply_counter)
+            else
+                throw(ArgumentError("initial inverse smoother must be :sap or :mr, got $smoother"))
+            end
+            LatticeDiracOperators.substitute_fermion!(test_vectors[v], work)
+        end
+        normalize_fermion!(test_vectors[v])
+    end
+    return test_vectors
+end
+
 # ==========================================
 #  Coarse Grid Solver: GMRES
 # ==========================================
+
+function _ensure_gpu_coarse_arnoldi_cache!(setup::DDalphaAMG_Setup,
+                                           ncoarse::Int, restart::Int)
+    cache = _ensure_gpu_cache!(setup)
+    needs_allocation = get(cache, :coarse_arnoldi_n, 0) != ncoarse ||
+                       get(cache, :coarse_arnoldi_restart, 0) != restart
+    if needs_allocation
+        cache[:coarse_arnoldi_basis] = CUDA.zeros(ComplexF64, ncoarse, restart + 1)
+        cache[:coarse_arnoldi_coeff_dev] = CUDA.zeros(ComplexF64, 2restart)
+        cache[:coarse_arnoldi_coeff_host] = zeros(ComplexF64, restart)
+        cache[:coarse_arnoldi_n] = ncoarse
+        cache[:coarse_arnoldi_restart] = restart
+    end
+    return cache[:coarse_arnoldi_basis],
+           cache[:coarse_arnoldi_coeff_dev],
+           cache[:coarse_arnoldi_coeff_host]
+end
 
 """
     coarse_gmres(setup, D, b_c; maxiter, restart, tol, coarse_apply_counter) -> CoarseVector
@@ -2510,40 +3297,85 @@ through a precomputed coarse operator or matrix-free as `R * D * P`.
 """
 function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
                       maxiter::Int=20, restart::Int=20, tol::Float64=1e-2,
+                      coarse_odd_even::Bool=true,
+                      arnoldi_mode::Symbol=:auto,
                       coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                       flop_counter::Union{Nothing,Ref{Int}}=nothing,
                       profile::Union{Nothing,AMGProfile}=nothing)
-    x_c = similar(b_c)
-    zero!(x_c)
-    b_norm = _amg_profile_time!(profile, :coarse_rhs_norm) do
-        coarse_norm(b_c)
-    end
-    ncoarse = length(b_c.data)
-    _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
-    if b_norm < 1e-30
-        return x_c
-    end
+    arnoldi_mode in (:auto, :scalar, :batched) ||
+        throw(ArgumentError("arnoldi_mode must be :auto, :scalar, or :batched"))
     has_Dc = setup.Dc_matrix !== nothing
     has_stencil = setup.coarse_stencil !== nothing
+    op = has_stencil ? setup.coarse_stencil::CoarseStencilOperator : nothing
+    use_odd_even = coarse_odd_even && has_stencil && _amg_can_coarse_odd_even(op)
 
     # Allocate a fine-grid buffer only when no precomputed operator is available.
     local fine_buf1, fine_buf2
-    if !has_Dc
+    if !has_Dc && !has_stencil
         fine_buf1 = similar(setup.test_vectors[1])
         fine_buf2 = similar(setup.test_vectors[1])
     end
-    m = ensure_coarse_gmres_cache!(setup, b_c, restart)
+
+    x_c = similar(b_c)
+    zero!(x_c)
+    rhs_c = b_c
+    local oe_self_inv, oe_tmp1, oe_tmp2, oe_tmp3, oe_rhs
+    if use_odd_even
+        oe_self_inv = _amg_profile_time!(profile, :coarse_odd_even_invert_diagonal) do
+            _amg_coarse_self_inverse!(setup, op)
+        end
+        oe_tmp1 = similar(b_c)
+        oe_tmp2 = similar(b_c)
+        oe_tmp3 = similar(b_c)
+        oe_rhs = similar(b_c)
+        _amg_profile_time!(profile, :coarse_odd_even_rhs) do
+            _amg_coarse_odd_even_rhs!(oe_rhs, op, oe_self_inv, b_c, oe_tmp1, oe_tmp2, oe_tmp3)
+        end
+        rhs_c = oe_rhs
+    end
+
+    b_norm = _amg_profile_time!(profile, :coarse_rhs_norm) do
+        coarse_norm(rhs_c)
+    end
+    ncoarse = length(rhs_c.data)
+    _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
+
+    if b_norm < 1e-30
+        if use_odd_even
+            result = similar(x_c)
+            _amg_coarse_odd_even_reconstruct!(result, op, oe_self_inv, x_c, b_c,
+                                              oe_tmp1, oe_tmp2, oe_tmp3)
+            return result
+        end
+        return x_c
+    end
+
+    m = ensure_coarse_gmres_cache!(setup, rhs_c, restart)
     V = setup._gmres_V
     w_c = setup._gmres_w::CoarseVector
     r_c = setup._gmres_r::CoarseVector
     H = setup._gmres_H
-    e1 = setup._gmres_e1
+    gamma = setup._gmres_e1
+    givens_c = zeros(ComplexF64, m)
+    givens_s = zeros(ComplexF64, m)
+    y = zeros(ComplexF64, m)
+    use_batched_arnoldi = rhs_c.data isa CuArray && arnoldi_mode != :scalar
+    if arnoldi_mode == :batched && !(rhs_c.data isa CuArray)
+        throw(ArgumentError("arnoldi_mode=:batched requires GPU coarse vectors"))
+    end
+    local arnoldi_basis, arnoldi_coeff_dev, arnoldi_coeff_host
+    if use_batched_arnoldi
+        arnoldi_basis, arnoldi_coeff_dev, arnoldi_coeff_host =
+            _ensure_gpu_coarse_arnoldi_cache!(setup, ncoarse, m)
+    end
 
     # Helper for coarse-operator application.
     @inline function apply_Dc!(w, v)
         _amg_profile_time!(profile, :coarse_apply) do
-            if has_stencil
-                apply_coarse_stencil!(w, setup.coarse_stencil, v)
+            if use_odd_even
+                _amg_apply_coarse_odd_even_schur!(w, op, oe_self_inv, v, oe_tmp1, oe_tmp2, oe_tmp3)
+            elseif has_stencil
+                apply_coarse_stencil!(w, op, v)
             elseif has_Dc
                 mul!(w.data, setup.Dc_matrix, v.data)
             else
@@ -2553,63 +3385,133 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         coarse_apply_counter !== nothing && (coarse_apply_counter[] += 1)
     end
 
-    for iter = 1:maxiter
-        # residual: r = b - Dc*x
-        r_c.data .= b_c.data
-        apply_Dc!(w_c, x_c)
-        _amg_profile_time!(profile, :coarse_residual_axpby) do
-            coarse_axpby!(-1.0, w_c, 1.0, r_c)
+    @inline function finalize_solution!(x)
+        use_odd_even || return x
+        result = similar(x)
+        _amg_profile_time!(profile, :coarse_odd_even_reconstruct) do
+            _amg_coarse_odd_even_reconstruct!(result, op, oe_self_inv, x, b_c,
+                                              oe_tmp1, oe_tmp2, oe_tmp3)
         end
-        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
+        return result
+    end
+
+    for iter = 1:maxiter
+
+        # residual: r = b - Dc*x
+        if iter == 1
+            r_c.data .= rhs_c.data
+        else
+            r_c.data .= rhs_c.data
+            apply_Dc!(w_c, x_c)
+            _amg_profile_time!(profile, :coarse_residual_axpby) do
+                coarse_axpby!(-1.0, w_c, 1.0, r_c)
+            end
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
+        end
 
         β = _amg_profile_time!(profile, :coarse_residual_norm) do
             coarse_norm(r_c)
         end
         _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
         if β / b_norm < tol
-            return x_c
+            return finalize_solution!(x_c)
         end
 
         # Arnoldi process
         fill!(H, zero(ComplexF64))
+        fill!(gamma, zero(ComplexF64))
+        fill!(givens_c, zero(ComplexF64))
+        fill!(givens_s, zero(ComplexF64))
         V[1].data .= r_c.data ./ β
+        if use_batched_arnoldi
+            view(arnoldi_basis, :, 1) .= V[1].data
+        end
+        gamma[1] = β
         _amg_count_flops!(flop_counter, 2 * ncoarse)
 
-        j_final = m
+        j_final = 0
+        converged = false
         for j = 1:m
+
             apply_Dc!(w_c, V[j])
 
-            # Modified Gram-Schmidt
-            for i = 1:j
-                H[i,j] = _amg_profile_time!(profile, :coarse_mgs_dot) do
-                    coarse_dot(V[i], w_c)
+            if use_batched_arnoldi
+                H[j+1,j] = _amg_profile_time!(profile, :coarse_batched_mgs) do
+                    _amg_gpu_batched_orthogonalize!(
+                        w_c.data, arnoldi_basis, j,
+                        arnoldi_coeff_dev, arnoldi_coeff_host)
                 end
-                _amg_profile_time!(profile, :coarse_mgs_axpby) do
-                    coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
+                @inbounds for i in 1:j
+                    H[i,j] = arnoldi_coeff_host[i]
                 end
                 _amg_count_flops!(flop_counter,
-                    _amg_complex_dot_flops(ncoarse) + _amg_complex_axpby_flops(ncoarse))
-            end
-            H[j+1,j] = _amg_profile_time!(profile, :coarse_mgs_norm) do
-                coarse_norm(w_c)
+                    2j * (_amg_complex_dot_flops(ncoarse) +
+                          _amg_complex_axpby_flops(ncoarse)))
+            else
+                # Modified Gram-Schmidt
+                for i = 1:j
+                    H[i,j] = _amg_profile_time!(profile, :coarse_mgs_dot) do
+                        coarse_dot(V[i], w_c)
+                    end
+                    _amg_profile_time!(profile, :coarse_mgs_axpby) do
+                        coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
+                    end
+                    _amg_count_flops!(flop_counter,
+                        _amg_complex_dot_flops(ncoarse) + _amg_complex_axpby_flops(ncoarse))
+                end
+                H[j+1,j] = _amg_profile_time!(profile, :coarse_mgs_norm) do
+                    coarse_norm(w_c)
+                end
             end
             _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
 
-            if abs(H[j+1,j]) < 1e-14
-                j_final = j
+            j_final = j
+            if abs(H[j+1,j]) <= tol / 10
+                converged = true
                 break
             end
             _amg_profile_time!(profile, :coarse_mgs_normalize) do
                 V[j+1].data .= w_c.data ./ H[j+1,j]
             end
+            if use_batched_arnoldi
+                view(arnoldi_basis, :, j + 1) .= V[j+1].data
+            end
             _amg_count_flops!(flop_counter, 2 * ncoarse)
+
+            _amg_profile_time!(profile, :coarse_givens_update) do
+                for i = 1:(j - 1)
+                    tmp = -givens_s[i] * H[i,j] + givens_c[i] * H[i+1,j]
+                    H[i,j] = conj(givens_c[i]) * H[i,j] + conj(givens_s[i]) * H[i+1,j]
+                    H[i+1,j] = tmp
+                end
+
+                denom = sqrt(abs2(H[j,j]) + abs2(H[j+1,j]))
+                givens_s[j] = H[j+1,j] / denom
+                givens_c[j] = H[j,j] / denom
+                gamma[j+1] = -givens_s[j] * gamma[j]
+                gamma[j] = conj(givens_c[j]) * gamma[j]
+                H[j,j] = denom
+                H[j+1,j] = zero(ComplexF64)
+            end
+            _amg_count_flops!(flop_counter, 6 * j + 6)
+
+            if abs(gamma[j+1]) / b_norm < tol
+                converged = true
+                j_final = j
+                break
+            end
         end
 
-        # Least-squares solve: min ||beta*e1 - H*y||.
-        fill!(e1, zero(ComplexF64))
-        e1[1] = β
-        y = _amg_profile_time!(profile, :coarse_lstsq) do
-            H[1:j_final+1, 1:j_final] \ view(e1, 1:j_final+1)
+        # Back-substitution on the incrementally updated triangular GMRES system.
+        fill!(y, zero(ComplexF64))
+        _amg_profile_time!(profile, :coarse_backsolve) do
+            for i = j_final:-1:1
+                y[i] = gamma[i]
+                for k = (i + 1):j_final
+                    y[i] -= H[i,k] * y[k]
+                end
+                y[i] /= H[i,i]
+            end
         end
         _amg_count_flops!(flop_counter, 16 * j_final^3)
 
@@ -2620,8 +3522,10 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
             _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(ncoarse))
         end
 
+        converged && return finalize_solution!(x_c)
+
         # Convergence check
-        r_c.data .= b_c.data
+        r_c.data .= rhs_c.data
         apply_Dc!(w_c, x_c)
         _amg_profile_time!(profile, :coarse_check_axpby) do
             coarse_axpby!(-1.0, w_c, 1.0, r_c)
@@ -2633,11 +3537,11 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
         # println("res:$(res),iter:$(iter)")
         if res < tol
-            return x_c
+            return finalize_solution!(x_c)
         end
     end
 
-    return x_c
+    return finalize_solution!(x_c)
 end
 
 
@@ -2658,9 +3562,16 @@ Steps:
 5. Post-smooth on the fine grid.
 """
 function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
-                pre_smooth::Int=4, post_smooth::Int=4,
-                coarse_maxiter::Int=50, coarse_tol::Float64=1e-2,
-                smoother::Symbol=:mr,
+                pre_smooth::Int=0, post_smooth::Int=2,
+                sap_block_mr_steps::Int=4,
+                coarse_maxiter::Int=50, coarse_restart::Int=30,
+                coarse_tol::Float64=5e-2,
+                smoother::Symbol=:sap,
+                coarse_odd_even::Bool=true,
+                sap_odd_even::Bool=true,
+                sap_schedule::Symbol=:boundary8,
+                sparse_residual_update::Bool=true,
+                coarse_arnoldi_mode::Symbol=:auto,
                 coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                 fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                 flop_counter::Union{Nothing,Ref{Int}}=nothing,
@@ -2674,16 +3585,21 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
     r_coarse = _coarse_vector(setup)
 
     # 1. Pre-smoothing
-    _amg_profile_time!(profile, :vcycle_pre_smooth) do
-        if smoother == :sap
-            sap_smooth!(x, D, b, setup; niter=1,
-                        block_solver=:mr, nblock_mr=pre_smooth,
-                        fine_apply_counter=fine_apply_counter,
-                        flop_counter=flop_counter)
-        else
-            mr_smooth!(x, D, b; niter=pre_smooth,
-                       fine_apply_counter=fine_apply_counter,
-                       flop_counter=flop_counter)
+    if pre_smooth > 0
+        _amg_profile_time!(profile, :vcycle_pre_smooth) do
+            if smoother == :sap
+                sap_smooth!(x, D, b, setup; niter=pre_smooth,
+                            block_solver=:mr, nblock_mr=sap_block_mr_steps,
+                            odd_even=sap_odd_even,
+                            sap_schedule=sap_schedule,
+                            sparse_residual_update=sparse_residual_update,
+                            fine_apply_counter=fine_apply_counter,
+                            flop_counter=flop_counter)
+            else
+                mr_smooth!(x, D, b; niter=pre_smooth,
+                           fine_apply_counter=fine_apply_counter,
+                           flop_counter=flop_counter)
+            end
         end
     end
 
@@ -2699,7 +3615,9 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
     # 3. Coarse-grid solve.
     e_coarse = _amg_profile_time!(profile, :coarse_gmres_total) do
         coarse_gmres(setup, D, r_coarse;
-                     maxiter=coarse_maxiter, tol=coarse_tol,
+                     maxiter=coarse_maxiter, restart=coarse_restart, tol=coarse_tol,
+                     coarse_odd_even=coarse_odd_even,
+                     arnoldi_mode=coarse_arnoldi_mode,
                      coarse_apply_counter=coarse_apply_counter,
                      flop_counter=flop_counter,
                      profile=profile)
@@ -2714,16 +3632,21 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
     _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(b)))
 
     # 5. Post-smoothing
-    _amg_profile_time!(profile, :vcycle_post_smooth) do
-        if smoother == :sap
-            sap_smooth!(x, D, b, setup; niter=1,
-                        block_solver=:mr, nblock_mr=post_smooth,
-                        fine_apply_counter=fine_apply_counter,
-                        flop_counter=flop_counter)
-        else
-            mr_smooth!(x, D, b; niter=post_smooth,
-                       fine_apply_counter=fine_apply_counter,
-                       flop_counter=flop_counter)
+    if post_smooth > 0
+        _amg_profile_time!(profile, :vcycle_post_smooth) do
+            if smoother == :sap
+                sap_smooth!(x, D, b, setup; niter=post_smooth,
+                            block_solver=:mr, nblock_mr=sap_block_mr_steps,
+                            odd_even=sap_odd_even,
+                            sap_schedule=sap_schedule,
+                            sparse_residual_update=sparse_residual_update,
+                            fine_apply_counter=fine_apply_counter,
+                            flop_counter=flop_counter)
+            else
+                mr_smooth!(x, D, b; niter=post_smooth,
+                           fine_apply_counter=fine_apply_counter,
+                           flop_counter=flop_counter)
+            end
         end
     end
 
@@ -2732,6 +3655,8 @@ end
 
 function _sap_smooth_gpu_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalphaAMG_Setup;
                                      niter::Int=1, nblock_mr::Int=4,
+                                     sap_schedule::Symbol=:boundary8,
+                                     sparse_residual_update::Bool=true,
                                      fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                                      flop_counter::Union{Nothing,Ref{Int}}=nothing)
     cache = _ensure_gpu_cache!(setup)
@@ -2740,7 +3665,8 @@ function _sap_smooth_gpu_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalpha
     nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
     threads = 256
     grid = cld(Int(total), threads)
-    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ)
+    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ); NBT = Int32(setup.NBT)
+    schedule_code = _amg_sap_schedule_code(sap_schedule)
 
     delta = similar(x)
     local_r = similar(x)
@@ -2756,38 +3682,150 @@ function _sap_smooth_gpu_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalpha
         axpby!(1, b, -1, res)
         _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
-        for color in Int32(0):Int32(1)
+        for step_i in _amg_sap_schedule_steps(sap_schedule)
+            step = Int32(step_i)
             @cuda threads=threads blocks=grid _amg_init_color_fields_kernel!(
                 reshape(delta.f, :), reshape(local_r.f, :), reshape(res.f, :),
-                cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+                cache[:bmap], nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code)
 
             for _ in 1:nblock_mr
                 @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
                     Alr.f, local_r.f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
-                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, color, NBX, NBY, NBZ)
+                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, step, NBX, NBY, NBZ, NBT, schedule_code)
 
                 @cuda threads=threads blocks=setup.Nblocks shmem=(2 * threads * sizeof(ComplexF64)) _amg_block_mr_dot_kernel!(
                     num, den, reshape(Alr.f, :), reshape(local_r.f, :),
-                    cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ)
+                    cache[:block_sites], cache[:block_counts], nc_ng, step, NBX, NBY, NBZ, NBT, schedule_code)
                 _amg_count_flops!(flop_counter,
                     2 * setup.Nblocks * _amg_complex_dot_flops(block_dofs))
 
                 @cuda threads=threads blocks=grid _amg_block_mr_update_kernel!(
                     reshape(delta.f, :), reshape(local_r.f, :), reshape(Alr.f, :),
-                    num, den, cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+                    num, den, cache[:bmap], nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code)
                 _amg_count_flops!(flop_counter,
                     2 * setup.Nblocks * _amg_complex_axpby_flops(block_dofs))
             end
 
             @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
                 reshape(x.f, :), reshape(delta.f, :), cache[:bmap],
-                nc_ng, total, color, NBX, NBY, NBZ)
+                nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code)
             _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
-            _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
-            @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
-                reshape(res.f, :), reshape(Ddelta.f, :))
+            handled = sparse_residual_update && sap_schedule == :boundary8 &&
+                      _amg_boundary8_residual_update!(res, delta, D, setup, step_i)
+            if !handled
+                _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
+                @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
+                    reshape(res.f, :), reshape(Ddelta.f, :))
+                _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+            end
+        end
+    end
+    return x
+end
+
+function _sap_smooth_gpu_odd_even_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
+                                              setup::DDalphaAMG_Setup;
+                                              niter::Int=1, nblock_mr::Int=4,
+                                              sap_schedule::Symbol=:boundary8,
+                                              sparse_residual_update::Bool=true,
+                                              fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                                              flop_counter::Union{Nothing,Ref{Int}}=nothing)
+    cache = _ensure_gpu_cache!(setup)
+    bi = x.blockinfo
+    total = Int32(length(x.f))
+    nc_ng = Int32(size(x.f, 1) * size(x.f, 2))
+    threads = 256
+    grid = cld(Int(total), threads)
+    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ); NBT = Int32(setup.NBT)
+    schedule_code = _amg_sap_schedule_code(sap_schedule)
+
+    delta = similar(x)
+    schur_r = similar(x)
+    b_odd = similar(x)
+    A_b_odd = similar(x)
+    schur_Ar = similar(x)
+    odd_part = similar(x)
+    A_odd_part = similar(x)
+    res = similar(x)
+    Ddelta = similar(x)
+    num = CUDA.zeros(ComplexF64, setup.Nblocks)
+    den = CUDA.zeros(ComplexF64, setup.Nblocks)
+    block_dofs = setup.r^4 * setup.NC * setup.NG
+
+    for _ in 1:niter
+        _amg_mul_dirac!(res, D, x; fine_apply_counter=fine_apply_counter)
+        axpby!(1, b, -1, res)
+        _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+        for step_i in _amg_sap_schedule_steps(sap_schedule)
+            step = Int32(step_i)
+            @cuda threads=threads blocks=grid _amg_oe_init_fields_kernel!(
+                reshape(delta.f, :), reshape(schur_r.f, :), reshape(b_odd.f, :),
+                reshape(res.f, :), cache[:bmap], nc_ng, total, step,
+                NBX, NBY, NBZ, NBT, schedule_code, bi)
+
+            @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
+                A_b_odd.f, b_odd.f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
+                cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, step, NBX, NBY, NBZ, NBT, schedule_code)
+
+            @cuda threads=threads blocks=grid _amg_oe_sub_even_kernel!(
+                reshape(schur_r.f, :), reshape(A_b_odd.f, :), cache[:bmap],
+                nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code, bi)
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(block_dofs * setup.Nblocks ÷ 2))
+
+            for _ in 1:nblock_mr
+                @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
+                    schur_Ar.f, schur_r.f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
+                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, step, NBX, NBY, NBZ, NBT, schedule_code)
+
+                @cuda threads=threads blocks=grid _amg_oe_extract_odd_kernel!(
+                    reshape(odd_part.f, :), reshape(schur_Ar.f, :), cache[:bmap],
+                    nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code, bi)
+
+                @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
+                    A_odd_part.f, odd_part.f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
+                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, step, NBX, NBY, NBZ, NBT, schedule_code)
+
+                @cuda threads=threads blocks=grid _amg_oe_finish_schur_kernel!(
+                    reshape(schur_Ar.f, :), reshape(A_odd_part.f, :), cache[:bmap],
+                    nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code, bi)
+
+                @cuda threads=threads blocks=setup.Nblocks shmem=(2 * threads * sizeof(ComplexF64)) _amg_block_mr_dot_kernel!(
+                    num, den, reshape(schur_Ar.f, :), reshape(schur_r.f, :),
+                    cache[:block_sites], cache[:block_counts], nc_ng, step, NBX, NBY, NBZ, NBT, schedule_code)
+                _amg_count_flops!(flop_counter,
+                    2 * setup.Nblocks * _amg_complex_dot_flops(block_dofs ÷ 2))
+
+                @cuda threads=threads blocks=grid _amg_block_mr_update_kernel!(
+                    reshape(delta.f, :), reshape(schur_r.f, :), reshape(schur_Ar.f, :),
+                    num, den, cache[:bmap], nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code)
+                _amg_count_flops!(flop_counter,
+                    2 * setup.Nblocks * _amg_complex_axpby_flops(block_dofs ÷ 2))
+            end
+
+            @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
+                A_odd_part.f, delta.f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
+                cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, step, NBX, NBY, NBZ, NBT, schedule_code)
+
+            @cuda threads=threads blocks=grid _amg_oe_reconstruct_odd_kernel!(
+                reshape(delta.f, :), reshape(b_odd.f, :), reshape(A_odd_part.f, :),
+                cache[:bmap], nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code, bi)
+            _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(block_dofs * setup.Nblocks ÷ 2))
+
+            @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
+                reshape(x.f, :), reshape(delta.f, :), cache[:bmap],
+                nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code)
             _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+
+            handled = sparse_residual_update && sap_schedule == :boundary8 &&
+                      _amg_boundary8_residual_update!(res, delta, D, setup, step_i)
+            if !handled
+                _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
+                @cuda threads=threads blocks=grid _amg_sub_field_kernel!(
+                    reshape(res.f, :), reshape(Ddelta.f, :))
+                _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
+            end
         end
     end
     return x
@@ -2807,10 +3845,16 @@ iterations, which is useful for nonlinear or inexact V-cycles.
 """
 function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 x0::Union{Nothing,WF3x1}=nothing,
-                maxiter::Int=100, restart::Int=20, tol::Float64=1e-10,
-                verbose::Bool=true, smoother::Symbol=:mr,
-                pre_smooth::Int=4, post_smooth::Int=4,
-                coarse_tol::Float64=1e-1,
+                maxiter::Int=100, restart::Int=25, tol::Float64=1e-10,
+                verbose::Bool=true, smoother::Symbol=:sap,
+                pre_smooth::Int=0, post_smooth::Int=2,
+                sap_block_mr_steps::Int=4,
+                coarse_tol::Float64=5e-2,
+                coarse_maxiter::Int=50,
+                coarse_restart::Int=30,
+                coarse_odd_even::Bool=true,
+                sap_odd_even::Bool=true,
+                sap_schedule::Symbol=:boundary8,
                 profile::Bool=false,
                 profile_synchronize::Bool=true)
 
@@ -2888,7 +3932,13 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
             Z[j] = _amg_profile_time!(_profile, :vcycle_total) do
                 vcycle(D, V[j], setup;
                        pre_smooth=pre_smooth, post_smooth=post_smooth,
+                       sap_block_mr_steps=sap_block_mr_steps,
+                       coarse_maxiter=coarse_maxiter,
+                       coarse_restart=coarse_restart,
                        coarse_tol=coarse_tol, smoother=smoother,
+                       coarse_odd_even=coarse_odd_even,
+                       sap_odd_even=sap_odd_even,
+                       sap_schedule=sap_schedule,
                        coarse_apply_counter=_coarse_apply_counter,
                        fine_apply_counter=_fine_apply_counter,
                        flop_counter=_variable_vector_flop_counter,
@@ -3042,6 +4092,7 @@ end
 function _sap_smooth_gpu_gmres_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
                                         setup::DDalphaAMG_Setup;
                                         niter::Int=1, nblock_gmres::Int=4,
+                                        sap_schedule::Symbol=:boundary8,
                                         fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                                         flop_counter::Union{Nothing,Ref{Int}}=nothing)
     cache = _ensure_gpu_cache!(setup)
@@ -3051,7 +4102,8 @@ function _sap_smooth_gpu_gmres_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
     threads = 256
     grid = cld(Int(total), threads)
     block_grid = cld(setup.Nblocks, threads)
-    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ)
+    NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ); NBT = Int32(setup.NBT)
+    schedule_code = _amg_sap_schedule_code(sap_schedule)
     m = Int32(nblock_gmres)
     mplus = Int32(nblock_gmres + 1)
 
@@ -3066,10 +4118,11 @@ function _sap_smooth_gpu_gmres_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
     coeff = CUDA.zeros(ComplexF64, setup.Nblocks)
     ydev = CUDA.zeros(ComplexF64, nblock_gmres * setup.Nblocks)
 
-    active_by_color = [
-        [_amg_block_color_from_bid(bid, setup.NBX, setup.NBY, setup.NBZ) == color
+    active_by_step = [
+        [_amg_sap_block_step_from_bid(bid, setup.NBX, setup.NBY, setup.NBZ, setup.NBT,
+                                      Int(schedule_code)) == step
          for bid in 1:setup.Nblocks]
-        for color in 0:1
+        for step in _amg_sap_schedule_steps(sap_schedule)
     ]
 
     for _ in 1:niter
@@ -3077,37 +4130,37 @@ function _sap_smooth_gpu_gmres_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
         axpby!(1, b, -1, res)
         _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
-        for color_i in 0:1
-            color = Int32(color_i)
+        for (step_index, step_i) in enumerate(_amg_sap_schedule_steps(sap_schedule))
+            step = Int32(step_i)
             fill!(H, zero(ComplexF64))
             fill!(ydev, zero(ComplexF64))
 
             @cuda threads=threads blocks=grid _amg_init_color_fields_kernel!(
                 reshape(δ.f, :), reshape(V[1].f, :), reshape(res.f, :),
-                cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ)
+                cache[:bmap], nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code)
 
             @cuda threads=threads blocks=setup.Nblocks shmem=(threads * sizeof(ComplexF64)) _amg_color_block_dot_kernel!(
                 dotbuf, reshape(V[1].f, :), reshape(V[1].f, :),
-                cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ)
+                cache[:block_sites], cache[:block_counts], nc_ng, step, NBX, NBY, NBZ, NBT, schedule_code)
             @cuda threads=threads blocks=block_grid _amg_color_invnorm_from_vec_kernel!(
-                coeff, beta, dotbuf, color, NBX, NBY, NBZ)
+                coeff, beta, dotbuf, step, NBX, NBY, NBZ, NBT, schedule_code)
             @cuda threads=threads blocks=grid _amg_color_block_axpby_coeff_kernel!(
                 reshape(V[1].f, :), reshape(V[1].f, :), coeff, cache[:bmap],
-                nc_ng, total, color, NBX, NBY, NBZ, ComplexF64(1.0), ComplexF64(0.0))
+                nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code, ComplexF64(1.0), ComplexF64(0.0))
 
             for j in 1:nblock_gmres
                 @cuda threads=bi.blocksize blocks=bi.rsize _amg_local_wilson_block_kernel!(
                     w.f, V[j].f, D.U[1].U, D.U[2].U, D.U[3].U, D.U[4].U,
-                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, color, NBX, NBY, NBZ)
+                    cache[:bmap], Float64(_amg_dirac_kappa(D)), bi, step, NBX, NBY, NBZ, NBT, schedule_code)
 
                 for i in 1:j
                     @cuda threads=threads blocks=setup.Nblocks shmem=(threads * sizeof(ComplexF64)) _amg_color_block_dot_h_kernel!(
                         H, Int32(i), Int32(j), reshape(V[i].f, :), reshape(w.f, :),
-                        cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ,
+                        cache[:block_sites], cache[:block_counts], nc_ng, step, NBX, NBY, NBZ, NBT, schedule_code,
                         mplus, m)
                     @cuda threads=threads blocks=grid _amg_color_block_axpby_h_kernel!(
                         reshape(w.f, :), reshape(V[i].f, :), H, Int32(i), Int32(j),
-                        cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ,
+                        cache[:bmap], nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code,
                         mplus, m, ComplexF64(-1.0), ComplexF64(1.0))
                     _amg_count_flops!(flop_counter,
                         setup.Nblocks * (_amg_complex_dot_flops(setup.r^4 * setup.NC * setup.NG) +
@@ -3116,17 +4169,17 @@ function _sap_smooth_gpu_gmres_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
 
                 @cuda threads=threads blocks=setup.Nblocks shmem=(threads * sizeof(ComplexF64)) _amg_color_block_dot_h_kernel!(
                     H, Int32(j + 1), Int32(j), reshape(w.f, :), reshape(w.f, :),
-                    cache[:block_sites], cache[:block_counts], nc_ng, color, NBX, NBY, NBZ,
+                    cache[:block_sites], cache[:block_counts], nc_ng, step, NBX, NBY, NBZ, NBT, schedule_code,
                     mplus, m)
                 @cuda threads=threads blocks=block_grid _amg_color_invnorm_from_h_kernel!(
-                    coeff, H, Int32(j + 1), Int32(j), color, NBX, NBY, NBZ, mplus, m)
+                    coeff, H, Int32(j + 1), Int32(j), step, NBX, NBY, NBZ, NBT, schedule_code, mplus, m)
                 _amg_count_flops!(flop_counter,
                     setup.Nblocks * _amg_complex_norm_flops(setup.r^4 * setup.NC * setup.NG))
 
                 if j < nblock_gmres
                     @cuda threads=threads blocks=grid _amg_color_block_axpby_coeff_kernel!(
                         reshape(V[j + 1].f, :), reshape(w.f, :), coeff, cache[:bmap],
-                        nc_ng, total, color, NBX, NBY, NBZ, ComplexF64(1.0), ComplexF64(0.0))
+                        nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code, ComplexF64(1.0), ComplexF64(0.0))
                 end
             end
 
@@ -3135,20 +4188,20 @@ function _sap_smooth_gpu_gmres_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
             yhost = zeros(ComplexF64, nblock_gmres * setup.Nblocks)
             _amg_solve_batched_gmres_y!(yhost, Hhost, betahost,
                                         nblock_gmres, setup.Nblocks,
-                                        active_by_color[color_i + 1])
+                                        active_by_step[step_index])
             copyto!(ydev, CuArray(yhost))
             fill!(δ.f, zero(ComplexF64))
             for k in 1:nblock_gmres
                 @cuda threads=threads blocks=grid _amg_color_gmres_update_kernel!(
                     reshape(δ.f, :), reshape(V[k].f, :), ydev, Int32(k),
-                    cache[:bmap], nc_ng, total, color, NBX, NBY, NBZ, m)
+                    cache[:bmap], nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code, m)
                 _amg_count_flops!(flop_counter,
                     setup.Nblocks * _amg_complex_axpby_flops(setup.r^4 * setup.NC * setup.NG))
             end
 
             @cuda threads=threads blocks=grid _amg_add_color_field_kernel!(
                 reshape(x.f, :), reshape(δ.f, :), cache[:bmap],
-                nc_ng, total, color, NBX, NBY, NBZ)
+                nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code)
             _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
             _amg_mul_dirac!(Ddelta, D, δ; fine_apply_counter=fine_apply_counter)
@@ -3199,6 +4252,15 @@ Arguments:
   V-cycle SAP post-smoothing sweep.
 - `vcycle_post_block_gmres_steps`: block-local GMRES steps inside each adaptive setup
   V-cycle SAP post-smoothing sweep when `vcycle_post_block_solver=:gmres`.
+- `setup_coarse_tol`: relative residual tolerance for coarse solves inside the
+  adaptive setup V-cycles. The paper's Table 6.1 default is `5e-2`.
+- `setup_coarse_maxiter`: maximum restarted coarse-GMRES cycles inside adaptive
+  setup.
+- `setup_coarse_restart`: restart length for coarse GMRES inside adaptive setup.
+  The paper uses restart length 30 for coarse systems.
+- `sap_schedule`: SAP block-list ordering. `:boundary8` uses the boundary-aware
+  eight-stage DD-alphaAMG method-2 ordering; `:twocolor` keeps the older two-color
+  red-black ordering.
 - `use_chirality`: follow the paper's chiral coarsening: split each prototype
   into upper/lower chiral components, yielding `2*Nv` coarse vectors. In this
   basis `P' * gamma5 = sigma3 * P'`, so the gamma5 factors cancel in the
@@ -3206,7 +4268,7 @@ Arguments:
 - `precompute_coarse`: precompute the coarse operator stencil. Solves need this,
   but matrix-free training losses can disable it.
 - `smooth_external_vectors`: when `coarse_vectors` are provided, apply the same
-  zero-RHS MR smoothing used for setup seeds before chiral splitting and block
+  inverse setup smoothing used for setup seeds before chiral splitting and block
   orthonormalization.
 
 Example:
@@ -3227,10 +4289,14 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                           setup_block_mr_steps::Int=4,
                           setup_block_gmres_steps::Int=setup_block_mr_steps,
                           vcycle_update_smoother::Symbol=:sap,
-                          vcycle_post_sap_iters::Int=1,
+                          vcycle_post_sap_iters::Int=2,
                           vcycle_post_block_solver::Symbol=setup_block_solver,
                           vcycle_post_block_mr_steps::Int=4,
                           vcycle_post_block_gmres_steps::Int=vcycle_post_block_mr_steps,
+                          setup_coarse_tol::Float64=5e-2,
+                          setup_coarse_maxiter::Int=5,
+                          setup_coarse_restart::Int=30,
+                          sap_schedule::Symbol=:boundary8,
                           use_chirality::Bool=false,
                           precompute_coarse::Bool=true,
                           block_normalize::Bool=true,
@@ -3247,6 +4313,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
 
     NBX = NX ÷ r; NBY = NY ÷ r; NBZ = NZ ÷ r; NBT = NT ÷ r
     Nblocks = NBX * NBY * NBZ * NBT
+    _amg_sap_schedule_code(sap_schedule)
 
     if verbose
         println("DD-alphaAMG Setup:")
@@ -3269,8 +4336,6 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             println("  using externally provided test vectors")
         end
         if smooth_external_vectors && nsmooth > 0
-            zero_rhs = similar(template)
-            zero_wf!(zero_rhs)
             setup_smoother in (:mr, :sap) ||
                 throw(ArgumentError("setup_smoother must be :mr or :sap, got $setup_smoother"))
             if setup_smoother == :sap
@@ -3284,25 +4349,31 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                     throw(ArgumentError("setup_block_gmres_steps must be positive, got $setup_block_gmres_steps"))
                 block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
                 block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
-                verbose && println("  smoothing external test vectors with SAP ($(setup_sap_iters) sweeps, $(block_steps) $(block_name) steps)...")
+                verbose && println("  inverse-smoothing external test vectors with SAP stages 1:$(setup_sap_iters) ($(block_steps) $(block_name) steps per local block solve)...")
                 sap_setup = DDalphaAMG_Setup{typeof(template)}(
                     test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
                     NBX, NBY, NBZ, NBT, Nblocks, nothing,
                     nothing,
                     CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
                 )
-                for v in 1:Nv_smooth
-                    sap_smooth!(test_vectors[v], D, zero_rhs, sap_setup;
-                                niter=setup_sap_iters,
-                                block_solver=setup_block_solver,
-                                nblock_mr=setup_block_mr_steps,
-                                nblock_gmres=setup_block_gmres_steps)
-                end
+                _amg_initial_inverse_smooth!(test_vectors, D, sap_setup;
+                                             smoother=:sap,
+                                             nstages=setup_sap_iters,
+                                             block_solver=setup_block_solver,
+                                             nblock_mr=setup_block_mr_steps,
+                                             nblock_gmres=setup_block_gmres_steps,
+                                             sap_schedule=sap_schedule)
             else
-                verbose && println("  smoothing external test vectors with MR ($nsmooth iterations)...")
-                for v in 1:Nv_smooth
-                    mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth)
-                end
+                verbose && println("  inverse-smoothing external test vectors with MR stages 1:$nsmooth...")
+                external_setup = DDalphaAMG_Setup{typeof(template)}(
+                    test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
+                    NBX, NBY, NBZ, NBT, Nblocks, nothing,
+                    nothing,
+                    CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
+                )
+                _amg_initial_inverse_smooth!(test_vectors, D, external_setup;
+                                             smoother=:mr,
+                                             nstages=nsmooth)
             end
         end
     else
@@ -3311,16 +4382,15 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             random_fermion!(test_vectors[v])
         end
 
-        # 2. Smooth test vectors so they approximate low modes.
-        zero_rhs = similar(template)
-        zero_wf!(zero_rhs)
+            # 2. Smooth test vectors so they approximate low modes.
+            zero_rhs = similar(template)
+            zero_wf!(zero_rhs)
 
         if smoother == :vcycle
             _setup_fine_apply_counter = Ref(0)
-            # Algorithm 16: use the V-cycle correction
-            # v_j <- v_j + C^(nu)(v_j - D*v_j) in the adaptive setup loop.
-            # Keep the original strong setup smoothing controlled by `nsmooth`;
-            # for this codebase it is essential for useful initial test vectors.
+            # DD-alphaAMG adaptive setup:
+            # first apply inverse SAP/MR stages to random seeds, then update
+            # v_j <- normalize(V^(nu) v_j) in the adaptive setup loop.
             sap_setup = DDalphaAMG_Setup{typeof(template)}(
                 test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
                 NBX, NBY, NBZ, NBT, Nblocks, nothing,
@@ -3347,13 +4417,19 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                 throw(ArgumentError("vcycle_post_block_mr_steps must be positive, got $vcycle_post_block_mr_steps"))
             vcycle_post_block_gmres_steps > 0 ||
                 throw(ArgumentError("vcycle_post_block_gmres_steps must be positive, got $vcycle_post_block_gmres_steps"))
+            setup_coarse_tol > 0 ||
+                throw(ArgumentError("setup_coarse_tol must be positive, got $setup_coarse_tol"))
+            setup_coarse_maxiter > 0 ||
+                throw(ArgumentError("setup_coarse_maxiter must be positive, got $setup_coarse_maxiter"))
+            setup_coarse_restart > 0 ||
+                throw(ArgumentError("setup_coarse_restart must be positive, got $setup_coarse_restart"))
             if verbose
                 if setup_smoother == :sap
                     setup_block_steps = setup_block_solver == :mr ? setup_block_mr_steps : setup_block_gmres_steps
                     setup_block_name = setup_block_solver == :mr ? "block-MR" : "block-GMRES"
-                    println("  [Algorithm 16 setup] Phase 1: SAP ($(setup_sap_iters) sweeps, $(setup_block_steps) $(setup_block_name) steps)...")
+                    println("  [Algorithm 16 setup] Phase 1: inverse SAP stages 1:$(setup_sap_iters) ($(setup_block_steps) $(setup_block_name) steps per local block solve)...")
                 else
-                    println("  [Algorithm 16 setup] Phase 1: MR ($nsmooth steps)...")
+                    println("  [Algorithm 16 setup] Phase 1: inverse MR stages 1:$nsmooth...")
                 end
                 if vcycle_update_smoother == :sap
                     post_block_steps = vcycle_post_block_solver == :mr ? vcycle_post_block_mr_steps : vcycle_post_block_gmres_steps
@@ -3362,23 +4438,17 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                 else
                     println("  [Algorithm 16 setup] adaptive post-smoother: MR ($vcycle_post_smooth steps)")
                 end
+                println("  [Algorithm 16 setup] adaptive coarse solve: tol=$(setup_coarse_tol), restart=$(setup_coarse_restart), max cycles=$(setup_coarse_maxiter)")
             end
-            for v in 1:Nv_smooth
-                if setup_smoother == :sap
-                    sap_smooth!(test_vectors[v], D, zero_rhs, sap_setup;
-                                niter=setup_sap_iters,
-                                block_solver=setup_block_solver,
-                                nblock_mr=setup_block_mr_steps,
-                                nblock_gmres=setup_block_gmres_steps,
-                                fine_apply_counter=_setup_fine_apply_counter)
-                else
-                    mr_smooth!(test_vectors[v], D, zero_rhs; niter=nsmooth,
-                               fine_apply_counter=_setup_fine_apply_counter)
-                end
-            end
-
-            r_fine = _copy_wf(zero_rhs)
-            correction = _copy_wf(zero_rhs)
+            initial_stages = setup_smoother == :sap ? setup_sap_iters : nsmooth
+            _amg_initial_inverse_smooth!(test_vectors, D, sap_setup;
+                                         smoother=setup_smoother,
+                                         nstages=initial_stages,
+                                         block_solver=setup_block_solver,
+                                         nblock_mr=setup_block_mr_steps,
+                                         nblock_gmres=setup_block_gmres_steps,
+                                         sap_schedule=sap_schedule,
+                                         fine_apply_counter=_setup_fine_apply_counter)
 
             for iter in 1:nvcycle
                 cur_vectors = _copy_wf_vector(test_vectors)
@@ -3396,28 +4466,22 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                     CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
                 )
                 precompute_coarse_operator!(cur_setup, D; mode=:direct_stencil)
-                r_coarse = _coarse_vector(cur_Nv, Nblocks, template)
 
                 for v in 1:Nv_smooth
-                    _amg_mul_dirac!(r_fine, D, test_vectors[v];
-                                    fine_apply_counter=_setup_fine_apply_counter)
-                    axpby!(1, test_vectors[v], -1, r_fine)
-                    restrict_f2c!(r_coarse, cur_setup, r_fine)
-                    e_coarse = coarse_gmres(cur_setup, D, r_coarse;
-                                            maxiter=50, tol=1e-2)
-                    prolongate_c2f!(correction, cur_setup, e_coarse)
-                    if vcycle_update_smoother == :sap
-                        sap_smooth!(correction, D, r_fine, cur_setup;
-                                    niter=vcycle_post_sap_iters,
-                                    block_solver=vcycle_post_block_solver,
-                                    nblock_mr=vcycle_post_block_mr_steps,
-                                    nblock_gmres=vcycle_post_block_gmres_steps,
-                                    fine_apply_counter=_setup_fine_apply_counter)
-                    else
-                        mr_smooth!(correction, D, r_fine; niter=vcycle_post_smooth,
-                                   fine_apply_counter=_setup_fine_apply_counter)
-                    end
-                    axpby!(1, correction, 1, test_vectors[v])
+                    updated = vcycle(D, test_vectors[v], cur_setup;
+                                     pre_smooth=0,
+                                     post_smooth=(vcycle_update_smoother == :sap ?
+                                                  vcycle_post_sap_iters : vcycle_post_smooth),
+                                     sap_block_mr_steps=vcycle_post_block_mr_steps,
+                                     coarse_maxiter=setup_coarse_maxiter,
+                                     coarse_restart=setup_coarse_restart,
+                                     coarse_tol=setup_coarse_tol,
+                                     smoother=vcycle_update_smoother,
+                                     coarse_odd_even=true,
+                                     sap_odd_even=true,
+                                     sap_schedule=sap_schedule,
+                                     fine_apply_counter=_setup_fine_apply_counter)
+                    LatticeDiracOperators.substitute_fermion!(test_vectors[v], updated)
                     normalize_fermion!(test_vectors[v])
                 end
 
@@ -3453,7 +4517,8 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                             niter=setup_sap_iters,
                             block_solver=setup_block_solver,
                             nblock_mr=setup_block_mr_steps,
-                            nblock_gmres=setup_block_gmres_steps)
+                            nblock_gmres=setup_block_gmres_steps,
+                            sap_schedule=sap_schedule)
             end
         else  # :mr (default)
             if verbose
@@ -3524,15 +4589,29 @@ Arguments:
 """
 function solve_DDalphaAMG(D, b::WF3x1, setup::DDalphaAMG_Setup;
                           x0::Union{Nothing,WF3x1}=nothing,
-                          tol::Float64=1e-10, maxiter::Int=100, restart::Int=20,
-                          verbose::Bool=true, smoother::Symbol=:mr,
-                          pre_smooth::Int=4, post_smooth::Int=4,
+                          tol::Float64=1e-10, maxiter::Int=100, restart::Int=25,
+                          verbose::Bool=true, smoother::Symbol=:sap,
+                          pre_smooth::Int=0, post_smooth::Int=2,
+                          sap_block_mr_steps::Int=4,
+                          coarse_tol::Float64=5e-2,
+                          coarse_maxiter::Int=50,
+                          coarse_restart::Int=30,
+                          coarse_odd_even::Bool=true,
+                          sap_odd_even::Bool=true,
+                          sap_schedule::Symbol=:boundary8,
                           profile::Bool=false,
                           profile_synchronize::Bool=true)
     return fgmres(D, b, setup;
                   x0=x0, tol=tol, maxiter=maxiter, restart=restart,
                   verbose=verbose, smoother=smoother,
                   pre_smooth=pre_smooth, post_smooth=post_smooth,
+                  sap_block_mr_steps=sap_block_mr_steps,
+                  coarse_tol=coarse_tol,
+                  coarse_maxiter=coarse_maxiter,
+                  coarse_restart=coarse_restart,
+                  coarse_odd_even=coarse_odd_even,
+                  sap_odd_even=sap_odd_even,
+                  sap_schedule=sap_schedule,
                   profile=profile,
                   profile_synchronize=profile_synchronize)
 end
