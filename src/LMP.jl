@@ -15,6 +15,7 @@ include("Layer_sequence.jl")
 include("Gauge.jl")
 include("DDalphaAMG.jl")
 include("CoarseCorrectionLoss.jl")
+include("SubspaceSimilarity.jl")
 
 
 using .elementry_base 
