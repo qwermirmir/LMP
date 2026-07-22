@@ -13,7 +13,7 @@ the low-mode eigenspace of the Wilson operator on gauge configurations 401 and
 - Gauge files:
   - `/data1/choi/heatbath_ensemble_beta6.0/raw_gauge/config_401.gbin`
   - `/data1/choi/heatbath_ensemble_beta6.0/raw_gauge/config_405.gbin`
-- Wilson hopping parameter: `kappa = 0.158`
+- Wilson hopping parameter used for inference and eigensolves: `kappa = 0.157`
 - Number of exact modes: 6
 - Eigenpair relative residual tolerance: `1e-10`
 - LMP checkpoint:
@@ -33,6 +33,12 @@ This Hermitian positive-semidefinite operator measures the low singular modes
 of the Wilson Dirac operator. It avoids basis-dependent sign and ordering
 ambiguities in direct comparisons with `gamma5 * D` while targeting the same
 near-null space.
+
+The checkpoint was trained at `kappa = 0.158`, but both model inference and the
+reference eigensolve use `kappa = 0.157`. This keeps the comparison internally
+consistent and avoids evaluating the reference spectrum beyond the intended
+physical range. Unlike right eigenvectors of a scalar-shifted Wilson operator,
+the eigenvectors of `D' * D` are not assumed to be exactly kappa invariant.
 
 For every computed pair `(lambda_i, q_i)`, require
 
