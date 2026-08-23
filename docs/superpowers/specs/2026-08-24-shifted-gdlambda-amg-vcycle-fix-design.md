@@ -33,17 +33,14 @@ The following existing algebra remains unchanged:
 Add a dedicated shifted two-level V-cycle rather than passing the shifted
 operator through the existing Wilson-specific `vcycle` blindly.
 
-For a fine right-hand side `b`, the preconditioner computes:
+For a fine right-hand side `b`, the paper-faithful preconditioner computes:
 
 1. zero initial correction `x`;
-2. a small fixed number of generic fine-grid GMRES smoothing steps on
-   `A(theta)*x=b`;
+2. the existing shifted Galerkin coarse correction
+   `x=P*(P' A(theta) P)^(-1)*P'*b`;
 3. the explicit fine residual `rho=b-A(theta)*x`;
-4. the existing shifted Galerkin coarse correction
-   `P*(P' A(theta) P)^(-1)*P'*rho`;
-5. correction accumulation into `x`;
-6. a small fixed number of generic post-smoothing steps on the recomputed
-   residual, followed by accumulation into `x`.
+4. exactly four generic GMRES post-smoothing steps on
+   `A(theta)*delta=rho`, followed by `x=x+delta`.
 
 Generic GMRES smoothing is selected instead of directly reusing the optimized
 SAP kernels because `A(theta)` is an operator wrapper, while several SAP GPU
@@ -52,8 +49,10 @@ slower than a future shifted SAP kernel but is the safer correctness baseline.
 It matches the paper's allowance for GMRES smoothing of indefinite shifted
 systems and avoids changing low-level CUDA kernels during this fix.
 
-The smoother iteration counts are explicit required experiment settings. They
-will not be inferred or changed during a run.
+The post-smoother count is fixed to the paper default of four. The correction
+equation is solved by outer FGMRES to relative residual `1e-1` or at most five
+iterations, and the coarse solve uses relative residual `5e-1`, matching the
+paper defaults. These values are recorded and never changed during a run.
 
 ## Interfaces and accounting
 
@@ -85,8 +84,8 @@ unlike units are not combined silently.
 
 Before production changes, add tests that fail against the coarse-only code:
 
-1. a deterministic dense shifted two-level fixture proving pre- and
-   post-smoothers are invoked and counted;
+1. a deterministic dense shifted two-level fixture proving exactly four
+   post-smoothing steps are invoked and counted and no pre-smoother is used;
 2. direct verification of
    `norm(b-A(theta)*x)/norm(b)` before and after one complete cycle;
 3. a comparison demonstrating the full cycle is distinct from coarse-only
