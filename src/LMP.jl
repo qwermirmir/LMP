@@ -33,7 +33,7 @@ using JLD2
 
 
 # ✅ `LatticeDiracOperators` 방식 적용: import 후 export 실행
-export Opt, Adam, update!, sync_layers!, save_checkpoint, load_checkpoint!
+export Opt, Adam, update!, advance_step!, sync_layers!, save_checkpoint, load_checkpoint!
 export Hopping_operator
 export Onestep
 export Paths

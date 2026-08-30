@@ -9,7 +9,7 @@ import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttenti
 import ..Layer_types: Orthogonal_Layer,LossSumLayer,Ritz_Layer,ZeroMode_Layer
 import ..elementry_base: Hopping_operator, Spin_matrix, inner_product,g2vector_generator!,addmul!
 import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minmax,spincolortrace
-import ..Optimizer: Opt, update!, Adam, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!, save_checkpoint, load_checkpoint!
+import ..Optimizer: Opt, update!, advance_step!, Adam, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!, save_checkpoint, load_checkpoint!
 import ..activation:  gradient, DeltaRule,DeltaRule!
 import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,_sync_blockmatrix_W_gpu!,blockmatrix_apply_gpu!,Matmul_batch!
 import ..gpu: sync_W_to_gpu!,pack_fermions!,unpack_fermions!,batched_forward!,fused_hopping_gpu!,fused_wilson_mul_gpu!,batched_hopping_steps_gpu!,get_shared_buf!,get_shared_float_buf!,get_shared_matrix!,_batch_normsq!,_normalize_batch!,_batch_normsq_dot!,_backward_normalize!,ritz_gram_matrices_gpu!,_normlayer_fwd!
@@ -2708,6 +2708,7 @@ function train(opt::Opt, layers::Vector{T}, input::WF3x1, target::WF3x1 , Dirac_
         end
 
         # Apply accumulated gradients.
+         advance_step!(opt)
          @time for i in 1:depth-1
             # d = gradient(layers[i], layers[i].activation::Any, u[i], delta[depth - i + 1],gamma)
             
@@ -2858,6 +2859,7 @@ function train(opt::Opt, layers::Vector{T} , config ,params ; epochs=100, batch=
 
 
  # Gradient grad gradient
+         advance_step!(opt)
          for i in 1:depth-1
  # Optimizer
             d[i] === nothing && continue
@@ -3457,6 +3459,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                                        transition_j, d, gamma, delta1_buf)
             end
 
+            advance_step!(opt)
             for i in 1:depth-1
                 d[i] === nothing && continue
                 update!(layers[i], opt, d[i])
@@ -3580,6 +3583,7 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         if _train_dbg
             _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
         end
+        advance_step!(opt)
         for i in 1:depth-1
             d[i] === nothing && continue
             update!(layers[i], opt, d[i])
@@ -4115,6 +4119,7 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
         _mem_after_bwd = _MEM_DEBUG[] ? _mem_snapshot() : UInt(0)
         # --- optimizer ---
         NVTX.@range "opt" @timeit to "optimizer" begin
+            advance_step!(opt)
             for i in 1:depth-1
                 d[i] === nothing && continue
                 if _OPTIMIZER_DEBUG[]

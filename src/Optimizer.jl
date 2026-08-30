@@ -22,7 +22,7 @@ import LatticeDiracOperators: Dirac_Operator
 
 abstract type Opt end
 
-export Adam, update!, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!
+export Adam, update!, advance_step!, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!
 export save_checkpoint, load_checkpoint!
 export Opt
 
@@ -58,6 +58,12 @@ mutable struct Adam <: Opt
             Dict{UInt, AdamState{Float64}}(),
             Dict{UInt, AdamState{WF3x1}}())
     end
+end
+
+"""Advance Adam's global timestep once for one optimizer sweep."""
+function advance_step!(opt::Adam)
+    opt.t += 1
+    return opt.t
 end
 
 
@@ -171,8 +177,6 @@ end
 
 
 function update!(layer::CPTC_Layer, opt::Adam,  grad)
-    opt.t += 1
-
     param = layer.W
 
     if length(param)==1
@@ -188,9 +192,6 @@ end
 
 
 function update!(layer::PTC_Layer, opt::Adam,  grad)
-    
-    opt.t += 1
-    
     param = layer.W
 
     # if length(param) ==1
@@ -210,8 +211,6 @@ end
 
 
 function update!(layer::Attention_Layer, opt::Adam, grad )
-    opt.t += 1
-
     if layer.Q isa PTC_Layer
  
 
@@ -290,13 +289,6 @@ end
 
 
 function update!(layer::test_Layer, opt::Adam, grad )
-    opt.t += 1
-
-
-
-
-
-
     param = layer.K.W
     if length(param) ==1
         complexProcess(param, opt , grad[1] )
@@ -326,12 +318,6 @@ end
 
 
 function update!(layer::FullPTCAttention_Layer, opt::Adam, grad )
-    opt.t += 1
-
-
-
-
-
     param = layer.Q.W
     if length(param) ==1
         complexProcess(param, opt , grad[1] )
@@ -375,13 +361,6 @@ end
 
 
 function update!(layer::PrallelTransportAttention_Layer, opt::Adam, grad )
-    opt.t += 1
-
-
-
-
-
-
     param = layer.K.W
     if length(param) ==1
         complexProcess(param, opt , grad[1] )
@@ -405,8 +384,6 @@ function update!(layer::PrallelTransportAttention_Layer, opt::Adam, grad )
 end 
 
 function update!(layer::siteweight_Layer, opt::Adam, grad)
-    opt.t += 1
-
     param = layer.Q.W
     if length(param) ==1
         complexProcess(param, opt , grad[1] )
@@ -441,8 +418,6 @@ function update!(layer::siteweight_Layer, opt::Adam, grad)
 end
 
 function update!(layer::DenseLinearLayer, opt::Adam, grad)
-    opt.t += 1
-
     # GPU batched path: grad[1]이 CuArray이면 GPU Adam
     if grad[1] isa CuArray
         NW = length(layer.W)
@@ -466,8 +441,6 @@ function update!(layer::DenseLinearLayer, opt::Adam, grad)
 end
 
 function update!(layer::PTLayer, opt::Adam, grad)
-    opt.t += 1
-
     # GPU batched path: grad[1]이 CuArray이면 GPU Adam
     if grad[1] isa CuArray
         NW = length(layer.W)
@@ -493,7 +466,6 @@ end
 
 # NormLayer용 update! 추가
 function update!(layer::NormLayer, opt::Adam, grad::Float64)
-    opt.t += 1
     key = objectid(layer)
     state = get!(opt.scalar_state, key) do
         AdamState{Float64}(0.0, 0.0)
@@ -531,9 +503,6 @@ end
 
 
 function update!(layer::fermionfield_Layer, opt::Adam, grad::Any)
-
-    opt.t += 1
-
     param = layer.x
 
     if length(param) ==1
@@ -555,14 +524,12 @@ end
 
 # RayleighQuotient_Layer: x :: WF3x1
 function update!(layer::RayleighQuotient_Layer, opt::Adam, grad::WF3x1)
-    opt.t += 1          # 타임스텝 증가 (CPTC_Layer와 동일 패턴)
     wf_adam_step!(layer.x, opt, grad)
     return nothing
 end
 
 # HoppingRayleighQuotient_Layer: x :: WF3x1
 function update!(layer::HoppingRayleighQuotient_Layer, opt::Adam, grad::WF3x1)
-    opt.t += 1
     wf_adam_step!(layer.x, opt, grad)
     return nothing
 end
@@ -698,7 +665,6 @@ end
 
 
 function update!(layer::BlockScalar_Layer, opt::Adam, grad::Matrix{ComplexF64})
-    opt.t += 1
     for idx in eachindex(layer.W)
         # real part
         re_key = objectid(layer) + UInt(2idx - 1)
@@ -730,7 +696,6 @@ end
 
 function update!(layer::BlockScalar_Layer, opt::Adam, grad)
     if grad isa AbstractVector && !isempty(grad) && grad[1] isa CuArray
-        opt.t += 1
         cache = layer._gpu_w_buf
         if !(cache isa Dict) || !haskey(cache, :W)
             error("BlockScalar_Layer GPU weights are not initialized. Run the GPU forward pass before update!.")
@@ -751,7 +716,6 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad)
 end
 
 function update!(layer::BlockMatrix_Layer, opt::Adam, grad::Array{ComplexF64,3})
-    opt.t += 1
     for idx in eachindex(layer.W)
         re_key = objectid(layer) + UInt(2idx - 1)
         st_re = get!(opt.scalar_state, re_key) do
@@ -781,7 +745,6 @@ end
 
 function update!(layer::BlockMatrix_Layer, opt::Adam, grad)
     if grad isa AbstractVector && !isempty(grad) && grad[1] isa CuArray
-        opt.t += 1
         cache = layer._gpu_w_buf
         if !(cache isa Dict) || !haskey(cache, :W)
             error("BlockMatrix_Layer GPU weights are not initialized. Run the GPU forward pass before update!.")
@@ -948,6 +911,7 @@ end
 
 function prealloc_optimizer_state!(layers, opt::Adam)
     t0 = opt.t
+    advance_step!(opt)
     for layer in layers
         if layer isa fermionfield_Layer
             _warm_fermionfield_update!(layer, opt)
