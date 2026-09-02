@@ -14,7 +14,9 @@ include("Layer_sequence.jl")
 # include("BatchedBufferSequence.jl")
 include("Gauge.jl")
 include("DDalphaAMG.jl")
+include("GDlambdaAMGDDalphaAdapter.jl")
 include("CoarseCorrectionLoss.jl")
+include("GDlambdaAMG.jl")
 include("SubspaceSimilarity.jl")
 
 
@@ -116,6 +118,14 @@ export mr_smooth!, sap_smooth!
 export block_orthonormalize!,deflated_initial_guess,_to_cpu,_to_gpu,_to_cpu_gauge
 export gamma5!, chiral_project!
 export CoarseCorrectionLoss_Layer, coarse_correction_loss_forward!
+export ShiftedGamma5DiracOperator, Gamma5LeftShiftedDiracOperator
+export shifted_coarse_correction!
+export shifted_amg_vcycle!
+export shifted_chiral_coarse_stencil
+export gd_global_orthonormalize!, gd_coarse_odd_even_relative_residual
+export gd_coarse_gmres, gd_adaptive_vcycle, gd_adaptive_amg_setup
+export flexible_gmres!, harmonic_ritz_pencil, harmonic_ritz, generalized_davidson
+export gd_eigenpair_audit
 export CloverDiracOperator, compute_Fmunu, refresh_clover!
 export train_timed
 export BatchedFieldBuffer, buffer_from_fields, materialize_fields, materialize_fields!

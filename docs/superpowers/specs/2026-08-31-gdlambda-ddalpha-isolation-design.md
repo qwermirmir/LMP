@@ -66,8 +66,10 @@ shifted coarse operator. It preserves the current solver behavior:
 - odd-even Schur reduction when supported;
 - scalar Arnoldi for the shifted correction;
 - Arnoldi breakdown determined independently of the requested coarse tolerance;
-- direct recomputation of the true residual before declaring convergence;
-- reconstruction and verification of the full coarse solution;
+- direct recomputation of the solved-system residual before convergence
+  (`Schur` residual for odd-even reduction, full residual otherwise);
+- reconstruction of the full coarse solution and independent reporting of its
+  full-system residual without changing the pre-isolation Schur stopping rule;
 - coarse application accounting used by the result CSV.
 
 The implementation uses distinct `gd_` names and is called only by

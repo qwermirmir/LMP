@@ -562,7 +562,9 @@ function _coarse_apply_dirac_matrixfree!(out::CoarseVector, setup::DDalphaAMG_Se
 end
 
 function _coarse_gmres_matrixfree(setup::DDalphaAMG_Setup, Dop, b_c::CoarseVector;
-                                  maxiter::Int=50, restart::Int=20, tol::Float64=1e-6)
+                                  maxiter::Int=50, restart::Int=20, tol::Float64=1e-6,
+                                  coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
+                                  history_callback::Union{Nothing,Function}=nothing)
     x_c = similar(b_c)
     DDalphaAMG.zero!(x_c)
     b_norm = DDalphaAMG.coarse_norm(b_c)
@@ -576,10 +578,35 @@ function _coarse_gmres_matrixfree(setup::DDalphaAMG_Setup, Dop, b_c::CoarseVecto
     r_c = similar(b_c)
     H = zeros(ComplexF64, m + 1, m)
     e1 = zeros(ComplexF64, m + 1)
+    trial_x = similar(b_c)
+    trial_image = similar(b_c)
+    trial_residual = similar(b_c)
 
-    apply!(w, v) = _coarse_apply_dirac_matrixfree!(w, setup, Dop, v, fine_buf1, fine_buf2)
+    function apply!(w, v)
+        _coarse_apply_dirac_matrixfree!(w, setup, Dop, v, fine_buf1, fine_buf2)
+        coarse_apply_counter === nothing || (coarse_apply_counter[] += 1)
+        return w
+    end
+
+    function verified_trial_residual!(iteration, estimated_relative_residual,
+                                      base_x, basis, coefficients)
+        trial_x.data .= base_x.data
+        for k in eachindex(coefficients)
+            DDalphaAMG.coarse_axpby!(coefficients[k], basis[k], 1.0, trial_x)
+        end
+        _coarse_apply_dirac_matrixfree!(
+            trial_image, setup, Dop, trial_x, fine_buf1, fine_buf2)
+        trial_residual.data .= b_c.data
+        DDalphaAMG.coarse_axpby!(-1.0, trial_image, 1.0, trial_residual)
+        true_relative_residual = DDalphaAMG.coarse_norm(trial_residual) / b_norm
+        history_callback === nothing || history_callback(
+            iteration, estimated_relative_residual, true_relative_residual)
+        return true_relative_residual
+    end
 
     remaining = maxiter
+    completed = 0
+    history_callback === nothing || history_callback(0, 1.0, 1.0)
     while remaining > 0
         r_c.data .= b_c.data
         apply!(w_c, x_c)
@@ -596,8 +623,22 @@ function _coarse_gmres_matrixfree(setup::DDalphaAMG_Setup, Dop, b_c::CoarseVecto
                 H[i, j] = DDalphaAMG.coarse_dot(V[i], w_c)
                 DDalphaAMG.coarse_axpby!(-H[i, j], V[i], 1.0, w_c)
             end
-        H[j + 1, j] = DDalphaAMG.coarse_norm(w_c)
-        if abs(H[j + 1, j]) > 1e-14
+            H[j + 1, j] = DDalphaAMG.coarse_norm(w_c)
+            trial_rhs = zeros(ComplexF64, j + 1)
+            trial_rhs[1] = β
+            trial_y = H[1:(j + 1), 1:j] \ trial_rhs
+            estimated_relative_residual =
+                norm(trial_rhs - H[1:(j + 1), 1:j] * trial_y) / b_norm
+            true_relative_residual =
+                (history_callback !== nothing || estimated_relative_residual <= tol) ?
+                verified_trial_residual!(completed + j,
+                    estimated_relative_residual, x_c, V, trial_y) : Inf
+            if estimated_relative_residual <= tol &&
+               true_relative_residual <= tol
+                x_c.data .= trial_x.data
+                return x_c
+            end
+            if abs(H[j + 1, j]) > 1e-14
             V[j + 1].data .= w_c.data ./ H[j + 1, j]
         else
             steps = j
@@ -611,6 +652,7 @@ function _coarse_gmres_matrixfree(setup::DDalphaAMG_Setup, Dop, b_c::CoarseVecto
             DDalphaAMG.coarse_axpby!(y[k], V[k], 1.0, x_c)
         end
         remaining -= steps
+        completed += steps
     end
     return x_c
 end

@@ -157,7 +157,13 @@ Expected: FAIL because `gd_coarse_gmres` has not yet been implemented.
 
 - [ ] **Step 3: Implement GD-local restarted GMRES**
 
-Implement the existing corrected algorithm under the `gd_coarse_gmres` name: preserve odd-even reduction, scalar/batched Arnoldi selection, `eps(Float64)` happy-breakdown criterion, direct true-residual verification, full-solution reconstruction, finite checks, and application accounting. All DDalphaAMG helper calls are explicitly qualified; no DDalphaAMG method is redefined.
+Implement the existing corrected algorithm under the `gd_coarse_gmres` name:
+preserve odd-even reduction, scalar/batched Arnoldi selection, `eps(Float64)`
+happy-breakdown criterion, direct solved-system residual verification (Schur
+for odd-even reduction and full otherwise), full-solution reconstruction,
+independent full-residual reporting, finite checks, and application accounting.
+All DDalphaAMG helper calls are explicitly qualified; no DDalphaAMG method is
+redefined.
 
 - [ ] **Step 4: Switch `shifted_coarse_correction!` to GD-local functions**
 
