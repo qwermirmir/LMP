@@ -1,5 +1,10 @@
 # 24-Cube-by-48-Time LMP-versus-V-cycle Quick Reproduction Design
 
+> Superseded on 2026-09-08. This design incorrectly selected the archived
+> `eig12/24/48/64` models. The approved work now trains the missing
+> `No BlockScalar + 1 PTLayer eig24` comparison model first. See
+> `2026-09-08-eig24-plus1pt-adamfix-training-design.md`.
+
 ## Purpose
 
 Reproduce the established two-panel LMP-versus-V-cycle DD-alphaAMG
