@@ -46,7 +46,7 @@ const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 
 import ..gpu: _alloc_result_wf
 
-export forward_propagation, Lossfunction, train,  preD,Operator ,doubletrain,backward_propagation!,forward_propagation!, backward_and_gradient!
+export forward_propagation, Lossfunction, train, Operator, backward_propagation!, forward_propagation!, backward_and_gradient!
 export refresh_fermionfield!, refresh_model!
 export substitute_Layer!
 export _to_cpu, _to_gpu,_to_cpu_gauge

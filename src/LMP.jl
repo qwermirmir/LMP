@@ -56,11 +56,8 @@ export backward_propagation
 export Clifford
 export inner_product
 export Attention_Layer
-export HalfPAttention_Layer
 export Matmul!
-export preD
 export Operator
-export doubletrain
 export Softmax
 export NormLayer
 export test_Layer
@@ -83,7 +80,6 @@ export ModRelu
 export g2vector_generator!
 export siteweight_Layer
 export RayleighQuotient_Layer
-export L2Norm_Layer
 export PtcRayleighQuotient_Layer
 export HoppingRayleighQuotient_Layer
 export DenseLinearLayer
@@ -91,17 +87,13 @@ export PTLayer
 export addmul!
 export fermionfield_Layer
 export Orthogonal_Layer
-export LossSumLayer
 export Ritz_Layer
 export ZeroMode_Layer
 export Convertsm
-export substitute_fermion!
 export gpuaddmul!
 export GramSchmidt_Layer
 export BlockScalar_Layer
 export BlockMatrix_Layer
-export conj!
-export gpuconj!
 export backward_propagation!,forward_propagation!
 export zero_wf!
 export refresh_fermionfield!, refresh_model!
@@ -127,8 +119,6 @@ export flexible_gmres!, harmonic_ritz_pencil, harmonic_ritz, generalized_davidso
 export gd_eigenpair_audit
 export CloverDiracOperator, compute_Fmunu, refresh_clover!
 export train_timed
-export BatchedFieldBuffer, buffer_from_fields, materialize_fields, materialize_fields!
-export dense_forward_buffer!, pt_forward_buffer!, norm_forward_buffer!, forward_buffer_segment
 export build_lmp_32pt_layers, load_lmp_model
 
 function _default_lmp_paths(max_len::Int=4)
