@@ -112,6 +112,11 @@
 - **복소 gradient 규약**: `gradient`는 `g = ∂L/∂Re(w) − i ∂L/∂Im(w)`를 반환하고, Adam의 `complex(upd_re, -upd_im)`은 이 규약에서 올바른 하강 방향이다(유한차분으로 확인).
   예외는 `BlockMatrix_Layer`로, 켤레(`∂L/∂Re + i ∂L/∂Im`)를 반환하고 Adam도 `+upd_im` 커널을 따로 쓴다. 내부적으로는 일관되지만, Phase 4에서 규약을 하나로 통일하고 docstring에 명시한다.
   GPU 경로는 `test_gpu_consistency.jl`로 확인: 두 모델 모두 GPU의 loss, gradient 노름, Adam 1스텝 후 loss가 CPU와 약 1e-15로 일치한다. 규약 통일 작업 후에도 이 테스트로 검증할 수 있다.
+- **체크포인트 재개 시 BlockScalar/BlockMatrix의 Adam 상태 소실** (수정함, `1ed3c5d`): `load_checkpoint!`가 GPU 캐시가 생기기 전에 Adam 모멘트를 넣어 두면, 첫 GPU 패스가 캐시를 새로 만들면서 버렸다. 재개한 실행은 둘째 스텝부터 끊김 없는 실행과 달라졌다(골든 모델에서 loss 상대 2.5e-5). 연구 브랜치(`fix/bigfiles-pr`)에는 아직 그대로 있다.
+- **`train`의 `gauge_cache` + batch 1** (수정함, `790e96c`): 디버그 모드가 아니면 `fetch(nothing)`으로 실패했다. 실제 학습은 `:raw`를 써서 영향 없음.
+- **batch > 1 학습** (미수정): 배치 gradient가 평균이 아니라 합이고, 일부 레이어가 캐시된 gradient 버퍼를 반환해 다음 샘플이 덮어쓰므로 샘플 순서에 따라 결과가 달라진다. 기록된 학습은 모두 batch 1. `test_train_gpu.jl`에 `@test_broken`으로 기록.
+- **CPU 체크포인트** (미수정): `save_checkpoint`가 PT/DenseLinear 가중치를 GPU에 있을 때만 저장하고, `load_checkpoint!`는 항상 `CuArray`를 만든다. CPU 모델은 저장·재개가 안 된다. `test_checkpoint.jl`에 `@test_broken`으로 기록.
+- **유한차분 스텝**: 4×6×8×10 격자에서는 원소별 gradient가 1e-5 수준이라 `h = 1e-5`에서 반올림 오차가 지배한다. `h = 1e-3`로 바꿨고, 측정 오차는 3e-7 이하(허용 1e-5).
 - **Clover trace**: `compute_Fmunu`가 `(Q − Q†)/8`에서 trace를 빼지 않아 표준 SW 정의와 다르다. `test_clover.jl`에서 `@test_broken`으로 표시. 물리 결과가 바뀌므로 사용자 결정 필요.
 
 ### Phase 3. 모듈 구조와 공개 API
@@ -142,6 +147,8 @@
     - 직접 스캔 결과 외부 함수 × 외부 타입 메서드 23개: `*` 7, `+` 4, `-` 4, `/` 1, `conj` 2, `broadcast!`, `minmax`, `ndims`, `deepcopy_internal`, `LatticeDiracOperators.substitute_fermion!` 각 1. 대부분 `elementry_base.jl`, 일부 `gpu.jl`
     - Aqua.jl `test_piracies`는 이것들을 잡지 못했음(하위 모듈 메서드를 보지 않는 것으로 보임). CI에 넣을 때 주의
   - `gpu.jl:1869` `deepcopy_internal`이 `fshifted`를 몰래 더미로 바꾸는 동작 → 명시적 복사 함수로
+- [ ] batch > 1 학습 수정: 배치 평균으로 모으고, 레이어가 반환하는 캐시 버퍼를 복사해서 누적 (`test_train_gpu.jl`의 broken 두 개가 통과해야 함)
+- [ ] CPU 체크포인트 지원: PT/DenseLinear 가중치와 CPU Adam 상태 저장, CPU 모델로 불러오기 (`test_checkpoint.jl`의 broken이 통과해야 함)
 - [ ] `WF3x1CPU/GPU` 별칭이 8개 파일에 중복 정의 → 한 곳에서 정의
 - [ ] 레거시 레이어 약 3.5k줄 제거 (결정 사항 1에 따라)
 - [ ] 주석 처리된 코드 약 300줄, `if false` 블록 제거
