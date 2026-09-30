@@ -3700,7 +3700,8 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             refresh_model!(layers, D, U_template)
             _train_dbg && _train_debug_step("epoch $epoch raw_read_next_U", _dbg_gc, _dbg_t; sync_gpu=true)
         else
-            _next_U = _train_dbg ? _next_U_dbg : fetch(cpu_prefetch)
+            # gauge_cache and the debug path fill _next_U_dbg without a prefetch task.
+            _next_U = cpu_prefetch === nothing ? _next_U_dbg : fetch(cpu_prefetch)
             _train_dbg && _train_debug_step("epoch $epoch fetch_next_U", _dbg_gc, _dbg_t)
             if _train_dbg
                 _dbg_gc = Base.gc_num(); _dbg_t = time_ns()
