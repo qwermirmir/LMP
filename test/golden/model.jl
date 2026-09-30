@@ -146,3 +146,27 @@ function golden_measure(layers = golden_model().layers)
         loss_after_step = ComplexF64(loss_after_step),
     )
 end
+
+"""
+    golden_train_step!(layers, opt)
+
+One optimizer step as the training loop takes it: forward, backward, gradients,
+`advance_step!` and `update!`. Returns the loss before the step and the squared
+gradient norms.
+"""
+function golden_train_step!(layers, opt)
+    D = layers[end].D
+    depth = length(layers)
+    gamma = Clifford()
+    u, _ = forward_propagation(layers, D, D)
+    delta = deepcopy(u[2:end])
+    loss = real(forward_propagation!(layers, D, D, u))
+    backward_propagation!(layers, u, 1, delta)
+    grads = [gradient(layers[i], layers[i].activation, u[i], delta[i], gamma) for i in 1:depth-1]
+    advance_step!(opt)
+    for i in 1:depth-1
+        grads[i] === nothing || update!(layers[i], opt, grads[i])
+    end
+    grad_norm2 = [sum(abs2, _flatten_gradient(g)) for g in grads if g !== nothing]
+    return (; loss, grad_norm2)
+end

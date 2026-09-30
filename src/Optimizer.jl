@@ -1354,6 +1354,12 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
                 if cache isa Dict
                     cache[:adam_m] = CuArray{ComplexF64}(data[key_m])
                     cache[:adam_v] = CuArray{ComplexF64}(data["layer_$(i)_adam_v"])
+                else
+                    # The GPU cache is built on the first GPU pass and picks these up.
+                    layer._gpu_w_buf = Dict{Symbol,Any}(
+                        :adam_m => data[key_m],
+                        :adam_v => data["layer_$(i)_adam_v"],
+                    )
                 end
             end
         elseif layer isa fermionfield_Layer

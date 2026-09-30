@@ -875,6 +875,16 @@ end
 GPU용 block 인덱스 맵 + 버퍼를 1회만 초기화.
 `layer._gpu_block_map[linear_idx]` = block_id 로, W 값만 갱신하면 됨.
 """
+# load_checkpoint! can restore Adam moments before the GPU cache of a block
+# layer exists. Carry them into the cache when it is built, so a resumed run
+# continues with the saved optimizer state.
+function _restored_adam_moment(cache, key::Symbol, W)
+    cache isa Dict || return nothing
+    moment = get(cache, key, nothing)
+    (moment === nothing || size(moment) != size(W)) && return nothing
+    return moment isa CuArray ? moment : CuArray{ComplexF64}(moment)
+end
+
 function _init_gpu_block_cache!(layer, x::WF3x1GPU)
     bi = x.blockinfo
     r = layer.r
@@ -910,8 +920,8 @@ function _init_gpu_block_cache!(layer, x::WF3x1GPU)
         :block_sites => CuArray(sites),
         :block_counts => CuArray(counts),
         :grad => nothing,
-        :adam_m => nothing,
-        :adam_v => nothing,
+        :adam_m => _restored_adam_moment(layer._gpu_w_buf, :adam_m, layer.W),
+        :adam_v => _restored_adam_moment(layer._gpu_w_buf, :adam_v, layer.W),
     )
 end
 
@@ -949,8 +959,8 @@ function _sync_blockscalar_W_gpu!(layer; upload::Bool=true)
             :block_sites => CuArray(sites),
             :block_counts => CuArray(counts),
             :grad => nothing,
-            :adam_m => nothing,
-            :adam_v => nothing,
+            :adam_m => _restored_adam_moment(layer._gpu_w_buf, :adam_m, layer.W),
+            :adam_v => _restored_adam_moment(layer._gpu_w_buf, :adam_v, layer.W),
         )
         layer._gpu_w_buf = cache
     elseif upload
@@ -1088,8 +1098,8 @@ function blockscalar_gradient_gpu!(layer, z::AbstractVector, d::AbstractVector)
             :block_sites => CuArray(sites),
             :block_counts => CuArray(counts),
             :grad => nothing,
-            :adam_m => nothing,
-            :adam_v => nothing,
+            :adam_m => _restored_adam_moment(layer._gpu_w_buf, :adam_m, layer.W),
+            :adam_v => _restored_adam_moment(layer._gpu_w_buf, :adam_v, layer.W),
         )
         layer._gpu_w_buf = cache
     end
@@ -1126,8 +1136,8 @@ function _sync_blockmatrix_W_gpu!(layer; upload::Bool=true)
             :block_sites => CuArray(sites),
             :block_counts => CuArray(counts),
             :grad => nothing,
-            :adam_m => nothing,
-            :adam_v => nothing,
+            :adam_m => _restored_adam_moment(layer._gpu_w_buf, :adam_m, layer.W),
+            :adam_v => _restored_adam_moment(layer._gpu_w_buf, :adam_v, layer.W),
         )
         layer._gpu_w_buf = cache
     elseif upload
@@ -1286,8 +1296,8 @@ function blockmatrix_gradient_gpu!(layer, z::AbstractVector, d::AbstractVector)
             :block_sites => CuArray(sites),
             :block_counts => CuArray(counts),
             :grad => nothing,
-            :adam_m => nothing,
-            :adam_v => nothing,
+            :adam_m => _restored_adam_moment(layer._gpu_w_buf, :adam_m, layer.W),
+            :adam_v => _restored_adam_moment(layer._gpu_w_buf, :adam_v, layer.W),
         )
         layer._gpu_w_buf = cache
     end
