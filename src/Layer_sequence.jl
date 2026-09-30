@@ -3284,6 +3284,10 @@ end
 
 load_gauge_cache(paths::Vector{String}) = [JLD2.load(path, "U") for path in paths]
 
+_training_config_index(epoch_offset::Int, step::Int, batch::Int,
+                       batch_position::Int, count::Int) =
+    mod1((epoch_offset + step - 1) * batch + batch_position, count)
+
 function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_template, params;
                epochs=100, batch=1, logfile=nothing,
                test_paths::Union{Vector{String},Nothing}=nothing, test_interval=10,
@@ -3327,14 +3331,16 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
     end
     gamma = Clifford()
 
-    # Move the first configuration to GPU.
+    # Move the first configuration for this absolute training step to GPU.
+    initial_k = _training_config_index(epoch_offset, 1, batch, 1, N)
     _staging = _make_gauge_staging(U_template)
     if gauge_format === :raw
         _raw_cpu_buffers = _make_raw_cpu_buffers(gauge_paths[1], U_template)
-        _read_raw_gauge_to_gpu!(U_template, gauge_paths[1], _staging, _raw_cpu_buffers)
+        _read_raw_gauge_to_gpu!(U_template, gauge_paths[initial_k], _staging, _raw_cpu_buffers)
     else
         _raw_cpu_buffers = nothing
-        first_U = gauge_cache === nothing ? JLD2.load(gauge_paths[1], "U") : gauge_cache[1]
+        first_U = gauge_cache === nothing ?
+            JLD2.load(gauge_paths[initial_k], "U") : gauge_cache[initial_k]
         substitute_U!(U_template, first_U)
         for mu in eachindex(U_template)
             _fast_substitute_U!(U_template[mu], first_U[mu], _staging[mu])
@@ -3434,8 +3440,8 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
     end
 
     for step in 1:epochs
-        next_k = mod(step, N) + 1
-        current_k = mod1(step, N)
+        current_k = _training_config_index(epoch_offset, step, batch, 1, N)
+        next_k = _training_config_index(epoch_offset, step + 1, batch, 1, N)
         _train_dbg = _TRAIN_ALLOC_DEBUG[]
 
         if batch > 1
@@ -3444,11 +3450,10 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
 
             fill!(d, nothing)
             current_loss = 0.0
-            first_k = mod1((epoch_offset + step - 1) * batch + 1, N)
+            first_k = _training_config_index(epoch_offset, step, batch, 1, N)
             last_k = first_k
             for b in 1:batch
-                sample_index = (epoch_offset + step - 1) * batch + b
-                current_k = mod1(sample_index, N)
+                current_k = _training_config_index(epoch_offset, step, batch, b, N)
                 last_k = current_k
                 _load_training_gauge!(current_k)
                 refresh_error_every_forward && refresh_forward_errors!(layers, D)
