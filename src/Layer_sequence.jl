@@ -29,7 +29,6 @@ abstract type Operator end
 using Gaugefields
 using LatticeDiracOperators
 using LinearAlgebra
-using Plots
 using CUDA
 using TimerOutputs
 
@@ -2572,9 +2571,7 @@ function backward_propagation!(layers::Vector{T}, u::Vector{Any}, batch::Int, de
 
 end
 
-using Plots
 using Base.Iterators
-using DisplayAs
 using PyPlot
 
 

@@ -29,7 +29,6 @@ using .Layer_sequence
 # using .BatchedBufferSequence
 using .Gauge
 using .DDalphaAMG
-using DisplayAs
 using JLD2
 # ✅ `Optimizer`를 정확히 가져오고, 필요한 함수 import
 
