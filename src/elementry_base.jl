@@ -161,15 +161,6 @@ function Base.:*(g::AbstractGaugefields{NC,Dim},a::WF3x1) where {NC,Dim,T<:Abstr
 end 
 
 
-function Base.:*(a::Number,b::Spin_matrix)
-    
-    c=deepcopy(b)
-
-    c.sm=a*b.sm
-
-    return c
-end
-
 
 
 
