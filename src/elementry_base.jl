@@ -564,8 +564,8 @@ function Clifford(W::Vector{T}) where{T<:AbstractSpinMatrix}
 
 end
 
-function Base.conj(WF3x1)
-    f=deepcopy(WF3x1)
+function Base.conj(x::WF3x1CPU)
+    f=deepcopy(x)
     NX = f.NX
     NY = f.NY
     NZ = f.NZ
