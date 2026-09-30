@@ -65,51 +65,61 @@
 ### Phase 0. 준비 (코드 변경 없음)
 
 - [ ] 메인 worktree의 미커밋 변경(`path_variant` 키워드, 체크포인트 path 목록 저장)을 사용자가 `fix/bigfiles-pr`에 커밋한 뒤 이 브랜치로 가져온다. 바깥 스크립트가 이 기능에 의존한다.
-- [ ] 골든 테스트 데이터 생성: 4⁴ hot 게이지, 고정 시드로 `build_lmp_32pt_layers` 기반 소형 모델의 forward 출력, loss, gradient를 저장한다. CPU에서 돌아가야 한다.
+- [x] 골든 테스트 데이터 생성: 4⁴ hot 게이지, 고정 시드로 `build_lmp_32pt_layers` 기반 소형 모델의 forward 출력, loss, gradient를 저장한다. CPU에서 돌아가야 한다.
 
 ### Phase 1. 저장소 위생 (가장 쉽고 효과 큼)
 
 삭제:
-- [ ] `research/` 전체 (노트북 26개, `.jld2` 5개, `compare_lmp_to_low_modes.jl`)
-- [ ] `docs/superpowers/` (AI 계획·스펙 문서 34개, `/data1`·GPU 번호 하드코딩 포함)
-- [ ] 루트 노트북: `Hop_test`, `shift_test`, `Clifford_test`, `module_test`, `raw_gauge_converter`(예제로 재작성 후 삭제)
-- [ ] `할일목록`, `.vscode/`, `.claude/settings.local.json` (Windows 사용자 경로, git push 권한 포함)
+- [x] `research/` 전체 (노트북 26개, `.jld2` 5개, `compare_lmp_to_low_modes.jl`)
+- [x] `docs/superpowers/` (AI 계획·스펙 문서 34개, `/data1`·GPU 번호 하드코딩 포함)
+- [x] 루트 노트북: `Hop_test`, `shift_test`, `Clifford_test`, `module_test` 삭제. `raw_gauge_converter`는 Phase 5에서 예제로 재작성한 뒤 삭제
+- [x] `할일목록`, `.vscode/`, `.claude/settings.local.json` (Windows 사용자 경로, git push 권한 포함)
 - [ ] `test/`의 노트북 중 변환하지 않을 것들 (목록은 Phase 2 참고)
-- [ ] `test/lmp_low_mode_experiment_config.jl`, `validate_external_coarse_vectors.jl`, `Attention_layer.jl`, 깨진 `Attention_gradient.jl`
+  - 레거시 레이어용 10개(`Attention_gradient`, `FullAttention_gradient`, `ParallelTransportAttention_gradient`, `CPTC_delta`, `Dirac_gradient`, `covariant_test`, `gradient_checking`, `test_gradient`, `siteweight_Layergradient`, `minmaxNorm_delta`)는 결정 사항 1이 정해질 때까지 남겨 둠
+- [x] `test/lmp_low_mode_experiment_config.jl`, `validate_external_coarse_vectors.jl`, `Attention_layer.jl`, 깨진 `Attention_gradient.jl`
 
 정비:
-- [ ] `Manifest.toml` 추적 해제, `.gitignore` 정리 (현재 `/test/`, `*.jld2`가 무시 목록에 있는데 추적 중)
+- [x] `Manifest.toml` 추적 해제, `.gitignore` 정리 (현재 `/test/`, `*.jld2`가 무시 목록에 있는데 추적 중)
 - [ ] `Project.toml`
-  - 제거: `IJulia`, `Revise`, `Wilsonloop`(미사용), `DisplayAs`, `Plots`(로드만 하고 호출 없음)
+  - [x] 제거: `IJulia`, `Revise`, `Wilsonloop`(미사용), `DisplayAs`, `Plots`(로드만 하고 호출 없음)
   - `PyPlot`: `train`이 라이브 matplotlib 창을 띄우는 부분을 콜백으로 바꾼 뒤 제거 (Phase 4)
-  - `TimerOutputs` compat `"0"` → 실제 버전 범위로
-  - `authors`를 실제 이름으로
-  - `[extras]`/`[targets]`에 `Test` 추가
+  - [x] `TimerOutputs` compat `"0"` → 실제 버전 범위로
+  - [ ] `authors`를 실제 이름으로 (사용자 확인 필요)
+  - [x] `[extras]`/`[targets]`에 `Test` 추가
 - [ ] `docs/lmp_layers.tex`는 유지하되 내부용 절("발표 시 강조점", "협업자용 서사", "현재 상태와 주의점")을 정리하고 구현 참조를 최종 src에 맞춘다. PDF는 추적하지 않고 CI나 릴리스에 첨부.
 
 ### Phase 2. 테스트 체계 구축 (리팩터링 전에 안전망)
 
-- [ ] `test/runtests.jl` 작성, CPU 전용 테스트와 GPU 테스트를 분리 (`CUDA.functional()`일 때만 GPU 테스트)
-- [ ] 기존 `@testset` 파일 정리
+- [x] `test/runtests.jl` 작성, CPU 전용 테스트와 GPU 테스트를 분리 (`CUDA.functional()`일 때만 GPU 테스트)
+- [x] 기존 `@testset` 파일 정리
   - `subspace_similarity.jl`, `ddalphaamg_setup_modes.jl`, `ddalphaamg_setup_modes_gpu.jl`: 유지
   - `gdlambda_amg.jl`: 수치 테스트만 남기고, 소스 문자열 `occursin` 검사 약 78개와 저장소 밖 스크립트 참조를 제거
   - `adam_global_step.jl`: 소스 문자열 검사를 행동 검사로 교체
-- [ ] 노트북에서 자동 테스트로 변환 (모두 4⁴ CPU, 외부 데이터 불필요)
+- [x] 노트북에서 자동 테스트로 변환 (모두 4⁴ CPU, 외부 데이터 불필요)
+  - 결과: `test_clover.jl`, `test_gradients.jl`, `test_gauge_covariance.jl`(reverse_paths 포함). 변환한 노트북과 `hopping_covariance_test.jl`은 삭제
   1. `Clover_test.ipynb`: 이미 PASS/FAIL 기준이 있음. 최우선
   2. 유한차분 gradient 검사: `PTLayer_gradient`, `ferimon_layergradient`, `NormLayer_delta`, `Dirac_gradient`
      - 템플릿: 바깥 `scripts/diagnostics/check_corner33_three_layer_gradient.jl`
      - 이 스크립트가 CPU/GPU 타입 문제를 우회하려고 `Hopping_operator`를 재정의하는데, CPU 디스패치 버그로 보이므로 먼저 고친다
+     - [x] 수정함: `PTLayer._hop_out`이 `Vector{Vector{WF3x1}}`(Union)이라 CPU 메서드에 맞지 않았음. `WF3x1CPU`로 고정. 골든 값 변화 없음. 바깥 스크립트의 재정의는 이제 불필요
   3. 게이지 공변성: `hopping_covariance_test.jl`(PASS/FAIL 출력 → `@test`), `covariant_test`, `hop_covariant`
   4. `reversepath`: `reverse_paths`가 역연산인지 검사
-- [ ] Phase 0의 골든 테스트 추가
-- [ ] GitHub Actions CI (CPU 테스트만, Julia 1.11)
+- [x] Phase 0의 골든 테스트 추가
+- [x] GitHub Actions CI (CPU 테스트만, Julia 1.11). `.github/workflows/CI.yml`. GPU 없는 러너에서 실제로 돌려 보지는 않음
+
+#### Phase 2에서 발견한 것
+
+- **복소 gradient 규약**: `gradient`는 `g = ∂L/∂Re(w) − i ∂L/∂Im(w)`를 반환하고, Adam의 `complex(upd_re, -upd_im)`은 이 규약에서 올바른 하강 방향이다(유한차분으로 확인).
+  예외는 `BlockMatrix_Layer`로, 켤레(`∂L/∂Re + i ∂L/∂Im`)를 반환하고 Adam도 `+upd_im` 커널을 따로 쓴다. 내부적으로는 일관되지만, Phase 4에서 규약을 하나로 통일하고 docstring에 명시한다(GPU 커널 포함, GPU에서 확인 필요).
+- **Clover trace**: `compute_Fmunu`가 `(Q − Q†)/8`에서 trace를 빼지 않아 표준 SW 정의와 다르다. `test_clover.jl`에서 `@test_broken`으로 표시. 물리 결과가 바뀌므로 사용자 결정 필요.
 
 ### Phase 3. 모듈 구조와 공개 API
 
 - [ ] `__precompile__(false)` 제거. 의존 패키지의 precompile을 막고 있다. `NVTX.activate()` 같은 로드 시점 부작용은 `__init__`으로 옮긴다.
 - [ ] 모듈 경계 정리: `CoarseCorrectionLoss`, `GDlambdaAMG`, Adapter가 `LMP` 최상위에 그냥 include되어 이름공간을 공유한다 (`GDlambdaAMG`가 `CoarseCorrectionLoss`의 `_field_norm`에 의존). 모듈로 감싸거나 분리한다.
 - [ ] export 정리
-  - 정의되지 않은 이름 제거: `BatchedFieldBuffer`, `materialize_fields`, `preD`, `doubletrain`, `HalfPAttention_Layer`, `ReLU`/`Sigmoid`/`Tanh` 등. 존재하지 않는 `RealAttention_Layer` import 제거
+  - [x] 정의되지 않은 이름 제거: `BatchedFieldBuffer`, `materialize_fields`, `preD`, `doubletrain`, `HalfPAttention_Layer`, `ReLU`/`Sigmoid`/`Tanh` 등 19개(export 문 기준 21건). 사용자 코드에서 이미 `UndefVarError`이거나 Base/LatticeDiracOperators로 해석되던 이름이라 동작 변화 없음
+  - [ ] 존재하지 않는 `RealAttention_Layer` import 제거
   - 내부용 제거: `_to_cpu`, `_to_gpu`, 디버그용 `Ref`
   - 충돌 위험 이름: `mean`(Statistics), `conj!`(Base와 별개 함수로 정의됨), `gradient`/`update!`/`train`/`Identity`(Flux·Zygote와 충돌). Base 확장으로 바꾸거나 이름을 바꾸거나 export에서 뺀다
   - `substitute_fermion!` 이중 정의 해소
@@ -125,8 +135,11 @@
 ### Phase 4. 코드 정리
 
 - [ ] **타입 파이러시 제거 (정확성 문제)**
-  - `elementry_base.jl:567` `Base.conj(WF3x1)`: 인자 타입이 없어 `Base.conj(::Any)`를 덮어쓴다. 최우선 수정
+  - [x] `elementry_base.jl:567` `Base.conj(WF3x1)`: 인자 타입이 없어 `Base.conj(::Any)`를 정의하고 있었음. `WF3x1CPU`로 제한
+  - [x] `*(Number, Spin_matrix)` 이중 정의 제거 (나중 정의가 앞의 것을 덮어쓰고 있었음)
   - Gaugefields/LatticeDiracOperators 타입에 대한 `Base.+ - * /`, `minmax`, `broadcast!` 오버로드 → LMP 자체 함수나 래퍼 타입으로
+    - 직접 스캔 결과 외부 함수 × 외부 타입 메서드 23개: `*` 7, `+` 4, `-` 4, `/` 1, `conj` 2, `broadcast!`, `minmax`, `ndims`, `deepcopy_internal`, `LatticeDiracOperators.substitute_fermion!` 각 1. 대부분 `elementry_base.jl`, 일부 `gpu.jl`
+    - Aqua.jl `test_piracies`는 이것들을 잡지 못했음(하위 모듈 메서드를 보지 않는 것으로 보임). CI에 넣을 때 주의
   - `gpu.jl:1869` `deepcopy_internal`이 `fshifted`를 몰래 더미로 바꾸는 동작 → 명시적 복사 함수로
 - [ ] `WF3x1CPU/GPU` 별칭이 8개 파일에 중복 정의 → 한 곳에서 정의
 - [ ] 레거시 레이어 약 3.5k줄 제거 (결정 사항 1에 따라)
