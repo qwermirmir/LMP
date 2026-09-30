@@ -21,6 +21,7 @@ const CPU_TESTS = [
 ]
 
 const GPU_TESTS = [
+    "test_gpu_consistency.jl",
     "ddalphaamg_setup_modes_gpu.jl",
 ]
 

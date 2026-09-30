@@ -17,17 +17,6 @@ include(joinpath(@__DIR__, "golden", "model.jl"))
 const FD_STEP = 1.0e-5
 const FD_PROBES_PER_LAYER = 3
 
-# Same model with the BlockScalar layer replaced by a BlockMatrix layer.
-function blockmatrix_model()
-    model = golden_model()
-    bm = BlockMatrix_Layer(model.x, GOLDEN_NUM_EIG, GOLDEN_BLOCK_R)
-    rng = Xoshiro(GOLDEN_SEED + 4)
-    bm.W .+= 0.1 .* randn(rng, ComplexF64, size(bm.W))
-    i = findfirst(l -> l isa BlockScalar_Layer, model.layers)
-    model.layers[i] = bm
-    return model
-end
-
 function analytic_gradients(layers, D)
     u, _ = forward_propagation(layers, D, D)
     delta = deepcopy(u[2:end])

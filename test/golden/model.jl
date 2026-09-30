@@ -67,6 +67,17 @@ function golden_model()
     return (; layers, U, x, D)
 end
 
+# Same model with the BlockScalar layer replaced by a BlockMatrix layer.
+function blockmatrix_model()
+    model = golden_model()
+    bm = BlockMatrix_Layer(model.x, GOLDEN_NUM_EIG, GOLDEN_BLOCK_R)
+    rng = Xoshiro(GOLDEN_SEED + 4)
+    bm.W .+= 0.1 .* randn(rng, ComplexF64, size(bm.W))
+    i = findfirst(l -> l isa BlockScalar_Layer, model.layers)
+    model.layers[i] = bm
+    return model
+end
+
 _field_norm2(fields) = sum(real(dot(f.f, f.f)) for f in fields)
 
 # Gradients come back as numbers, spin matrices, fermion fields, or nested
@@ -77,14 +88,14 @@ _flatten_gradient(g::LMP.activation.WF3x1) = ComplexF64.(vec(Array(g.f)))
 _flatten_gradient(g) = reduce(vcat, (_flatten_gradient(m) for m in g))
 
 """
-    golden_measure()
+    golden_measure(layers = golden_model().layers)
 
 Runs one forward pass, one backward pass, the weight gradients, and one Adam
-update on the golden model. Returns a `NamedTuple` of scalars that summarize the
-result.
+update on `layers`, which end in a Ritz layer. Returns a `NamedTuple` of scalars
+that summarize the result.
 """
-function golden_measure()
-    (; layers, D) = golden_model()
+function golden_measure(layers = golden_model().layers)
+    D = layers[end].D
     depth = length(layers)
     gamma = Clifford()
 
