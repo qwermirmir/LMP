@@ -110,7 +110,8 @@
 #### Phase 2에서 발견한 것
 
 - **복소 gradient 규약**: `gradient`는 `g = ∂L/∂Re(w) − i ∂L/∂Im(w)`를 반환하고, Adam의 `complex(upd_re, -upd_im)`은 이 규약에서 올바른 하강 방향이다(유한차분으로 확인).
-  예외는 `BlockMatrix_Layer`로, 켤레(`∂L/∂Re + i ∂L/∂Im`)를 반환하고 Adam도 `+upd_im` 커널을 따로 쓴다. 내부적으로는 일관되지만, Phase 4에서 규약을 하나로 통일하고 docstring에 명시한다(GPU 커널 포함, GPU에서 확인 필요).
+  예외는 `BlockMatrix_Layer`로, 켤레(`∂L/∂Re + i ∂L/∂Im`)를 반환하고 Adam도 `+upd_im` 커널을 따로 쓴다. 내부적으로는 일관되지만, Phase 4에서 규약을 하나로 통일하고 docstring에 명시한다.
+  GPU 경로는 `test_gpu_consistency.jl`로 확인: 두 모델 모두 GPU의 loss, gradient 노름, Adam 1스텝 후 loss가 CPU와 약 1e-15로 일치한다. 규약 통일 작업 후에도 이 테스트로 검증할 수 있다.
 - **Clover trace**: `compute_Fmunu`가 `(Q − Q†)/8`에서 trace를 빼지 않아 표준 SW 정의와 다르다. `test_clover.jl`에서 `@test_broken`으로 표시. 물리 결과가 바뀌므로 사용자 결정 필요.
 
 ### Phase 3. 모듈 구조와 공개 API
