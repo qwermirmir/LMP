@@ -13,19 +13,6 @@ using Gaugefields
 using LatticeDiracOperators
 using LMP
 
-# TEMPORARY: the CPU backward pass calls the hopping operator with a vector whose
-# element type is the CPU/GPU union, and no src method accepts it. Remove this
-# once src handles it.
-function (hop::Hopping_operator)(x::LMP.activation.WF3x1CPU,
-                                 fields::Vector{LMP.activation.WF3x1})
-    typed = Vector{typeof(x)}(undef, length(fields))
-    for i in eachindex(fields)
-        typed[i] = fields[i]::typeof(x)
-    end
-    hop(x, typed)
-    return fields
-end
-
 const GOLDEN_SEED = 20260930
 const GOLDEN_KAPPA = 0.141
 const GOLDEN_NUM_EIG = 2

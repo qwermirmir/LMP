@@ -327,7 +327,7 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
     _delta_init::Bool            # DeltaRule 버퍼 초기화 여부
     _Wadj::Vector{T}             # adjoint(W) 캐시 벡터
     _invhops::Vector{Any}        # 스레드별 Hopping_operator 캐시
-    _hop_out::Vector{Vector{WF3x1}} # 스레드별 hop 출력 버퍼 (1-element)
+    _hop_out::Vector{Vector{WF3x1CPU}} # 스레드별 hop 출력 버퍼 (1-element, CPU 전용)
     # --- GPU-resident batched buffers ---
     _W_gpu::Any                 # CuArray{ComplexF64,3} (4,4,NW)
     _Wadj_gpu::Any              # CuArray{ComplexF64,3} (4,4,NW) adjoint(W)
@@ -353,7 +353,7 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
             return new{G, Spin_matrix_GPU}(paths, U, Out, W, activation,
                        WF3x1[], WF3x1[], false,
                        Paths[], WF3x1[], WF3x1[], false,
-                       Spin_matrix_GPU[], Any[], Vector{WF3x1}[],
+                       Spin_matrix_GPU[], Any[], Vector{WF3x1CPU}[],
                        nothing, nothing, nothing, nothing, nothing, nothing,
                        nothing, nothing, 0, nothing, nothing)
         else
@@ -364,7 +364,7 @@ mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
             return new{G, Spin_matrix}(paths, U, Out, W, activation,
                        WF3x1[], WF3x1[], false,
                        Paths[], WF3x1[], WF3x1[], false,
-                       Spin_matrix[], Any[], Vector{WF3x1}[],
+                       Spin_matrix[], Any[], Vector{WF3x1CPU}[],
                        nothing, nothing, nothing, nothing, nothing, nothing,
                        nothing, nothing, 0, nothing, nothing)
         end

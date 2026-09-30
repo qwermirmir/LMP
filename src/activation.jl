@@ -2952,7 +2952,7 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
         nt = nthreads()
         if isempty(layer._invhops) || length(layer._invhops) != nt
             layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
-            layer._hop_out = [Vector{WF3x1}([deepcopy(z[1])]) for _ in 1:nt]
+            layer._hop_out = [WF3x1CPU[deepcopy(z[1])] for _ in 1:nt]
         else
             @inbounds for t in 1:nt
                 layer._invhops[t].Gauge = layer.U
@@ -3143,8 +3143,7 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
         nt = nthreads()
         if isempty(layer._invhops) || length(layer._invhops) != nt
             layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
-            TF = typeof(z[1])
-            layer._hop_out = [Vector{TF}([deepcopy(z[1])]) for _ in 1:nt]
+            layer._hop_out = [WF3x1CPU[deepcopy(z[1])] for _ in 1:nt]
         else
             @inbounds for t in 1:nt
                 layer._invhops[t].Gauge = layer.U
