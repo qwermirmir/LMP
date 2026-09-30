@@ -12,8 +12,43 @@ using LMP
 
 _relerr(a, b) = norm(a.f .- b.f) / norm(a.f)
 
-function covariance_setup()
-    U = Initialize_Gaugefields(3, 0, 4, 4, 4, 4; condition="hot", cuda=false,
+# The second lattice has a different extent in every direction, so a swapped
+# direction or index changes the result.
+const LATTICES = ((4, 4, 4, 4), (4, 6, 8, 10))
+
+const TEST_PATHS = ([1], [2], [3], [4], [-1], [-2], [-3], [-4], [1, 2], [3, -4, -4],
+                    [4, 4, 4, 4, 4, 4])
+
+# One parallel-transport step written directly from the definition,
+#     +mu: out(n) = U_mu(n - mu)^dagger psi(n - mu),
+#     -mu: out(n) = U_mu(n) psi(n + mu),
+# with antiperiodic boundary conditions in time.
+function reference_step(U, f, step)
+    mu = abs(step)
+    offset = step > 0 ? -1 : 1
+    Umu = U[mu].U
+    dims = size(f)[2:5]
+    out = zero(f)
+    for n in CartesianIndices(dims)
+        m = collect(Tuple(n))
+        m[mu] += offset
+        sign = 1
+        if !(1 <= m[mu] <= dims[mu])
+            m[mu] = mod1(m[mu], dims[mu])
+            mu == 4 && (sign = -1)
+        end
+        link = step > 0 ? adjoint(Umu[:, :, m...]) : Umu[:, :, Tuple(n)...]
+        for ig in axes(f, 6)
+            out[:, Tuple(n)..., ig] = sign * link * f[:, m..., ig]
+        end
+    end
+    return out
+end
+
+reference_path(U, f, steps) = foldl((g, step) -> reference_step(U, g, step), steps; init=f)
+
+function covariance_setup(dims)
+    U = Initialize_Gaugefields(3, 0, dims...; condition="hot", cuda=false,
                                randomnumber="Reproducible")
     # Any SU(3)-valued field is a valid gauge transformation; reuse a link field.
     g = deepcopy(U[4])
@@ -28,11 +63,16 @@ function covariance_setup()
     return (; U, V, g, x, gx, rng)
 end
 
-@testset "gauge covariance" begin
-    (; U, V, g, x, gx, rng) = covariance_setup()
+@testset "gauge covariance, lattice $dims" for dims in LATTICES
+    (; U, V, g, x, gx, rng) = covariance_setup(dims)
 
-    @testset "Hopping_operator, path $steps" for steps in
-            ([1], [2], [3], [4], [-1], [-2], [-3], [-4], [1, 2], [3, -4, -4])
+    @testset "Hopping_operator matches the definition, path $steps" for steps in TEST_PATHS
+        out = Hopping_operator(U, Paths([steps]))(x)[1]
+        expected = reference_path(U, x.f, steps)
+        @test norm(out.f .- expected) / norm(expected) < 1.0e-13
+    end
+
+    @testset "Hopping_operator, path $steps" for steps in TEST_PATHS
         P = Paths([steps])
         lhs = similar(x)
         mul!(lhs, g, Hopping_operator(U, P)(x)[1])

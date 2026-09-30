@@ -9,7 +9,7 @@ using CUDA
 
 include(joinpath(@__DIR__, "golden", "model.jl"))
 
-# Splits the 4^4 lattice into 16 blocks so the blocked GPU layout is exercised.
+# Blocks of 2^4 sites, so every lattice is split into several GPU blocks.
 const GPU_BLOCKS = (2, 2, 2, 2)
 
 # grad_proj is left out: it projects the flattened gradient, and the GPU stores
@@ -17,8 +17,12 @@ const GPU_BLOCKS = (2, 2, 2, 2)
 const COMPARED_KEYS = (:loss, :activations, :grad_norm2, :loss_after_step)
 
 @testset "GPU matches CPU" begin
-    @testset "$name" for (name, build) in (("BlockScalar model", golden_model),
-                                           ("BlockMatrix model", blockmatrix_model))
+    @testset "$name" for (name, build) in (
+            ("BlockScalar model", golden_model),
+            ("BlockMatrix model", blockmatrix_model),
+            ("asymmetric BlockScalar model", asymmetric_model),
+            ("asymmetric BlockMatrix model",
+             () -> blockmatrix_model(dims=ASYM_DIMS, max_len=ASYM_MAX_LEN)))
         cpu = golden_measure(build().layers)
         layers = build().layers
         substitute_Layer!(layers, GPU_BLOCKS)

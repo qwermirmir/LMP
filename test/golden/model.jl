@@ -17,11 +17,18 @@ const GOLDEN_SEED = 20260930
 const GOLDEN_KAPPA = 0.141
 const GOLDEN_NUM_EIG = 2
 const GOLDEN_BLOCK_R = 2
+const GOLDEN_DIMS = (4, 4, 4, 4)
+const GOLDEN_MAX_LEN = 2
 
-function golden_gauge_and_dirac()
+# Every lattice extent differs, so a swapped direction or index changes the
+# result. Longer paths exercise multi-step hopping.
+const ASYM_DIMS = (4, 6, 8, 10)
+const ASYM_MAX_LEN = 4
+
+function golden_gauge_and_dirac(dims=GOLDEN_DIMS)
     # "Reproducible" makes Gaugefields use a fixed StableRNG. The default
     # "Random" draws a fresh MersenneTwister and ignores Random.seed!.
-    U = Initialize_Gaugefields(3, 0, 4, 4, 4, 4; condition="hot", cuda=false,
+    U = Initialize_Gaugefields(3, 0, dims...; condition="hot", cuda=false,
                                randomnumber="Reproducible")
     x = Initialize_pseudofermion_fields(U[1], "Wilson"; nowing=true)
     params = Dict{String,Any}(
@@ -43,9 +50,9 @@ function _fill_spin_weights!(W, rng, scale)
     return W
 end
 
-function golden_model()
-    U, x, D = golden_gauge_and_dirac()
-    P = LMP._default_lmp_paths(2)
+function golden_model(; dims=GOLDEN_DIMS, max_len=GOLDEN_MAX_LEN)
+    U, x, D = golden_gauge_and_dirac(dims)
+    P = LMP._default_lmp_paths(max_len)
     pl = length(P)
 
     fe = fermionfield_Layer(x, 1)
@@ -67,9 +74,11 @@ function golden_model()
     return (; layers, U, x, D)
 end
 
+asymmetric_model() = golden_model(dims=ASYM_DIMS, max_len=ASYM_MAX_LEN)
+
 # Same model with the BlockScalar layer replaced by a BlockMatrix layer.
-function blockmatrix_model()
-    model = golden_model()
+function blockmatrix_model(; kwargs...)
+    model = golden_model(; kwargs...)
     bm = BlockMatrix_Layer(model.x, GOLDEN_NUM_EIG, GOLDEN_BLOCK_R)
     rng = Xoshiro(GOLDEN_SEED + 4)
     bm.W .+= 0.1 .* randn(rng, ComplexF64, size(bm.W))
