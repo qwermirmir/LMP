@@ -15,6 +15,7 @@ const CPU_TESTS = [
     "adam_global_step.jl",
     "test_gauge_covariance.jl",
     "test_clover.jl",
+    "test_checkpoint.jl",
     "subspace_similarity.jl",
     "ddalphaamg_setup_modes.jl",
     "gdlambda_amg.jl",
@@ -22,6 +23,7 @@ const CPU_TESTS = [
 
 const GPU_TESTS = [
     "test_gpu_consistency.jl",
+    "test_checkpoint_gpu.jl",
     "ddalphaamg_setup_modes_gpu.jl",
 ]
 
