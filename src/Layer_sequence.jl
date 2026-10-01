@@ -1,22 +1,3 @@
-module Layer_sequence
-
-
-
-
-
-import ..Layer_types: Layer, CPTC_Layer, PTC_Layer,ActivationFunction,Identity,Attention_Layer,Softmax,NormLayer,test_Layer,complexNormLayer,minmaxNormLayer,zscoreNormLayer,RealAttention_Layer
-import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,siteweight_Layer,RayleighQuotient_Layer,PtcRayleighQuotient_Layer,HoppingRayleighQuotient_Layer
-import ..Layer_types: Orthogonal_Layer,LossSumLayer,Ritz_Layer,ZeroMode_Layer
-import ..elementry_base: Hopping_operator, Spin_matrix, inner_product,g2vector_generator!,addmul!
-import ..elementry_base: Clifford, Random_SpinM,norm2,mean,standardization,minmax,spincolortrace
-import ..Optimizer: Opt, update!, advance_step!, Adam, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!, save_checkpoint, load_checkpoint!
-import ..activation:  gradient, DeltaRule,DeltaRule!
-import ..gpu: Matmul!,gpuaddmul!,zero_wf!,Convertsm,Spin_matrix_GPU,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,_sync_blockmatrix_W_gpu!,blockmatrix_apply_gpu!,Matmul_batch!
-import ..gpu: sync_W_to_gpu!,pack_fermions!,unpack_fermions!,batched_forward!,fused_hopping_gpu!,fused_wilson_mul_gpu!,batched_hopping_steps_gpu!,get_shared_buf!,get_shared_float_buf!,get_shared_matrix!,_batch_normsq!,_normalize_batch!,_batch_normsq_dot!,_backward_normalize!,ritz_gram_matrices_gpu!,_normlayer_fwd!
-import ..Layer_types: DenseLinearLayer, PTLayer,fermionfield_Layer,GramSchmidt_Layer
-import ..Layer_types: BlockScalar_Layer, BlockMatrix_Layer
-import ..elementry_base: blockize, unblockize
-using JLD2
 abstract type Operator end
 
 
@@ -26,32 +7,17 @@ abstract type Operator end
 
 
 # using LatticeQCD
-using Gaugefields
-using LatticeDiracOperators
-using LinearAlgebra
-using CUDA
-using TimerOutputs
 
 const NVTX = CUDA.NVTX
 NVTX.activate()
 
 # import LatticeDiracOperators: Dirac_Operators
 
-const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
-const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
 
-const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 # const Dirac_operator =LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}
 # const DagDirac_operator =LatticeDiracOperators.Dirac_operators.Adjoint_Wilson_operator{LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}}
 
-import ..gpu: _alloc_result_wf
 
-export forward_propagation, Lossfunction, train, Operator, backward_propagation!, forward_propagation!, backward_and_gradient!
-export refresh_fermionfield!, refresh_model!
-export substitute_Layer!
-export _to_cpu, _to_gpu,_to_cpu_gauge
-export train_timed, load_gauge_cache, save_raw_gauge, convert_gauge_paths_to_raw
-export _GPU_MEMORY_REPORT, gpu_memory_report, gpu_memory_report_bindings, cuda_memory_summary, cuda_pool_summary
 
 _metadata_value_string(x) = x === nothing ? "nothing" : string(x)
 
@@ -245,21 +211,17 @@ end
 # Set to a layer index j to print per-step @allocated for that layer during backward.
 # Example: LMP.Layer_sequence._ALLOC_DEBUG_LAYER[] = 35
 const _ALLOC_DEBUG_LAYER = Ref(-1)
-export _ALLOC_DEBUG_LAYER
 
 # Enable with: LMP.Layer_sequence._GAUGE_COPY_DEBUG[] = true
 const _GAUGE_COPY_DEBUG = Ref(false)
-export _GAUGE_COPY_DEBUG
 
 # Enable with: LMP.Layer_sequence._OPTIMIZER_DEBUG[] = true
 const _OPTIMIZER_DEBUG = Ref(false)
-export _OPTIMIZER_DEBUG
 
 # Enable with: LMP.Layer_sequence._MEM_DEBUG[] = true
 # Prints per-phase GPU memory deltas each epoch to isolate 700 MB/epoch growth.
 # Uses CUDA.total_memory() - CUDA.available_memory() which matches nvidia-smi.
 const _MEM_DEBUG = Ref(false)
-export _MEM_DEBUG
 
 function _mem_snapshot()
     GC.gc(true)        # full GC: CuArray finalizer 모두 실행
@@ -272,7 +234,6 @@ end
 # In this mode gauge JLD2 loads are done synchronously so their allocations
 # are attributed to the load step instead of an async task.
 const _TRAIN_ALLOC_DEBUG = Ref(false)
-export _TRAIN_ALLOC_DEBUG
 
 # Enable with: LMP.Layer_sequence._GPU_MEMORY_REPORT[] = true
 # Prints a live CuArray ownership report from train_timed roots.
@@ -1707,7 +1668,6 @@ end
 # end
 
 
-using Base.Threads
 
 function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     Out   = layer.Out
@@ -2041,8 +2001,6 @@ end
 #     return lambda
 #     # return A,B
 # end
-using LinearAlgebra
-using Base.Threads
 
 function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
     l = length(x)
@@ -2516,7 +2474,6 @@ function forward_propagation!(layers::Vector{T}, input::Any, target::Any, u::Vec
 end
 
 
-export backward_propagation
 
 
 
@@ -2571,8 +2528,6 @@ function backward_propagation!(layers::Vector{T}, u::Vector{Any}, batch::Int, de
 
 end
 
-using Base.Iterators
-using PyPlot
 
 
 
@@ -4170,6 +4125,3 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
     println()
     return to
 end
-
-
-end # module Layer_sequence

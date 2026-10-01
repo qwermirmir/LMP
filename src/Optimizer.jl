@@ -1,30 +1,5 @@
-module Optimizer
-
-using LatticeDiracOperators
-using CUDA
-using JLD2
-
-import ..elementry_base: Hopping_operator, Spin_matrix, inner_product, Random_SpinM
-import ..Layer_types: CPTC_Layer, PTC_Layer, Layer, ActivationFunction, Identity,Attention_Layer,NormLayer,test_Layer,FullPTCAttention_Layer,PtcRayleighQuotient_Layer
-import ..elementry_base: AbstractSpinMatrix
-import ..Layer_types: PrallelTransportAttention_Layer,siteweight_Layer,Dirac_Layer,RayleighQuotient_Layer,HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer
-import ..Layer_types: fermionfield_Layer
-import ..Layer_types: BlockScalar_Layer, BlockMatrix_Layer
-
-import ..gpu: gpu_adam_update!, blockscalar_adam_update!, blockmatrix_adam_update!, sync_W_from_gpu!, sync_W_to_gpu!, Spin_matrix_GPU, zero_wf!
-
-const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
-const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
-
-const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
-
-import LatticeDiracOperators: Dirac_Operator
-
 abstract type Opt end
 
-export Adam, update!, advance_step!, sync_layers!, sync_layers_to_gpu!, prealloc_optimizer_state!
-export save_checkpoint, load_checkpoint!
-export Opt
 
 
 
@@ -593,7 +568,6 @@ function wf_adam_step!(param::WF3x1, opt::Adam, grad::WF3x1)
 end
 
 
-using CUDA
 
 function kernel_wf_adam!(p, m, v, g, β1, β2, α, ε, b1, b2)
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -1384,5 +1358,3 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
     CUDA.synchronize()
     return layers
 end
-
-end # module Optimizer

@@ -3,13 +3,9 @@ using CUDA
 using LatticeDiracOperators
 using Random
 
-import .Layer_types: Layer, Identity, ActivationFunction
-import .activation
-import .Layer_sequence
 import .DDalphaAMG: DDalphaAMG_Setup, CoarseVector, setup_DDalphaAMG,
                    restrict_f2c!, prolongate_c2f!, restrict_f2c, prolongate_c2f,
                    mr_smooth!
-import .gpu: zero_wf!
 
 export CoarseCorrectionLoss_Layer
 export coarse_correction_loss_forward!
@@ -1291,14 +1287,14 @@ function _ensure_delta!(layer::CoarseCorrectionLoss_Layer, z)
     return layer._delta
 end
 
-function activation.DeltaRule(layer::CoarseCorrectionLoss_Layer, ::Identity,
+function DeltaRule(layer::CoarseCorrectionLoss_Layer, ::Identity,
                               z::Vector{T}, batch::Int) where {T<:CCL_WF3x1}
     delta = _ensure_delta!(layer, z)
-    activation.DeltaRule!(layer, layer.activation, z, delta, batch)
+    DeltaRule!(layer, layer.activation, z, delta, batch)
     return delta
 end
 
-function activation.DeltaRule!(layer::CoarseCorrectionLoss_Layer, ::Identity,
+function DeltaRule!(layer::CoarseCorrectionLoss_Layer, ::Identity,
                                z::Vector{T}, delta::Vector, batch::Int) where {T<:CCL_WF3x1}
     setup = layer.setup
     setup === nothing && error("CoarseCorrectionLoss_Layer forward must run before backward")
@@ -1444,7 +1440,7 @@ function activation.DeltaRule!(layer::CoarseCorrectionLoss_Layer, ::Identity,
     return delta
 end
 
-function Layer_sequence._refresh_layer!(layer::CoarseCorrectionLoss_Layer, D_new, U_new)
+function _refresh_layer!(layer::CoarseCorrectionLoss_Layer, D_new, U_new)
     layer.D = D_new
     if layer.refresh_error
         refresh_error_vector!(layer, D_new)
@@ -1463,7 +1459,7 @@ function Layer_sequence._refresh_layer!(layer::CoarseCorrectionLoss_Layer, D_new
     return layer
 end
 
-function Layer_sequence._refresh_forward_error!(layer::CoarseCorrectionLoss_Layer, D_new)
+function _refresh_forward_error!(layer::CoarseCorrectionLoss_Layer, D_new)
     layer.refresh_error || return nothing
     layer.D = D_new
     refresh_error_vector!(layer, D_new)

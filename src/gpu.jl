@@ -1,31 +1,13 @@
-module gpu
-
-
-
-
 # using LatticeQCD
-using Gaugefields
-using LatticeDiracOperators
-using LinearAlgebra
-using CUDA
-using StaticArrays
-
-import Gaugefields:add_U!,clear_U!
-
-import ..elementry_base: Spin_matrix, Hopping_operator, Random_SpinM,AbstractSpinMatrix
 
 
-const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
-const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
+
+
 const GPUgauge=Vector{Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, :cuda, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}}
 
 
-const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 
-using StaticArrays
 
-export Spin_matrix_GPU, Random_SpinM_GPU,Generate_weight
-export Matmul!,Convertsm,gpuaddmul!,conj!,zero_wf!
 
 
 
@@ -214,7 +196,7 @@ function kernel_conj_1D!(
     return nothing
 end
 
-function conj!(out::WF3x1GPU, inp::WF3x1GPU)
+function conj_fermion!(out::WF3x1GPU, inp::WF3x1GPU)
     total = length(inp.f)
     threads = 256
     blocks  = cld(total, threads)
@@ -223,7 +205,7 @@ function conj!(out::WF3x1GPU, inp::WF3x1GPU)
 end
 
 
-function conj!(x::WF3x1CPU,y::WF3x1CPU)
+function conj_fermion!(x::WF3x1CPU,y::WF3x1CPU)
     NX = x.NX
     NY = x.NY
     NZ = x.NZ
@@ -581,7 +563,6 @@ function Matmul_batch!(result, M_all, M_cpu::Array{ComplexF64,3},
     return result
 end
 
-export Matmul_batch, Matmul_batch!
 
 
 
@@ -718,8 +699,6 @@ function Convertsm(W::Vector{Spin_matrix_GPU})
 end 
 
 
-export substitute_fermion!
-import LatticeDiracOperators.Dirac_operators: substitute_fermion!, Shifted_fermionfields_4D_accelerator
 
 # GPU: dest(::WF3x1GPU) <- src.parent.fshifted  (device-to-device copy)
 function substitute_fermion!(
@@ -1322,19 +1301,12 @@ function blockmatrix_gradient_gpu!(layer, z::AbstractVector, d::AbstractVector)
     return grad
 end
 
-export _build_block_weight_gpu, _init_gpu_block_cache!, _update_block_weight_gpu!
-export _sync_blockscalar_W_gpu!, blockscalar_apply_gpu!, blockscalar_gradient_gpu!
-export _sync_blockmatrix_W_gpu!, blockmatrix_apply_gpu!, blockmatrix_delta_gpu!, blockmatrix_gradient_gpu!
 
 
 # ============================================================
 #  Batched PTLayer kernels — GPU-resident W, 단일 커널 launch
 # ============================================================
 
-export sync_W_to_gpu!, sync_W_from_gpu!
-export pack_fermions!, unpack_fermions!
-export batched_forward!, batched_gradient!, batched_delta!
-export gpu_adam_update!
 
 # ---- W ↔ CuArray 동기화 ----
 
@@ -1702,7 +1674,6 @@ function blockscalar_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
         W_gpu, m_gpu, v_gpu, grad_gpu, alpha, beta1, beta2, eps, bias1, bias2)
 end
 
-export blockscalar_adam_update!
 
 function blockmatrix_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
                                   alpha, beta1, beta2, eps, t)
@@ -1715,7 +1686,6 @@ function blockmatrix_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
         W_gpu, m_gpu, v_gpu, grad_gpu, alpha, beta1, beta2, eps, bias1, bias2)
 end
 
-export blockmatrix_adam_update!
 
 function _cudakernel_adjoint_W!(Wadj, W, n)
     idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -1734,7 +1704,6 @@ function sync_Wadj_gpu!(Wadj_gpu, W_gpu)
     CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adjoint_W!(Wadj_gpu, W_gpu, n)
 end
 
-export sync_Wadj_gpu!
 
 
 # ============================================================
@@ -1862,13 +1831,6 @@ const _BC_DEFAULT = (Int8(1), Int8(1), Int8(1), Int8(-1))
     return (s1, s2, s3, s4)
 end
 
-export fused_hopping_gpu!
-export fused_wilson_mul_gpu!
-export batched_hopping_steps_gpu!
-export batched_inv_hopping_gpu!
-export get_shared_buf!
-export get_shared_float_buf!
-export _alloc_result_wf
 
 # ============================================================
 #  WF3x1GPU deepcopy override — fshifted를 1-element 더미로 대체
@@ -2087,7 +2049,6 @@ function _backward_normalize!(out::CuArray{ComplexF64,5}, z::CuArray{ComplexF64,
         reshape(out,:), reshape(z,:), reshape(d,:), normsq, dotprod, inner, n)
 end
 
-export _batch_normsq!, _normalize_batch!, _batch_normsq_dot!, _backward_normalize!
 
 # ==============================================================
 #  NormLayer per-field fused kernels — pack/unpack 없이 직접 처리
@@ -2183,7 +2144,6 @@ function _normlayer_bwd!(out::CuArray{ComplexF64,4}, z::CuArray{ComplexF64,4}, d
         out, z, d, total)
 end
 
-export _normlayer_fwd!, _normlayer_bwd!
 
 const _shared_matrix_pool = Dict{Tuple{Symbol,Int}, CuArray{ComplexF64,2}}()
 
@@ -2268,7 +2228,6 @@ function ritz_gram_matrices_gpu!(A::Matrix{ComplexF64}, B::Matrix{ComplexF64},
     return A, B
 end
 
-export get_shared_matrix!, ritz_gram_matrices_gpu!
 
 # ============================================================
 #  BlockScalar gradient: sum over spin/color (dims 1,2) — 0 allocation
@@ -2313,7 +2272,6 @@ function inplace_conj!(x::CuArray{ComplexF64})
     @cuda threads=256 blocks=cld(Int(n), 256) _inplace_conj_kernel!(reshape(x, :), n)
 end
 
-export _sum_spin_color!, inplace_conj!
 
 # ============================================================
 #  Fused Wilson Dirac kernel — replaces external mul!(y, D, x)
@@ -2786,6 +2744,3 @@ function batched_inv_hopping_gpu!(ci_all, temp_5d, Gauge,
         copyto!(ci_all, temp_5d)
     end
 end
-
-
-end # module gpu

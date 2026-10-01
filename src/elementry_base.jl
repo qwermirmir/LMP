@@ -1,35 +1,4 @@
-module elementry_base
-
-
-export Hopping_operator
-export Onestep
-export Paths
-export PTC
-export CPTC
-export Random_SpinM
-export Spin_matrix
-export inner_product
-export norm2
-export reverse_paths
-export Clifford 
-export mean
-export standardization
-export minmax
-export g2vector_generator!
-export substitute_fermion!
-export blockize
-export unblockize
-export CloverDiracOperator
-export compute_Fmunu
-export refresh_clover!
-
 # using LatticeQCD
-using Gaugefields
-using LatticeDiracOperators
-using LinearAlgebra
-import LinearAlgebra: mul!   # ← 이 줄이 중요!
-using CUDA
-using StaticArrays
 
 const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
 const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
@@ -37,13 +6,11 @@ const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerat
 const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 
 
-const Dirac_operator =LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}
-const DagDirac_operator =LatticeDiracOperators.Dirac_operators.Adjoint_Wilson_operator{LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}}
-const DdagD_operator =LatticeDiracOperators.Dirac_operators.DdagD_Wilson_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}}
+const WilsonDiracCPU =LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}
+const AdjointWilsonDiracCPU =LatticeDiracOperators.Dirac_operators.Adjoint_Wilson_operator{LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}}
+const DdagDWilsonCPU =LatticeDiracOperators.Dirac_operators.DdagD_Wilson_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.Wilson_Dirac_operator{4, Gaugefields.AbstractGaugefields_module.Gaugefields_4D_nowing{3}, LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}}}
 
 
-import Base: getindex, setindex!, size, length, ndims, broadcastable
-export AbstractSpinMatrix,mean,spincolortrace,addmul!
 
 
 abstract type AbstractSpinMatrix <: AbstractArray{ComplexF64,2} end
@@ -67,7 +34,6 @@ ndims(::Type{WF3x1}) = 6
 # Overload Base.adjoint for Spin_matrix
 Base.adjoint(S::Spin_matrix) = Spin_matrix(adjoint(S.sm))
 
-import Base: broadcastable
 
 broadcastable(S::Spin_matrix) = S.sm  # 내부 행렬을 브로드캐스팅 가능하게 변환
 
@@ -401,7 +367,6 @@ Base.transpose(S::Spin_matrix) = Spin_matrix(transpose(S.sm))
 
 
 
-import Base.Broadcast: broadcast!
 
 function broadcast!(::typeof(/), x::WF3x1, y::Number)
     for ic in 1:x.NC, it in 1:x.NT, iz in 1:x.NZ, iy in 1:x.NY, ix in 1:x.NX
@@ -412,7 +377,7 @@ function broadcast!(::typeof(/), x::WF3x1, y::Number)
     return x
 end
 
-function Base.:*(D::Dirac_operator,x::WF3x1)
+function Base.:*(D::WilsonDiracCPU,x::WF3x1)
 
     y=deepcopy(x)
 
@@ -421,7 +386,7 @@ function Base.:*(D::Dirac_operator,x::WF3x1)
     return y
 end
 
-function Base.:*(D::DagDirac_operator,x::WF3x1)
+function Base.:*(D::AdjointWilsonDiracCPU,x::WF3x1)
 
     y=deepcopy(x)
 
@@ -430,7 +395,7 @@ function Base.:*(D::DagDirac_operator,x::WF3x1)
     return y
 end
 
-function Base.:*(x::WF3x1,D::Dirac_operator)
+function Base.:*(x::WF3x1,D::WilsonDiracCPU)
     cx=conj(x)
 
     y=D'*cx
@@ -439,7 +404,7 @@ function Base.:*(x::WF3x1,D::Dirac_operator)
 end 
 
 
-function Base.:*(D::DdagD_operator,x::WF3x1)
+function Base.:*(D::DdagDWilsonCPU,x::WF3x1)
 
     y=deepcopy(x)
 
@@ -624,8 +589,8 @@ function norm2(x::WF3x1)
 end
 
 
-# CPU 버전 substitute_fermion! - inplace copy (메모리 할당 없음)
-function substitute_fermion!(dest::WF3x1CPU, src::WF3x1CPU)
+# CPU 버전 _copy_fermion! - inplace copy (메모리 할당 없음)
+function _copy_fermion!(dest::WF3x1CPU, src::WF3x1CPU)
     @assert size(dest.f) == size(src.f) "dest와 src의 크기가 같아야 합니다."
     copyto!(dest.f, src.f)
     return dest
@@ -638,7 +603,6 @@ end
 # Here σ_μν = (i/2)[γ_μ,γ_ν] and F̂_μν = (Q_μν - Q_μν†)/8.
 # ============================================================
 
-export CloverDiracOperator
 
 # --- 좌표 한 칸 이동 (periodic BC) ---
 @inline function _pbc(x::Int, shift::Int, N::Int)
@@ -1213,7 +1177,7 @@ function (hop::Hopping_operator)(x::WF3x1CPU, V::AbstractVector{T}) where {T<:WF
         copyx = V[k]
         
         # copyx를 x로 초기화 (inplace copy)
-        substitute_fermion!(copyx, x)
+        _copy_fermion!(copyx, x)
 
         for step in hop.P.various[k].steps
             a = step.f
@@ -1225,7 +1189,7 @@ function (hop::Hopping_operator)(x::WF3x1CPU, V::AbstractVector{T}) where {T<:WF
             
             else
                 # a == 0: copyx를 x로 재설정
-                substitute_fermion!(copyx, x)
+                _copy_fermion!(copyx, x)
             end
         end
     end
@@ -1443,7 +1407,6 @@ end
 
 
 
-using Random
 
 function g2vector_generator!(x::WF3x1; p::Real=0.5, rng::AbstractRNG=Random.default_rng())
     @assert 0 ≤ p ≤ 1 "p must be in [0,1]"
@@ -1620,10 +1583,3 @@ function unblockize(blocks::Vector{T}) where {T<:WF3x1}
 
     return f
 end
-
-
-end # module
-
-
-
-

@@ -48,7 +48,7 @@ end
     jld2_path = joinpath(dir, "config.jld2")
     JLD2.save(jld2_path, "U", U)
     raw_path = joinpath(dir, "config.gbin")
-    LMP.Layer_sequence.save_raw_gauge(jld2_path, raw_path, gpu_gauge_template())
+    LMP.save_raw_gauge(jld2_path, raw_path, gpu_gauge_template())
 
     @testset "batch 1, gauge from $source" for (source, kwargs) in (
             ("memory", (; gauge_cache=[U])),

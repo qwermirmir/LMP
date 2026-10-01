@@ -93,7 +93,7 @@ _field_norm2(fields) = sum(real(dot(f.f, f.f)) for f in fields)
 # vectors of these depending on the layer type.
 _flatten_gradient(g::Number) = ComplexF64[g]
 _flatten_gradient(g::AbstractArray{<:Number}) = ComplexF64.(vec(Array(g)))
-_flatten_gradient(g::LMP.activation.WF3x1) = ComplexF64.(vec(Array(g.f)))
+_flatten_gradient(g::LMP.WF3x1) = ComplexF64.(vec(Array(g.f)))
 _flatten_gradient(g) = reduce(vcat, (_flatten_gradient(m) for m in g))
 
 """

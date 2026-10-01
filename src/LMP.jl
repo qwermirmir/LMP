@@ -1,17 +1,33 @@
 module LMP
 
-
-
-
 __precompile__(false)
 
+using Base.Threads
+using Base.Iterators: take
+using CUDA
+using Gaugefields
+using JLD2
+using LatticeDiracOperators
+using LinearAlgebra
+using Random
+using StaticArrays
+using TimerOutputs
+import PyPlot
+using PyPlot: plt
+
+# Functions from Base and the dependencies that LMP adds methods to.
+import Base: getindex, setindex!, size, length, ndims, broadcastable
+import Base.Broadcast: broadcast!
+import LinearAlgebra: mul!
+import Gaugefields: add_U!, clear_U!
+import LatticeDiracOperators.Dirac_operators: substitute_fermion!, Shifted_fermionfields_4D_accelerator
+
 include("elementry_base.jl")
-include("gpu.jl")  # ✅ GPU 모듈 포함
+include("gpu.jl")
 include("Layer_types.jl")
 include("activation.jl")
-include("Optimizer.jl")  # ✅ Optimizer 모듈 포함
+include("Optimizer.jl")
 include("Layer_sequence.jl")
-# include("BatchedBufferSequence.jl")
 include("Gauge.jl")
 include("DDalphaAMG.jl")
 include("GDlambdaAMGDDalphaAdapter.jl")
@@ -19,21 +35,9 @@ include("CoarseCorrectionLoss.jl")
 include("GDlambdaAMG.jl")
 include("SubspaceSimilarity.jl")
 
-
-using .elementry_base 
-using .gpu
-using .Layer_types
-using .activation
-using .Optimizer
-using .Layer_sequence
-# using .BatchedBufferSequence
 using .Gauge
 using .DDalphaAMG
-using JLD2
-# ✅ `Optimizer`를 정확히 가져오고, 필요한 함수 import
 
-
-# ✅ `LatticeDiracOperators` 방식 적용: import 후 export 실행
 export Opt, Adam, update!, advance_step!, sync_layers!, save_checkpoint, load_checkpoint!
 export Hopping_operator
 export Onestep

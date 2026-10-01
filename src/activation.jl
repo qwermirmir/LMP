@@ -1,33 +1,11 @@
-module activation
-
-
 # using LatticeQCD
-using Gaugefields
-using LatticeDiracOperators
-using LinearAlgebra
-using CUDA
-using Base.Threads
-using StaticArrays
   # 활성화 함수 추상 타입
 
 
-import ..elementry_base: Spin_matrix, inner_product, Clifford, reverse_paths,Hopping_operator,norm2,mean,minmax,spincolortrace,addmul!,substitute_fermion!
-import ..Layer_types: CPTC_Layer, PTC_Layer, Layer,ActivationFunction,Identity ,Attention_Layer,Softmax,NormLayer,test_Layer,complexNormLayer,minmaxNormLayer,zscoreNormLayer,siteweight_Layer
-import ..Layer_types: FullPTCAttention_Layer,Dirac_Layer,PrallelTransportAttention_Layer,ModRelu,RayleighQuotient_Layer,PtcRayleighQuotient_Layer
-import ..Layer_types: HoppingRayleighQuotient_Layer,DenseLinearLayer,PTLayer,fermionfield_Layer,LossSumLayer,Orthogonal_Layer,Ritz_Layer,ZeroMode_Layer,GramSchmidt_Layer,BlockScalar_Layer,BlockMatrix_Layer
-import ..elementry_base: blockize, unblockize
-import ..gpu: Matmul!,Spin_matrix_GPU,gpuaddmul!,zero_wf!,conj!,Matmul_batch,Matmul_batch!,_build_block_weight_gpu,_init_gpu_block_cache!,_update_block_weight_gpu!,_sync_blockscalar_W_gpu!,blockscalar_apply_gpu!,blockscalar_gradient_gpu!,_sync_blockmatrix_W_gpu!,blockmatrix_apply_gpu!,blockmatrix_gradient_gpu!,blockmatrix_delta_gpu!
-import ..gpu: pack_fermions!,unpack_fermions!,batched_gradient!,batched_delta!,sync_Wadj_gpu!,fused_hopping_gpu!,sync_W_to_gpu!,batched_forward!,batched_inv_hopping_gpu!,get_shared_buf!,get_shared_float_buf!,batched_hopping_steps_gpu!,_batch_normsq_dot!,_backward_normalize!,_sum_spin_color!,inplace_conj!,_normlayer_bwd!
 
-export gradient, DeltaRule,DeltaRule!
-export Identity
 
-const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
-const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
 
-const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 
-import ..gpu: _alloc_result_wf
 
 
 
@@ -2483,7 +2461,7 @@ function DeltaRule(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, batch::Int)
             axpby!(evecs[j,k], DdagDz[j], 1, r)
         end
         axpby!(1, r, -evals[k], ψ)
-        conj!(VD[k], ψ)
+        conj_fermion!(VD[k], ψ)
     end
 
     for i in 1:l
@@ -2539,7 +2517,7 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
         # r = D†D ψ_k - λ_k ψ_k
         axpby!(1, r, -evals[k], ψ)    # ψ = r - λ_k ψ → but we want r = D†Dψ - λψ
         # 위에서 axpby!(1,r,-λ,ψ) → ψ = 1*r + (-λ)*ψ = D†Dψ - λψ. 맞음
-        conj!(VD[k], ψ)
+        conj_fermion!(VD[k], ψ)
     end
 
     # ∂/∂V 를 반환하려면 계수는 evecs[i,k] (conj 없음)
@@ -2566,7 +2544,7 @@ function DeltaRule!(layer::ZeroMode_Layer, ::Identity, z::AbstractVector{<:WF3x1
     l = length(z)
     length(layer._DdagDz) == l || error("ZeroMode_Layer forward must run before backward")
     for i in eachindex(delta)
-        conj!(delta[i], layer._DdagDz[i])
+        conj_fermion!(delta[i], layer._DdagDz[i])
         delta[i].f .= (2 / l) .* delta[i].f
     end
     return delta
@@ -2762,7 +2740,7 @@ function DeltaRule!(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector
         unpack_fermions!(delta, layer._ci_all)
         # batched_delta!는 Wadj*conj(d)만 계산 — CPU 경로의 conj(W†*conj(d))와 맞추려면 outer conj 필요
         for k in 1:In
-            conj!(delta[k], delta[k])
+            conj_fermion!(delta[k], delta[k])
         end
     else
         # CPU path
@@ -2777,9 +2755,9 @@ function DeltaRule!(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector
         zero_wf!(delta)
         for k in 1:In
             for i in 1:Out
-                conj!(conj_d, d[i])
+                conj_fermion!(conj_d, d[i])
                 mul!(y, adjoint(W[i+(k-1)*Out]), conj_d)
-                conj!(conj_y, y)
+                conj_fermion!(conj_y, y)
                 axpby!(1, conj_y, 1, delta[k])
             end
         end
@@ -2912,7 +2890,7 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
         end
         d_conj = layer._d_conj_buf
         @inbounds for j in 1:Nd
-            conj!(d_conj[j], d[j])
+            conj_fermion!(d_conj[j], d[j])
         end
     elseif !layer._delta_init
         layer._delta_init = true
@@ -2977,7 +2955,7 @@ function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) w
             invhop = invhops[tid]
             invhop.P = invpaths[i]
             invhop(ci, hop_out[tid])  # preallocated 버전 사용
-            conj!(result[i], hop_out[tid][1])
+            conj_fermion!(result[i], hop_out[tid][1])
         end
     else
         # GPU batched: Wadj*conj(d) 를 1회 커널로
@@ -3102,7 +3080,7 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
         end
         d_conj = layer._d_conj_buf
         @inbounds for i in 1:Nd
-            conj!(d_conj[i], d[i])
+            conj_fermion!(d_conj[i], d[i])
         end
     elseif !layer._delta_init
         # GPU path: ci_buffers, invhops, hop_out 불필요 (batched 처리)
@@ -3168,7 +3146,7 @@ function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, 
             invhop = invhops[tid]
             invhop.P = invpaths[i]
             invhop(ci, hop_out[tid])  # preallocated 버전 사용
-            conj!(delta[i], hop_out[tid][1])
+            conj_fermion!(delta[i], hop_out[tid][1])
         end
     else
         # GPU batched: Wadj*conj(d) 를 1회 커널로 전부 계산
@@ -3404,7 +3382,7 @@ function DeltaRule!(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}
             nrm   = sqrt(norm2(z[i]))
             inv_n = 1.0 / nrm
 
-            conj!(cj_buf, z[i])
+            conj_fermion!(cj_buf, z[i])
             eta1  = inner_product(cj_buf, d[i]) / 2
             coeff = -2 * real(eta1) * inv_n^3
 
@@ -3880,6 +3858,3 @@ function DeltaRule!(layer::BlockMatrix_Layer, ::Identity,
         end
     end
 end
-
-
-end # module activation

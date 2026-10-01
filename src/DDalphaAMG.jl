@@ -1,7 +1,6 @@
 module DDalphaAMG
 
-using ..elementry_base
-using ..gpu
+using ..LMP: inner_product, fused_wilson_mul_gpu!, zero_wf!
 using Gaugefields
 using LatticeDiracOperators
 using LinearAlgebra

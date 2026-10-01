@@ -1,43 +1,12 @@
-module Layer_types
-
 abstract type Layer end
 abstract type ActivationFunction end
 
-import ..elementry_base: Hopping_operator, Spin_matrix,AbstractSpinMatrix,Paths,Random_SpinM
-import ..gpu: Spin_matrix_GPU, Random_SpinM_GPU, Generate_weight
 
 
-using Gaugefields
-using LatticeDiracOperators
-using CUDA
 
-const WF3x1CPU = LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_nowing{3}
-const WF3x1GPU =LatticeDiracOperators.Dirac_operators.WilsonFermion_4D_accelerator{3, CuArray{ComplexF64, 4, CUDA.DeviceMemory}, 4, :cuda, CuArray{ComplexF64, 2, CUDA.DeviceMemory}, CuArray{ComplexF64, 4, CUDA.DeviceMemory}}
-const GPUgauge=Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
 
-const WF3x1 = Union{WF3x1CPU, WF3x1GPU}
 
-export Layer, PTC_Layer, CPTC_Layer,ActivationFunction,Identity,Attention_Layer,Softmax,NormLayer,test_Layer,complexNormLayer
-export minmaxNormLayer, zscoreNormLayer
-export FullPTCAttention_Layer,Attention_Layer
-export xavier_init!
-export Dirac_Layer
-export PrallelTransportAttention_Layer
-export ModRelu
-export siteweight_Layer
-export RayleighQuotient_Layer
-export PtcRayleighQuotient_Layer
 # export L2Norm_Layer
-export HoppingRayleighQuotient_Layer
-export DenseLinearLayer
-export PTLayer
-export fermionfield_Layer
-export Orthogonal_Layer
-export Ritz_Layer
-export ZeroMode_Layer
-export GramSchmidt_Layer
-export BlockScalar_Layer
-export BlockMatrix_Layer
 
 struct Identity <: ActivationFunction end
 
@@ -744,5 +713,3 @@ end
 function Base.show(io::IO, layer::PTLayer)
     print(io, "PTLayer(paths=$(length(layer.paths)), Out=$(layer.Out))")
 end
-
-end # module Layer_types
