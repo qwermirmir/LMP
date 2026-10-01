@@ -90,3 +90,8 @@ function _refresh_forward_error!(layer::LossSumLayer, D_new)
     _refresh_forward_error!(layer.l2, D_new)
     return nothing
 end
+
+# l1 + l2 builds LossSumLayer(l1, l2).
+function Base.:+(a::A, b::B) where {A<:Layer, B<:Layer}
+    return LossSumLayer(a, b)
+end

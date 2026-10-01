@@ -395,12 +395,3 @@ function load_checkpoint!(path::AbstractString, layers, opt::Adam)
     return layers
 end
 
-function _recompute_checkpoint_segment!(to, layers, u::Vector{Any}, checkpoints,
-                                        start_idx::Int, stop_idx::Int)
-    fill!(u, nothing)
-    u[start_idx] = checkpoints[start_idx]
-    for i in start_idx:(stop_idx-1)
-        @timeit to "checkpoint_recompute" u[i+1] = layers[i](u[i])
-    end
-    return nothing
-end

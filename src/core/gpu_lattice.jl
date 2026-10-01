@@ -82,3 +82,9 @@ end
 end
 
 const _BC_DEFAULT = (Int8(1), Int8(1), Int8(1), Int8(-1))
+
+# Lattice coordinate along one direction of linear site b in block r:
+#   1 + mod(div(b-1, blocks_s), blocks) + mod(div(r-1, blocknumbers_s), blocknumbers) * blocks
+@inline function _cvt_br(b, r, blk, blk_s, nblk, nblk_s)
+    return 1 + mod(div(b - 1, blk_s), blk) + mod(div(r - 1, nblk_s), nblk) * blk
+end

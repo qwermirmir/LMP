@@ -1,12 +1,19 @@
-# Moving a model between CPU and GPU (substitute_Layer! and the per-type
-# _to_gpu/_to_cpu conversions), and pointing a model at a new gauge
-# configuration (refresh_model!).
+# Moving a model between CPU and GPU, and pointing it at a new gauge
+# configuration.
+#
+# A model on the GPU keeps its weights in two places: layer.W (a vector of
+# Spin_matrix_GPU) and a packed 4 x 4 x NW CuArray used by the kernels
+# (layer._W_gpu). The Adam update writes only the packed array, so
+# sync_layers! copies it back into layer.W before anything reads layer.W.
+
+# ---------------------------------------------------------------------------
+# Weights: layer.W <-> packed GPU arrays
+# ---------------------------------------------------------------------------
 
 """
-    sync_layers!(layers)
+    sync_layers_to_gpu!(layers)
 
-Copies the GPU weights (`_W_gpu`) of every layer back to `layer.W` on the CPU.
-Call it before saving a checkpoint or moving the model with `substitute_Layer!`.
+Copies `layer.W` of every GPU PTLayer into its packed array `_W_gpu`.
 """
 function sync_layers_to_gpu!(layers)
     for layer in layers
@@ -26,6 +33,13 @@ function sync_layers_to_gpu!(layers)
     return layers
 end
 
+"""
+    sync_layers!(layers)
+
+Copies the packed GPU weights of every PTLayer, DenseLinearLayer and
+BlockScalar_Layer back into `layer.W`. Call it before saving a checkpoint or
+moving the model with `substitute_Layer!`.
+"""
 function sync_layers!(layers)
     for layer in layers
         if layer isa PTLayer && layer._W_gpu !== nothing
@@ -48,8 +62,21 @@ function sync_layers!(layers)
     end
 end
 
+# ---------------------------------------------------------------------------
+# Moving a model between CPU and GPU
+# ---------------------------------------------------------------------------
+
+"""
+    substitute_Layer!(layers)
+    substitute_Layer!(layers, blocks)
+
+Moves a model to the other device, replacing each element of `layers`. The
+one-argument form toggles: a GPU model moves to the CPU and remembers its GPU
+block layout, and a CPU model moves to the GPU with the remembered layout. The
+two-argument form always moves to the GPU with block size `blocks`, e.g.
+`(4, 4, 4, 4)`. All layers on the GPU share one copy of the gauge field.
+"""
 function substitute_Layer!(layers::Vector{<:Layer})
-    # Toggle all layers between GPU and CPU representations.
     if _is_gpu_layer(layers)
         # Preserve GPU block layout so a later CPU -> GPU conversion can reuse it.
         _gpu_blocks = _extract_gpu_blocks(layers)
@@ -108,7 +135,6 @@ end
 
 _get_blocks(::Layer) = nothing
 
-# --- GPU layer detection ---
 function _is_gpu_layer(layers::Vector{<:Layer})
     for layer in layers
         if _has_gpu(layer)
@@ -120,7 +146,10 @@ end
 
 _has_gpu(::Layer) = false
 
-# --- GPU -> CPU gauge field ---
+# ---------------------------------------------------------------------------
+# GPU -> CPU conversions. Each layer type adds its own _to_cpu method.
+# ---------------------------------------------------------------------------
+
 function _to_cpu_gauge(U::Vector{G}) where {G<:AbstractGaugefields}
 
         NC = U[1].NC
@@ -135,15 +164,12 @@ function _to_cpu_gauge(U::Vector{G}) where {G<:AbstractGaugefields}
 
 end
 
-# --- GPU -> CPU Spin matrix ---
 _to_cpu_W(W::Vector{Spin_matrix_GPU}) = Convertsm(W)
 
 _to_cpu_W(W::Vector{Spin_matrix}) = W
 
 _to_cpu_W(W::Vector{T}) where {T<:AbstractArray{ComplexF64,2}} = W
 
-# --- GPU -> CPU fermion field ---
-# Convert GPU fermions, including JLD2-loaded fields, to CPU fermions.
 function _to_cpu_fermion(x::WF3x1GPU)
     NC = x.NC
     NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT
@@ -186,10 +212,8 @@ function _to_cpu_fermions(xs::Vector{<:WF3x1})
     return result
 end
 
-# --- Generic GPU -> CPU layer fallback ---
 _to_cpu(layer::Layer) = layer
 
-# --- Dirac operator GPU -> CPU (D.U gauge field) ---
 function _to_cpu_dirac(D)
     U = D.U
     if eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
@@ -206,11 +230,10 @@ function _to_cpu_dirac(D)
     end
 end
 
-# ============================================================
-# CPU -> GPU
-# ============================================================
+# ---------------------------------------------------------------------------
+# CPU -> GPU conversions. Each layer type adds its own _to_gpu method.
+# ---------------------------------------------------------------------------
 
-# --- CPU -> GPU gauge field ---
 function _to_gpu_gauge(U::Vector{G}; blocks=nothing) where {G<:AbstractGaugefields}
     if G <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
         return U # already on GPU
@@ -226,7 +249,6 @@ function _to_gpu_gauge(U::Vector{G}; blocks=nothing) where {G<:AbstractGaugefiel
     return Ugpu
 end
 
-# --- CPU -> GPU Spin matrix ---
 _to_gpu_W(W::Vector{Spin_matrix_GPU}) = W
 
 _to_gpu_W(W::Vector{Spin_matrix}) = [Spin_matrix_GPU(w) for w in W]
@@ -250,7 +272,6 @@ function _to_gpu_fermions(xs::Vector{<:WF3x1}; blocks=nothing)
     return result
 end
 
-# --- Dirac operator CPU -> GPU ---
 function _to_gpu_dirac(D; blocks=nothing, shared_U=nothing)
     U = D.U
     if shared_U === nothing && eltype(U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
@@ -266,7 +287,6 @@ function _to_gpu_dirac(D; blocks=nothing, shared_U=nothing)
     return Dirac_operator(Ugpu, xgpu, params)
 end
 
-# --- Generic CPU -> GPU layer fallback ---
 _to_gpu(layer::Layer, blocks=nothing) = layer
 
 _to_gpu(layer::Layer, blocks, shared_U) = _to_gpu(layer, blocks)
@@ -282,15 +302,16 @@ function _shared_gpu_gauge_for_layers(layers::Vector{<:Layer}, blocks)
     return nothing
 end
 
+# ---------------------------------------------------------------------------
+# Pointing a model at a new gauge configuration
+# ---------------------------------------------------------------------------
+
 """
     refresh_model!(layers, D_new, U_new)
 
-Refresh stale CuArray GPU contexts after loading a model from JLD2.
-- Ritz_Layer, PtcRayleighQuotient_Layer: refresh D
-- PTLayer: refresh U
-- fermionfield_Layer: refresh x
-- GramSchmidt_Layer: refresh x
-- LossSumLayer: recurse into sublayers
+Points every layer at a new gauge configuration: PTLayer takes the links
+`U_new`, the loss layers take the Dirac operator `D_new`, and LossSumLayer
+passes both on. The training loop calls it after loading each configuration.
 """
 function refresh_model!(layers::Vector{<:Layer}, D_new, U_new)
     for layer in layers
@@ -310,42 +331,12 @@ function refresh_forward_errors!(layers::Vector{<:Layer}, D_new)
     return layers
 end
 
-function Base.:+(a::A, b::B) where {A<:Layer, B<:Layer}
-    return LossSumLayer(a, b)
-end
-
-function (layers::Vector{T})(x::Any) where T<:Layer
-    result = x
-    for layer in layers
-        result = layer(result)
-    end
-    return result
-end
-
-# Gaugefields substitute_U!
-# Staging buffers avoid extra CUDA mallocs and GPU synchronization.
-# convert_br(b, r, blocks, blocks_s, blocknumbers, blocknumbers_s)
-#   = 1 + mod(div(b-1,blocks_s),blocks) + mod(div(r-1,blocknumbers_s),blocknumbers)*blocks
-@inline function _cvt_br(b, r, blk, blk_s, nblk, nblk_s)
-    return 1 + mod(div(b - 1, blk_s), blk) + mod(div(r - 1, nblk_s), nblk) * blk
-end
-
-function _clear_forward_caches!(layers, first_layer::Int=1, last_layer::Int=length(layers)-1)
-    for i in max(first_layer, 1):min(last_layer, length(layers)-1)
-        _clear_layer_forward_cache!(layers[i])
-    end
-    return nothing
-end
-
+# Frees unused GPU memory: waits for the GPU, runs the garbage collector and
+# returns cached blocks to the driver.
 function _force_cuda_reclaim!()
     CUDA.synchronize()
     GC.gc(true)
     CUDA.reclaim()
     CUDA.synchronize()
-    return nothing
-end
-
-function _accum_gradient!(d::Vector{Any}, j::Int, gi)
-    gi !== nothing && (d[j] = d[j] === nothing ? gi : d[j] + gi)
     return nothing
 end

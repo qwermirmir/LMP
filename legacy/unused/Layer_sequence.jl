@@ -917,3 +917,12 @@ function train_timed(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String},
     println()
     return to
 end
+
+# Calling a vector of layers as a model. Nothing used it.
+function (layers::Vector{T})(x::Any) where T<:Layer
+    result = x
+    for layer in layers
+        result = layer(result)
+    end
+    return result
+end
