@@ -1,38 +1,63 @@
-# PTLayer: transports each input field along its path and mixes the results
-# with spin-matrix weights, y_j = sum_i W_ji T_i x_i, where T_i is the parallel
-# transport along path i.
+# PTLayer: the parallel-transport layer. Each input field is transported along
+# its own path and the transported fields are mixed by spin-matrix weights.
 
+"""
+    PTLayer(paths, U, Out, activation=Identity())
+
+Parallel-transport layer with `length(paths)` inputs and `Out` outputs.
+
+Forward pass, for input fields `x[1:npaths]`:
+
+    y[j] = sum_i W[(i-1)*Out + j] * T_i x[i],    j = 1..Out
+
+where `T_i` transports a field along `paths[i]` through the links `U` (see
+`Hopping_operator`) and each `W[k]` is a 4x4 spin matrix acting on the spinor
+index at every site. The layer is gauge covariant: transforming `U` and every
+`x[i]` by a gauge transformation `g` transforms every `y[j]` by `g`.
+
+Backward pass, for output deltas `d[1:Out]`:
+
+    delta[i] = conj(T_i^-1 sum_j W[(i-1)*Out + j]^dagger conj(d[j]))
+
+Weight gradient, summing over sites and colour:
+
+    dL/dW[(i-1)*Out + j][a, b] = sum_x d[j][a](x) (T_i x[i])[b](x)
+
+On the GPU the weights live in `_W_gpu` as a `4 x 4 x NW` array. The paths are
+transported by `batched_hopping_steps_gpu!` and mixed by the kernels in
+`core/spin_mixing.jl`.
+"""
 mutable struct PTLayer{G<:AbstractGaugefields, T<:AbstractSpinMatrix} <: Layer
     paths::Vector{Paths}
     U::Vector{G}
     Out::Int
-    W::Vector{T}
+    W::Vector{T}              # W[(i-1)*Out + j]: weight from path i to output j
     activation::ActivationFunction
-    # --- 캐시 버퍼 (매 epoch deepcopy 방지) ---
-    _hopped::Vector{WF3x1}      # forward에서 hop 결과 저장 (gradient에서 재사용)
-    _result::Vector{WF3x1}      # forward 출력 버퍼
-    _initialized::Bool           # 버퍼 초기화 여부
-    # --- DeltaRule 캐시 버퍼 ---
-    _invpaths::Vector{Paths}     # reverse_paths 캐시 (paths 불변이므로 1회만 계산)
-    _d_conj_buf::Vector{WF3x1}  # conj(d) 작업용 버퍼
-    _ci_buffers::Vector{WF3x1}  # 스레드별 ci 버퍼
-    _delta_init::Bool            # DeltaRule 버퍼 초기화 여부
-    _Wadj::Vector{T}             # adjoint(W) 캐시 벡터
-    _invhops::Vector{Any}        # 스레드별 Hopping_operator 캐시
-    _hop_out::Vector{Vector{WF3x1CPU}} # 스레드별 hop 출력 버퍼 (1-element, CPU 전용)
-    # --- GPU-resident batched buffers ---
-    _W_gpu::Any                 # CuArray{ComplexF64,3} (4,4,NW)
-    _Wadj_gpu::Any              # CuArray{ComplexF64,3} (4,4,NW) adjoint(W)
-    _hopped_all::Any            # CuArray{ComplexF64,5} (NC,NG,bs,rs,npaths) — forward hop cache for gradient
-    _grad_gpu::Any              # CuArray{ComplexF64,3} (4,4,NW) gradient on GPU
-    _adam_m_gpu::Any            # CuArray{ComplexF64,3} Adam 1st moment
-    _adam_v_gpu::Any            # CuArray{ComplexF64,3} Adam 2nd moment
-    # --- Batched hopping cache ---
-    _hop_dirs_gpu::Any           # CuArray{Int8,2} (max_steps, npaths) direction table
-    _hop_nsteps_gpu::Any         # CuArray{Int32,1} (npaths,) step counts
-    _hop_max_steps::Int          # max steps across all paths
-    _inv_hop_dirs_gpu::Any       # CuArray{Int8,2} (max_steps, npaths) inverse direction table
-    _W_cpu_buf::Any              # Array{ComplexF64,3} (4,4,NW) — sync_W_from_gpu! staging
+    # Forward buffers
+    _hopped::Vector{WF3x1}    # CPU: transported inputs T_i x[i], reused by gradient
+    _result::Vector{WF3x1}    # output fields
+    _initialized::Bool
+    # Backward buffers (CPU)
+    _invpaths::Vector{Paths}  # reverse_paths(paths[i]); paths never change
+    _d_conj_buf::Vector{WF3x1}  # conj(d[j])
+    _ci_buffers::Vector{WF3x1}  # one work field per thread
+    _delta_init::Bool
+    _Wadj::Vector{T}          # W[k]^dagger
+    _invhops::Vector{Any}     # one Hopping_operator per thread
+    _hop_out::Vector{Vector{WF3x1CPU}}  # one 1-element output buffer per thread
+    # GPU arrays
+    _W_gpu::Any               # CuArray{ComplexF64,3} (4, 4, NW)
+    _Wadj_gpu::Any            # CuArray{ComplexF64,3} (4, 4, NW), W^dagger
+    _hopped_all::Any          # unused: the transported inputs live in a shared buffer
+    _grad_gpu::Any            # CuArray{ComplexF64,3} (4, 4, NW)
+    _adam_m_gpu::Any          # Adam first moment, same shape as _W_gpu
+    _adam_v_gpu::Any          # Adam second moment
+    # Direction tables for the batched GPU hop kernels
+    _hop_dirs_gpu::Any        # CuArray{Int8,2} (max_steps, npaths)
+    _hop_nsteps_gpu::Any      # CuArray{Int32,1} (npaths,)
+    _hop_max_steps::Int
+    _inv_hop_dirs_gpu::Any    # CuArray{Int8,2} (max_steps, npaths), reversed paths
+    _W_cpu_buf::Any           # Array{ComplexF64,3} (4, 4, NW), staging for sync_W_from_gpu!
 
     function PTLayer(paths::Vector{Paths}, U::Vector{G}, Out::Int,
                      activation::ActivationFunction=Identity()) where {G<:AbstractGaugefields}
@@ -67,62 +92,9 @@ function Base.show(io::IO, layer::PTLayer)
     print(io, "PTLayer(paths=$(length(layer.paths)), Out=$(layer.Out))")
 end
 
-function _get_blocks(layer::PTLayer)
-    if eltype(layer.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
-        bi = layer.U[1].blockinfo
-        return bi.blocks
-    end
-    return nothing
-end
-
-_has_gpu(layer::PTLayer) = eltype(layer.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
-
-# --- PTLayer ---
-function _to_cpu(layer::PTLayer)
-    U_cpu = _to_cpu_gauge(layer.U)
-    new_layer = PTLayer(layer.paths, U_cpu, layer.Out, layer.activation)
-    W_cpu = _to_cpu_W(layer.W)
-    new_layer.W = W_cpu
-    return new_layer
-end
-
-_shared_layer_gauge(layer::PTLayer) = layer.U
-
-# --- PTLayer ---
-function _to_gpu(layer::PTLayer, blocks=nothing)
-    U_gpu = _to_gpu_gauge(layer.U; blocks=blocks)
-    new_layer = PTLayer(layer.paths, U_gpu, layer.Out, layer.activation)
-    W_gpu = _to_gpu_W(layer.W)
-    new_layer.W = W_gpu
-    return new_layer
-end
-
-function _to_gpu(layer::PTLayer, blocks, shared_U)
-    U_gpu = shared_U === nothing ? _to_gpu_gauge(layer.U; blocks=blocks) : shared_U
-    new_layer = PTLayer(layer.paths, U_gpu, layer.Out, layer.activation)
-    W_gpu = _to_gpu_W(layer.W)
-    new_layer.W = W_gpu
-    return new_layer
-end
-
-# function (layer::DenseLinearLayer)(x::WF3x1) 
-#     Out = layer.Out
-#     W   = layer.W
-
-#     result = Vector{WF3x1}(undef, Out)
-#     yi = deepcopy(x)   
-
-    
-#     @inbounds for i in 1:Out
-# # yi 1
-# mul!(yi, W[i], x) # yi = W[i]*x " "
-# result[i] = layer.activation(yi) # activation alloc
-#     end
-
-#     return result
-# end
-
-
+# ---------------------------------------------------------------------------
+# Forward pass
+# ---------------------------------------------------------------------------
 
 function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     Out   = layer.Out
@@ -138,7 +110,7 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     _is_gpu_pt = x[1] isa WF3x1GPU
     if !layer._initialized || length(layer._result) != Out
         if !_is_gpu_pt
-    # CPU path keeps hopped fields locally.
+            # The CPU path keeps the transported fields for the gradient.
             layer._hopped = Vector{WF3x1}(undef, npaths)
             for i in 1:npaths
                 layer._hopped[i] = deepcopy(x[1])
@@ -159,8 +131,8 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
         zero_wf!(result[j])
     end
 
-    # 2) Apply each hopping path.
     if x[1] isa WF3x1CPU
+        # 2) CPU: transport each input along its path.
         hop = Hopping_operator(layer.U, paths[1])
         hop_buf = WF3x1CPU[hopped[1]] # 1-element buffer
         @inbounds for i in 1:npaths
@@ -169,7 +141,7 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             hop(x[i], hop_buf)
         end
 
-    # 3) CPU: combine paths into Out outputs.
+        # 3) CPU: mix the transported fields into the Out outputs.
         @threads for j in 1:Out
             rj = result[j]
             @inbounds for i in 1:npaths
@@ -179,12 +151,12 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             result[j] = rj
         end
     else
-    # GPU batched hop: reduce many hop kernels to max_steps kernels.
+        # GPU: transport all paths with max_steps batched kernels, then mix with
+        # one batched kernel.
         NC = 3; NG = 4
         blocksize = x[1].blockinfo.blocksize
         rsize     = x[1].blockinfo.rsize
 
-        # Lazy init GPU buffers; hopped_all uses a shared pool to avoid per-layer 628 MB.
         NW = npaths * Out
         if layer._W_gpu === nothing
             layer._W_gpu     = CUDA.zeros(ComplexF64, NG, NG, NW)
@@ -192,44 +164,18 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
             layer._W_cpu_buf = Array{ComplexF64}(undef, NG, NG, NW)
             sync_W_to_gpu!(layer._W_gpu, W)
         end
-        # Shared hopped_all buffer avoids 9 PTLayer * 628 MB = 5.6 GB.
+        # The transported inputs go into a buffer shared by all PTLayers instead
+        # of one per layer: with 9 layers on a 16^3x32 lattice that saves
+        # 9 x 628 MB. The backward pass recomputes them (gradient checkpointing).
         _result_buf  = get_shared_buf!(:result_all, NC, NG, blocksize, rsize, Out)
         _hop_temp    = get_shared_buf!(:hop_temp,   NC, NG, blocksize, rsize, npaths)
         _hopped_all  = get_shared_buf!(:hopped_all, NC, NG, blocksize, rsize, npaths)
 
-        # lazy init batched hop tables
         if layer._hop_dirs_gpu === nothing
-            max_steps = 0
-            for i in 1:npaths
-                steps_i = paths[i].various[1].steps
-                ns = length(steps_i)
-                # Identity path: single step with direction 0 means zero effective steps.
-                if ns == 1 && steps_i[1].f == 0
-                    ns = 0
-                end
-                max_steps = max(max_steps, ns)
-            end
-            layer._hop_max_steps = max_steps
-
-            dirs_cpu = zeros(Int8, max_steps, npaths)
-            nsteps_cpu = zeros(Int32, npaths)
-            for i in 1:npaths
-                steps_i = paths[i].various[1].steps
-                ns = length(steps_i)
-                if ns == 1 && steps_i[1].f == 0
-                    nsteps_cpu[i] = Int32(0)
-                else
-                    nsteps_cpu[i] = Int32(ns)
-                    for s in 1:ns
-                        dirs_cpu[s, i] = Int8(steps_i[s].f)
-                    end
-                end
-            end
-            layer._hop_dirs_gpu   = CuArray(dirs_cpu)
-            layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
+            _init_hop_tables!(layer)
         end
 
-        # Batched hop: identity paths only pack; hop paths use batched_hopping_steps_gpu!.
+        # Identity paths only need packing; other paths are transported.
         if layer._hop_max_steps > 0
             batched_hopping_steps_gpu!(
                 _hopped_all, _hop_temp, x,
@@ -238,24 +184,204 @@ function (layer::PTLayer)(x::AbstractVector{T}) where {T<:WF3x1}
         else
             pack_fermions!(_hopped_all, x)
         end
-
-        # Gradient checkpointing: do not store per-layer hop buffers.
-        # Backward is sequential, so reuse shared pool(:hopped_all).
         layer._hopped_all = nothing
 
-
-        # One batched forward kernel.
         batched_forward!(_result_buf, layer._W_gpu, _hopped_all, blocksize, rsize, npaths, Out)
-
-        # Unpack result_all into result.
         unpack_fermions!(result, _result_buf)
     end
 
     return result
 end
 
-_refresh_layer!(layer::PTLayer, D_new, U_new) = (layer.U = U_new)
+# ---------------------------------------------------------------------------
+# Backward pass
+# ---------------------------------------------------------------------------
 
+"""
+    DeltaRule!(layer::PTLayer, ::Identity, z, d, delta)
+
+Writes the input deltas into `delta` given the layer inputs `z` and the output
+deltas `d`. See [`PTLayer`](@ref) for the formula.
+"""
+function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
+
+    Out   = layer.Out
+    W     = layer.W
+    paths = layer.paths
+
+    @assert length(d) == Out "The length of d must be equal to Out."
+    @assert length(delta) == length(z) "The length of delta must be equal to the length of z."
+
+    Nz = length(z)
+    Nd = length(d)
+    NW = length(W)
+
+    is_gpu = z[1] isa WF3x1GPU && layer._W_gpu !== nothing
+
+    # CPU: conj(d[j]) buffers.
+    if !is_gpu
+        if !layer._delta_init || length(layer._d_conj_buf) != Nd
+            layer._d_conj_buf = Vector{WF3x1}(undef, Nd)
+            for i in 1:Nd
+                layer._d_conj_buf[i] = deepcopy(d[1])
+            end
+            layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
+            layer._delta_init = true
+        end
+        d_conj = layer._d_conj_buf
+        @inbounds for i in 1:Nd
+            conj_fermion!(d_conj[i], d[i])
+        end
+    elseif !layer._delta_init
+        layer._delta_init = true
+    end
+
+    # Reversed paths, computed once.
+    if isempty(layer._invpaths) || length(layer._invpaths) != Nz
+        layer._invpaths = Vector{typeof(paths[1])}(undef, Nz)
+        @inbounds for i in 1:Nz
+            layer._invpaths[i] = reverse_paths(paths[i])
+        end
+    end
+    invpaths = layer._invpaths
+
+    # CPU: W^dagger, refreshed every call because W changes during training.
+    if !is_gpu
+        if length(layer._Wadj) != NW
+            layer._Wadj = Vector{typeof(W[1])}(undef, NW)
+            @inbounds for k in 1:NW
+                layer._Wadj[k] = adjoint(W[k])
+            end
+        end
+        Wadj = layer._Wadj
+        @inbounds for k in 1:NW
+            wsm = W[k].sm
+            wadj_sm = Wadj[k].sm
+            for j in 1:4
+                for i in 1:4
+                    wadj_sm[i,j] = conj(wsm[j,i])
+                end
+            end
+        end
+    end
+
+    # CPU: one reverse-transport operator and output buffer per thread.
+    if !is_gpu
+        nt = nthreads()
+        if isempty(layer._invhops) || length(layer._invhops) != nt
+            layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
+            layer._hop_out = [WF3x1CPU[deepcopy(z[1])] for _ in 1:nt]
+        else
+            @inbounds for t in 1:nt
+                layer._invhops[t].Gauge = layer.U
+            end
+        end
+    end
+
+    # Mix first, c_i = sum_j W_ij^dagger conj(d[j]), so each path is transported once.
+    if z[1] isa WF3x1CPU
+        ci_buffers = layer._ci_buffers
+        invhops = layer._invhops
+        hop_out = layer._hop_out
+
+        @threads for i in 1:Nz
+            tid = threadid()
+            ci = ci_buffers[tid]
+            zero_wf!(ci)
+            base = (i-1) * Out
+            @inbounds for j in 1:Out
+                addmul!(ci, Wadj[base + j], d_conj[j])
+            end
+            invhop = invhops[tid]
+            invhop.P = invpaths[i]
+            invhop(ci, hop_out[tid])
+            conj_fermion!(delta[i], hop_out[tid][1])
+        end
+    else
+        NC = 3; NG = 4
+        blocksize = z[1].blockinfo.blocksize
+        rsize     = z[1].blockinfo.rsize
+
+        # W^dagger on the GPU, from _W_gpu when it exists, otherwise from the CPU copy.
+        if layer._Wadj_gpu === nothing || size(layer._Wadj_gpu, 3) != NW
+            layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+        end
+        if layer._W_gpu !== nothing
+            sync_Wadj_gpu!(layer._Wadj_gpu, layer._W_gpu)
+        else
+            Wadj_cpu = Array{ComplexF64}(undef, NG, NG, NW)
+            @inbounds for k in 1:NW
+                sm = Wadj[k].sm
+                for jj in 1:4, ii in 1:4
+                    Wadj_cpu[ii, jj, k] = sm[ii, jj]
+                end
+            end
+            copyto!(layer._Wadj_gpu, Wadj_cpu)
+        end
+
+        # Work buffers are shared between layers.
+        _d_buf = get_shared_buf!(:d_buf, NC, NG, blocksize, rsize, Nd)
+        pack_fermions!(_d_buf, d)
+
+        _ci_buf = get_shared_buf!(:ci_all, NC, NG, blocksize, rsize, Nz)
+
+        # c_i = sum_j W_ij^dagger conj(d[j]) in one kernel.
+        batched_delta!(_ci_buf, layer._Wadj_gpu, _d_buf, blocksize, rsize, Nd, Nz)
+
+        if layer._inv_hop_dirs_gpu === nothing
+            # The forward pass normally builds the forward tables first.
+            if layer._hop_max_steps == 0 && layer._hop_dirs_gpu === nothing
+                _init_hop_tables!(layer)
+            end
+            inv_dirs_cpu, _, _ = _hop_direction_table(invpaths, layer._hop_max_steps)
+            layer._inv_hop_dirs_gpu = CuArray(inv_dirs_cpu)
+        end
+
+        # Transport c_i back along the reversed path.
+        max_steps = layer._hop_max_steps
+        if max_steps > 0
+            _hop_temp = get_shared_buf!(:hop_temp, NC, NG, blocksize, rsize, Nz)
+            bi = z[1].blockinfo
+            NX = z[1].NX; NY = z[1].NY; NZ_ = z[1].NZ; NT = z[1].NT
+            batched_inv_hopping_gpu!(
+                _ci_buf, _hop_temp, layer.U,
+                layer._inv_hop_dirs_gpu, layer._hop_nsteps_gpu,
+                max_steps, Nz, blocksize, rsize, bi, NX, NY, NZ_, NT)
+        end
+
+        inplace_conj!(_ci_buf)
+        unpack_fermions!(delta, _ci_buf)
+    end
+
+    return nothing
+end
+
+"""
+    DeltaRule(layer::PTLayer, ::Identity, z, d)
+
+Allocating version of [`DeltaRule!`](@ref): returns the input deltas.
+"""
+function DeltaRule(layer::PTLayer, act::Identity, z::Vector{WF3x1}, d::Vector{T}) where T<:WF3x1
+    result = Vector{WF3x1}(undef, length(z))
+    for i in eachindex(result)
+        result[i] = deepcopy(z[1])
+        zero_wf!(result[i])
+    end
+    DeltaRule!(layer, act, z, d, result)
+    return result
+end
+
+# ---------------------------------------------------------------------------
+# Weight gradient
+# ---------------------------------------------------------------------------
+
+"""
+    gradient(layer::PTLayer, ::Identity, z, d, γ)
+
+Returns `[grad]`, the gradient of the loss with respect to every weight, for
+layer inputs `z` and output deltas `d`. On the GPU `grad` is the `4 x 4 x NW`
+array `layer._grad_gpu`; on the CPU it is a vector of spin matrices.
+"""
 function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  γ::Vector{Spin_matrix} )where T<:WF3x1
 
     Out=layer.Out
@@ -265,20 +391,18 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
     n=length(layer.W)
     npaths = length(paths)
 
-    @assert length(z) == npaths "PTLayer gradient: z의 길이는 paths 길이와 같아야 합니다. length(z)=$(length(z)), length(paths)=$(npaths)"
-    @assert length(d) == Out "PTLayer gradient: d의 길이는 Out과 같아야 합니다. length(d)=$(length(d)), Out=$Out"
+    @assert length(z) == npaths "PTLayer gradient: length(z) must equal the number of paths. length(z)=$(length(z)), length(paths)=$(npaths)"
+    @assert length(d) == Out "PTLayer gradient: length(d) must equal Out. length(d)=$(length(d)), Out=$Out"
     @assert length(W) == npaths*Out "The length of W must be equal to length(paths)*Out."
 
-    # gradient checkpointing: hopped_all은 per-layer로 저장하지 않고 z에서 재계산
-    # (9 PTLayer × 628MB = 5.6GB 절약 — backward는 sequential이므로 shared buffer 안전)
     if layer._W_gpu !== nothing
         if d[1] isa WF3x1GPU
-            # GPU batched: 625개 kernel → 1회 launch, GPU→CPU 전송 없음
+            # GPU: one kernel for all weights. The transported inputs are not
+            # stored by the forward pass, so recompute them from z.
             blocksize = d[1].blockinfo.blocksize
             rsize     = d[1].blockinfo.rsize
             NC = 3; NG = 4
 
-            # forward에서 캐싱된 hop 결과 재사용 (hop 재계산 방지)
             if layer._hopped_all !== nothing && size(layer._hopped_all, 5) == npaths
                 _hopped_g = layer._hopped_all
             else
@@ -293,7 +417,6 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
                 end
             end
 
-            # d_buf: 전역 공유 버퍼 사용
             _d_buf_g = get_shared_buf!(:d_buf, NC, NG, blocksize, rsize, Out)
             if layer._grad_gpu === nothing || size(layer._grad_gpu, 3) != n
                 layer._grad_gpu = CUDA.zeros(ComplexF64, NG, NG, n)
@@ -305,7 +428,7 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
 
             return [layer._grad_gpu]
         elseif length(layer._hopped) == npaths
-            # CPU: @threads 병렬화 (CPU path는 _hopped 캐시 그대로 사용)
+            # CPU fields with the transported inputs cached by the forward pass.
             grad = Vector{typeof(W[1])}(undef, n)
             @threads for idx in 1:n
                 j = ((idx-1) % Out) + 1
@@ -315,6 +438,7 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
             return [grad]
         end
     else
+        # Weights not on the GPU: transport each input again.
         grad = Vector{typeof(W[1])}(undef, n)
         hop=Hopping_operator(layer.U,paths[1])
         for i in 1:npaths
@@ -340,408 +464,16 @@ function gradient(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  
         return [grad]
     end
 
-end 
-
-function DeltaRule(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) where T<:WF3x1
-
-    Out   = layer.Out
-    W     = layer.W
-    paths = layer.paths
-
-    @assert length(d) == Out "The length of d must be equal to Out."
-
-    Nz = length(z)
-    Nd = length(d)
-    NW = length(W)
-    result = Vector{WF3x1}(undef, Nz)
-    for i in 1:Nz
-        result[i] = deepcopy(z[1])
-        zero_wf!(result[i])
-    end
-
-    # ① d_conj 버퍼 캐시 — CPU path에서만 필요
-    is_gpu = z[1] isa WF3x1GPU && layer._W_gpu !== nothing
-
-    if !is_gpu
-        if !layer._delta_init || length(layer._d_conj_buf) != Nd
-            layer._d_conj_buf = Vector{WF3x1}(undef, Nd)
-            for i in 1:Nd
-                layer._d_conj_buf[i] = deepcopy(d[1])
-            end
-            layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
-            layer._delta_init = true
-        end
-        d_conj = layer._d_conj_buf
-        @inbounds for j in 1:Nd
-            conj_fermion!(d_conj[j], d[j])
-        end
-    elseif !layer._delta_init
-        layer._delta_init = true
-    end
-
-    # ② 역경로 캐시 (paths 불변이므로 1회만 계산)
-    if isempty(layer._invpaths) || length(layer._invpaths) != Nz
-        layer._invpaths = Vector{typeof(paths[1])}(undef, Nz)
-        @inbounds for i in 1:Nz
-            layer._invpaths[i] = reverse_paths(paths[i])
-        end
-    end
-    invpaths = layer._invpaths
-
-    # ③ Wadj 캐시 — CPU path에서만 필요
-    if !is_gpu
-        if length(layer._Wadj) != NW
-            layer._Wadj = Vector{typeof(W[1])}(undef, NW)
-            @inbounds for k in 1:NW
-                layer._Wadj[k] = adjoint(W[k])
-            end
-        end
-        Wadj = layer._Wadj
-        @inbounds for k in 1:NW
-            wsm = W[k].sm
-            wadj_sm = Wadj[k].sm
-            for j in 1:4
-                for i in 1:4
-                    wadj_sm[i,j] = conj(wsm[j,i])
-                end
-            end
-        end
-    end
-
-    # ④ invhops + hop 출력 버퍼 캐시 (CPU path에서만 필요)
-    if !is_gpu
-        nt = nthreads()
-        if isempty(layer._invhops) || length(layer._invhops) != nt
-            layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
-            layer._hop_out = [WF3x1CPU[deepcopy(z[1])] for _ in 1:nt]
-        else
-            @inbounds for t in 1:nt
-                layer._invhops[t].Gauge = layer.U
-            end
-        end
-    end
-
-    # ⑤ 최적화: 먼저 c_i = Σ_j Wadj_{ij} * d_conj[j] 계산 후, hop 1회만 수행
-    if z[1] isa WF3x1CPU
-        ci_buffers = layer._ci_buffers
-        invhops = layer._invhops
-        hop_out = layer._hop_out
-
-        @threads for i in 1:Nz
-            tid = threadid()
-            ci = ci_buffers[tid]
-            zero_wf!(ci)
-            base = (i-1) * Out
-            @inbounds for j in 1:Out
-                addmul!(ci, Wadj[base + j], d_conj[j])
-            end
-            invhop = invhops[tid]
-            invhop.P = invpaths[i]
-            invhop(ci, hop_out[tid])  # preallocated 버전 사용
-            conj_fermion!(result[i], hop_out[tid][1])
-        end
-    else
-        # GPU batched: Wadj*conj(d) 를 1회 커널로
-        NC = 3; NG = 4
-        blocksize = z[1].blockinfo.blocksize
-        rsize     = z[1].blockinfo.rsize
-
-        if layer._Wadj_gpu === nothing || size(layer._Wadj_gpu, 3) != NW
-            layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
-        end
-        if layer._W_gpu !== nothing
-            sync_Wadj_gpu!(layer._Wadj_gpu, layer._W_gpu)
-        else
-            Wadj_cpu = Array{ComplexF64}(undef, NG, NG, NW)
-            @inbounds for k in 1:NW
-                sm = layer._Wadj[k].sm
-                for jj in 1:4, ii in 1:4
-                    Wadj_cpu[ii, jj, k] = sm[ii, jj]
-                end
-            end
-            copyto!(layer._Wadj_gpu, Wadj_cpu)
-        end
-
-        # d_buf, ci_all: 공유 임시 버퍼 사용 (layers 간 재사용)
-        _d_buf = get_shared_buf!(:d_buf, NC, NG, blocksize, rsize, Nd)
-        pack_fermions!(_d_buf, d)
-
-        _ci_buf = get_shared_buf!(:ci_all, NC, NG, blocksize, rsize, Nz)
-
-        # 1회 batched kernel: ci_all = Σ_j Wadj * conj(d)
-        batched_delta!(_ci_buf, layer._Wadj_gpu, _d_buf, blocksize, rsize, Nd, Nz)
-
-        # lazy init inverse direction table (forward init이 안 된 경우 여기서 수행)
-        if layer._inv_hop_dirs_gpu === nothing
-            max_steps = layer._hop_max_steps
-            if max_steps == 0 && layer._hop_dirs_gpu === nothing
-                max_steps = 0
-                for i in 1:Nz
-                    steps_i = paths[i].various[1].steps
-                    ns = length(steps_i)
-                    if ns == 1 && steps_i[1].f == 0; ns = 0; end
-                    max_steps = max(max_steps, ns)
-                end
-                layer._hop_max_steps = max_steps
-
-                dirs_cpu = zeros(Int8, max_steps, Nz)
-                nsteps_cpu = zeros(Int32, Nz)
-                for i in 1:Nz
-                    steps_i = paths[i].various[1].steps
-                    ns = length(steps_i)
-                    if ns == 1 && steps_i[1].f == 0
-                        nsteps_cpu[i] = Int32(0)
-                    else
-                        nsteps_cpu[i] = Int32(ns)
-                        for s in 1:ns; dirs_cpu[s, i] = Int8(steps_i[s].f); end
-                    end
-                end
-                layer._hop_dirs_gpu   = CuArray(dirs_cpu)
-                layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
-            end
-
-            max_steps = layer._hop_max_steps
-            inv_dirs_cpu = zeros(Int8, max_steps, Nz)
-            for i in 1:Nz
-                inv_steps = invpaths[i].various[1].steps
-                ns = length(inv_steps)
-                if !(ns == 1 && inv_steps[1].f == 0)
-                    for s in 1:ns; inv_dirs_cpu[s, i] = Int8(inv_steps[s].f); end
-                end
-            end
-            layer._inv_hop_dirs_gpu = CuArray(inv_dirs_cpu)
-        end
-
-        # batched inverse hop: ci_buf ↔ shared hop_temp
-        max_steps = layer._hop_max_steps
-        if max_steps > 0
-            _hop_temp = get_shared_buf!(:hop_temp, NC, NG, blocksize, rsize, Nz)
-            bi = z[1].blockinfo
-            NXl = z[1].NX; NYl = z[1].NY; NZl = z[1].NZ; NTl = z[1].NT
-            batched_inv_hopping_gpu!(
-                _ci_buf, _hop_temp, layer.U,
-                layer._inv_hop_dirs_gpu, layer._hop_nsteps_gpu,
-                max_steps, Nz, blocksize, rsize, bi, NXl, NYl, NZl, NTl)
-        end
-
-        # batch conj
-        inplace_conj!(_ci_buf)
-
-        # unpack → result
-        unpack_fermions!(result, _ci_buf)
-    end
-
-    return result
 end
 
-function DeltaRule!(layer::PTLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
-
-    Out   = layer.Out
-    W     = layer.W
-    paths = layer.paths
-
-    @assert length(d) == Out "The length of d must be equal to Out."
-    @assert length(delta) == length(z) "The length of delta must be equal to the length of z."
-
-    Nz = length(z)
-    Nd = length(d)
-    NW = length(W)
-
-    # ① d_conj 버퍼 캐시 — CPU path에서만 필요
-    is_gpu = z[1] isa WF3x1GPU && layer._W_gpu !== nothing
-
-    if !is_gpu
-        if !layer._delta_init || length(layer._d_conj_buf) != Nd
-            layer._d_conj_buf = Vector{WF3x1}(undef, Nd)
-            for i in 1:Nd
-                layer._d_conj_buf[i] = deepcopy(d[1])
-            end
-            layer._ci_buffers = [deepcopy(z[1]) for _ in 1:nthreads()]
-            layer._delta_init = true
-        end
-        d_conj = layer._d_conj_buf
-        @inbounds for i in 1:Nd
-            conj_fermion!(d_conj[i], d[i])
-        end
-    elseif !layer._delta_init
-        # GPU path: ci_buffers, invhops, hop_out 불필요 (batched 처리)
-        layer._delta_init = true
-    end
-
-    # ② 역경로 캐시 (paths 불변이므로 1회만 계산)
-    if isempty(layer._invpaths) || length(layer._invpaths) != Nz
-        layer._invpaths = Vector{typeof(paths[1])}(undef, Nz)
-        @inbounds for i in 1:Nz
-            layer._invpaths[i] = reverse_paths(paths[i])
-        end
-    end
-    invpaths = layer._invpaths
-
-    # ③ Wadj 캐시 — CPU path에서만 필요
-    if !is_gpu
-        if length(layer._Wadj) != NW
-            layer._Wadj = Vector{typeof(W[1])}(undef, NW)
-            @inbounds for k in 1:NW
-                layer._Wadj[k] = adjoint(W[k])
-            end
-        end
-        Wadj = layer._Wadj
-        @inbounds for k in 1:NW
-            wsm = W[k].sm
-            wadj_sm = Wadj[k].sm
-            for j in 1:4
-                for i in 1:4
-                    wadj_sm[i,j] = conj(wsm[j,i])
-                end
-            end
-        end
-    end
-
-    # ④ invhops + hop 출력 버퍼 캐시 (CPU path에서만 필요)
-    if !is_gpu
-        nt = nthreads()
-        if isempty(layer._invhops) || length(layer._invhops) != nt
-            layer._invhops = [Hopping_operator(layer.U, invpaths[1]) for _ in 1:nt]
-            layer._hop_out = [WF3x1CPU[deepcopy(z[1])] for _ in 1:nt]
-        else
-            @inbounds for t in 1:nt
-                layer._invhops[t].Gauge = layer.U
-            end
-        end
-    end
-
-    # ⑤ 최적화: 먼저 c_i = Σ_j Wadj_{ij} * d_conj[j] 계산 후, hop 1회만 수행
-    if z[1] isa WF3x1CPU
-        ci_buffers = layer._ci_buffers
-        invhops = layer._invhops
-        hop_out = layer._hop_out
-
-        @threads for i in 1:Nz
-            tid = threadid()
-            ci = ci_buffers[tid]
-            zero_wf!(ci)
-            base = (i-1) * Out
-            @inbounds for j in 1:Out
-                addmul!(ci, Wadj[base + j], d_conj[j])
-            end
-            invhop = invhops[tid]
-            invhop.P = invpaths[i]
-            invhop(ci, hop_out[tid])  # preallocated 버전 사용
-            conj_fermion!(delta[i], hop_out[tid][1])
-        end
-    else
-        # GPU batched: Wadj*conj(d) 를 1회 커널로 전부 계산
-        NC = 3; NG = 4
-        blocksize = z[1].blockinfo.blocksize
-        rsize     = z[1].blockinfo.rsize
-
-        # Wadj_gpu 동기화 (W_gpu가 있으면 GPU에서 직접, 없으면 CPU→GPU)
-        if layer._Wadj_gpu === nothing || size(layer._Wadj_gpu, 3) != NW
-            layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
-        end
-        if layer._W_gpu !== nothing
-            sync_Wadj_gpu!(layer._Wadj_gpu, layer._W_gpu)
-        else
-            # fallback: CPU Wadj → GPU
-            Wadj_cpu = Array{ComplexF64}(undef, NG, NG, NW)
-            @inbounds for k in 1:NW
-                sm = Wadj[k].sm
-                for jj in 1:4, ii in 1:4
-                    Wadj_cpu[ii, jj, k] = sm[ii, jj]
-                end
-            end
-            copyto!(layer._Wadj_gpu, Wadj_cpu)
-        end
-
-        # d_buf, ci_all: 공유 임시 버퍼 사용 (layers 간 재사용)
-        _d_buf = get_shared_buf!(:d_buf, NC, NG, blocksize, rsize, Nd)
-        pack_fermions!(_d_buf, d)
-
-        _ci_buf = get_shared_buf!(:ci_all, NC, NG, blocksize, rsize, Nz)
-
-        # 1회 batched kernel: ci_all = Σ_j Wadj * conj(d)
-        batched_delta!(_ci_buf, layer._Wadj_gpu, _d_buf, blocksize, rsize, Nd, Nz)
-
-        # lazy init inverse direction table for batched backward hop
-        if layer._inv_hop_dirs_gpu === nothing
-            max_steps = layer._hop_max_steps
-            if max_steps == 0 && layer._hop_dirs_gpu === nothing
-                # forward batched hop이 아직 init되지 않은 경우 — 여기서 직접 계산
-                max_steps = 0
-                for i in 1:Nz
-                    steps_i = paths[i].various[1].steps
-                    ns = length(steps_i)
-                    if ns == 1 && steps_i[1].f == 0
-                        ns = 0
-                    end
-                    max_steps = max(max_steps, ns)
-                end
-                layer._hop_max_steps = max_steps
-
-                # forward dirs + nsteps (forward에서 아직 init 안된 경우)
-                dirs_cpu = zeros(Int8, max_steps, Nz)
-                nsteps_cpu = zeros(Int32, Nz)
-                for i in 1:Nz
-                    steps_i = paths[i].various[1].steps
-                    ns = length(steps_i)
-                    if ns == 1 && steps_i[1].f == 0
-                        nsteps_cpu[i] = Int32(0)
-                    else
-                        nsteps_cpu[i] = Int32(ns)
-                        for s in 1:ns
-                            dirs_cpu[s, i] = Int8(steps_i[s].f)
-                        end
-                    end
-                end
-                layer._hop_dirs_gpu   = CuArray(dirs_cpu)
-                layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
-            end
-
-            max_steps = layer._hop_max_steps
-            # inverse dirs: reverse order & negate
-            inv_dirs_cpu = zeros(Int8, max_steps, Nz)
-            for i in 1:Nz
-                inv_steps = invpaths[i].various[1].steps
-                ns = length(inv_steps)
-                if ns == 1 && inv_steps[1].f == 0
-                    # identity — nsteps=0
-                else
-                    for s in 1:ns
-                        inv_dirs_cpu[s, i] = Int8(inv_steps[s].f)
-                    end
-                end
-            end
-            layer._inv_hop_dirs_gpu = CuArray(inv_dirs_cpu)
-        end
-
-        # batched inverse hop: ci_buf ↔ shared hop_temp
-        max_steps = layer._hop_max_steps
-        if max_steps > 0
-            _hop_temp = get_shared_buf!(:hop_temp, NC, NG, blocksize, rsize, Nz)
-            bi = z[1].blockinfo
-            NX = z[1].NX; NY = z[1].NY; NZ_ = z[1].NZ; NT = z[1].NT
-            batched_inv_hopping_gpu!(
-                _ci_buf, _hop_temp, layer.U,
-                layer._inv_hop_dirs_gpu, layer._hop_nsteps_gpu,
-                max_steps, Nz, blocksize, rsize, bi, NX, NY, NZ_, NT)
-        end
-
-        # batch conj
-        inplace_conj!(_ci_buf)
-
-        # unpack → delta
-        unpack_fermions!(delta, _ci_buf)
-    end
-
-    return nothing
-end
+# ---------------------------------------------------------------------------
+# Adam update
+# ---------------------------------------------------------------------------
 
 function update!(layer::PTLayer, opt::Adam, grad)
-    # GPU batched path: grad[1]이 CuArray이면 GPU Adam
     if grad[1] isa CuArray
         NW = length(layer.W)
         NG = 4
-        # lazy init Adam states on GPU
         if layer._adam_m_gpu === nothing || size(layer._adam_m_gpu, 3) != NW
             layer._adam_m_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
             layer._adam_v_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
@@ -749,7 +481,6 @@ function update!(layer::PTLayer, opt::Adam, grad)
         gpu_adam_update!(layer._W_gpu, layer._adam_m_gpu, layer._adam_v_gpu, grad[1],
                          opt.α, opt.β1, opt.β2, opt.ε, opt.t)
     else
-        # CPU fallback
         param = layer.W
         for i in 1:length(param)
             complexProcess(param[i], opt, grad[1][i])
@@ -757,183 +488,78 @@ function update!(layer::PTLayer, opt::Adam, grad)
     end
 end
 
-# ──── Batched forward kernel ────
-# result[c,g,b,r,j] = Σ_i Σ_g2  W[g,g2,(i-1)*Out+j] * hopped[c,g2,b,r,i]
+# ---------------------------------------------------------------------------
+# CPU/GPU conversion
+# ---------------------------------------------------------------------------
 
-function _cudakernel_batched_forward!(
-    result_all::CuDeviceArray{ComplexF64, 5},
-    W_gpu     ::CuDeviceArray{ComplexF64, 3},
-    hopped_all::CuDeviceArray{ComplexF64, 5},
-    NC::Int, NG::Int, npaths::Int, Out::Int
-)
-    b = Int(threadIdx().x)
-    r = Int(blockIdx().x)
+_has_gpu(layer::PTLayer) = eltype(layer.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
 
-    @inbounds for j in 1:Out
-        for c in 1:NC
-            a1 = zero(ComplexF64); a2 = zero(ComplexF64)
-            a3 = zero(ComplexF64); a4 = zero(ComplexF64)
-            for i in 1:npaths
-                widx = (i-1)*Out + j
-                x1 = hopped_all[c, 1, b, r, i]
-                x2 = hopped_all[c, 2, b, r, i]
-                x3 = hopped_all[c, 3, b, r, i]
-                x4 = hopped_all[c, 4, b, r, i]
-                a1 += W_gpu[1,1,widx]*x1 + W_gpu[1,2,widx]*x2 + W_gpu[1,3,widx]*x3 + W_gpu[1,4,widx]*x4
-                a2 += W_gpu[2,1,widx]*x1 + W_gpu[2,2,widx]*x2 + W_gpu[2,3,widx]*x3 + W_gpu[2,4,widx]*x4
-                a3 += W_gpu[3,1,widx]*x1 + W_gpu[3,2,widx]*x2 + W_gpu[3,3,widx]*x3 + W_gpu[3,4,widx]*x4
-                a4 += W_gpu[4,1,widx]*x1 + W_gpu[4,2,widx]*x2 + W_gpu[4,3,widx]*x3 + W_gpu[4,4,widx]*x4
-            end
-            result_all[c, 1, b, r, j] = a1
-            result_all[c, 2, b, r, j] = a2
-            result_all[c, 3, b, r, j] = a3
-            result_all[c, 4, b, r, j] = a4
+function _get_blocks(layer::PTLayer)
+    if eltype(layer.U) <: Gaugefields.AbstractGaugefields_module.Gaugefields_4D_accelerator
+        bi = layer.U[1].blockinfo
+        return bi.blocks
+    end
+    return nothing
+end
+
+_shared_layer_gauge(layer::PTLayer) = layer.U
+
+function _to_cpu(layer::PTLayer)
+    U_cpu = _to_cpu_gauge(layer.U)
+    new_layer = PTLayer(layer.paths, U_cpu, layer.Out, layer.activation)
+    W_cpu = _to_cpu_W(layer.W)
+    new_layer.W = W_cpu
+    return new_layer
+end
+
+function _to_gpu(layer::PTLayer, blocks=nothing)
+    U_gpu = _to_gpu_gauge(layer.U; blocks=blocks)
+    new_layer = PTLayer(layer.paths, U_gpu, layer.Out, layer.activation)
+    W_gpu = _to_gpu_W(layer.W)
+    new_layer.W = W_gpu
+    return new_layer
+end
+
+function _to_gpu(layer::PTLayer, blocks, shared_U)
+    U_gpu = shared_U === nothing ? _to_gpu_gauge(layer.U; blocks=blocks) : shared_U
+    new_layer = PTLayer(layer.paths, U_gpu, layer.Out, layer.activation)
+    W_gpu = _to_gpu_W(layer.W)
+    new_layer.W = W_gpu
+    return new_layer
+end
+
+_refresh_layer!(layer::PTLayer, D_new, U_new) = (layer.U = U_new)
+
+# ---------------------------------------------------------------------------
+# Direction tables for the batched GPU hop kernels
+# ---------------------------------------------------------------------------
+
+# Number of unit steps in a path; the identity path (a single step of
+# direction 0) has none.
+function _path_nsteps(path)
+    steps = path.various[1].steps
+    return length(steps) == 1 && steps[1].f == 0 ? 0 : length(steps)
+end
+
+# Direction table for the batched hop kernels: column i lists the step
+# directions of paths[i], padded with zeros to max_steps rows.
+function _hop_direction_table(paths, max_steps=maximum(_path_nsteps, paths; init=0))
+    dirs = zeros(Int8, max_steps, length(paths))
+    nsteps = zeros(Int32, length(paths))
+    for (i, path) in enumerate(paths)
+        ns = _path_nsteps(path)
+        nsteps[i] = Int32(ns)
+        for s in 1:ns
+            dirs[s, i] = Int8(path.various[1].steps[s].f)
         end
     end
-    return nothing
+    return dirs, nsteps, max_steps
 end
 
-"""
-    batched_forward!(result_all, W_gpu, hopped_all, blocksize, rsize, npaths, Out)
-
-625개 gpuaddmul! 대신 1회 커널 launch.
-"""
-function batched_forward!(result_all, W_gpu, hopped_all, blocksize, rsize, npaths, Out)
-    NC = 3; NG = 4
-    CUDA.@cuda threads=blocksize blocks=rsize _cudakernel_batched_forward!(
-        result_all, W_gpu, hopped_all, NC, NG, npaths, Out)
-end
-
-# ──── Batched gradient kernel (inner-product reduction) ────
-# M_all[fg,xg,widx] = Σ_{c,b,r} d[c,fg,b,r,j] * hopped[c,xg,b,r,i]
-#  where  j = (widx-1)%Out + 1,  i = (widx-1)÷Out + 1
-
-function _cudakernel_batched_gradient!(
-    M_all     ::CuDeviceArray{ComplexF64, 3},
-    d_all     ::CuDeviceArray{ComplexF64, 5},
-    hopped_all::CuDeviceArray{ComplexF64, 5},
-    NC::Int, NG::Int, blocksize::Int, rsize::Int, Out::Int, npaths::Int
-)
-    tid = Int(threadIdx().x)
-    bid = Int(blockIdx().x)
-
-    NW = npaths * Out
-    fg  = ((bid - 1) % NG) + 1
-    rest = (bid - 1) ÷ NG
-    xg   = (rest % NG) + 1
-    widx = (rest ÷ NG) + 1
-    if widx > NW; return; end
-
-    j = ((widx - 1) % Out) + 1
-    i = ((widx - 1) ÷ Out) + 1
-
-    N = NC * blocksize * rsize
-    acc = zero(ComplexF64)
-    stride = blockDim().x
-    k = tid
-    while k <= N
-        k0 = k - 1
-        ic = (k0 % NC) + 1
-        t  = k0 ÷ NC
-        b  = (t % blocksize) + 1
-        r  = (t ÷ blocksize) + 1
-        @inbounds acc += d_all[ic, fg, b, r, j] * hopped_all[ic, xg, b, r, i]
-        k += stride
-    end
-
-    sh = CUDA.CuStaticSharedArray(ComplexF64, 256)
-    @inbounds sh[tid] = acc
-    CUDA.sync_threads()
-    offset = stride >>> 1
-    while offset >= 1
-        if tid <= offset
-            @inbounds sh[tid] += sh[tid + offset]
-        end
-        CUDA.sync_threads()
-        offset >>>= 1
-    end
-    if tid == 1
-        @inbounds M_all[fg, xg, widx] = sh[1]
-    end
-    return nothing
-end
-
-"""
-    batched_gradient!(grad_gpu, d_all, hopped_all, blocksize, rsize, Out, npaths)
-
-625개 kernel_matmul_batched! 대신 1회 launch.
-결과는 grad_gpu (CuArray 4×4×NW) 에 직접 기록 → GPU→CPU 전송 불필요.
-"""
-function batched_gradient!(grad_gpu, d_all, hopped_all, blocksize, rsize, Out, npaths)
-    NG = 4; NC = 3
-    NW = npaths * Out
-    threads = 256
-    nblocks = NG * NG * NW          # 16 * NW
-    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_batched_gradient!(
-        grad_gpu, d_all, hopped_all, NC, NG, blocksize, rsize, Out, npaths)
-end
-
-# ──── Batched DeltaRule kernel ────
-# ci[c,g,b,r,i] = Σ_j Σ_g2  Wadj[g,g2,(i-1)*Out+j] * conj(d[c,g2,b,r,j])
-
-function _cudakernel_batched_delta!(
-    ci_all   ::CuDeviceArray{ComplexF64, 5},
-    Wadj_gpu ::CuDeviceArray{ComplexF64, 3},
-    d_all    ::CuDeviceArray{ComplexF64, 5},
-    NC::Int, NG::Int, Out::Int, npaths::Int
-)
-    b = Int(threadIdx().x)
-    r = Int(blockIdx().x)
-
-    @inbounds for i in 1:npaths
-        for c in 1:NC
-            a1 = zero(ComplexF64); a2 = zero(ComplexF64)
-            a3 = zero(ComplexF64); a4 = zero(ComplexF64)
-            for j in 1:Out
-                widx = (i-1)*Out + j
-                x1 = conj(d_all[c, 1, b, r, j])
-                x2 = conj(d_all[c, 2, b, r, j])
-                x3 = conj(d_all[c, 3, b, r, j])
-                x4 = conj(d_all[c, 4, b, r, j])
-                a1 += Wadj_gpu[1,1,widx]*x1 + Wadj_gpu[1,2,widx]*x2 + Wadj_gpu[1,3,widx]*x3 + Wadj_gpu[1,4,widx]*x4
-                a2 += Wadj_gpu[2,1,widx]*x1 + Wadj_gpu[2,2,widx]*x2 + Wadj_gpu[2,3,widx]*x3 + Wadj_gpu[2,4,widx]*x4
-                a3 += Wadj_gpu[3,1,widx]*x1 + Wadj_gpu[3,2,widx]*x2 + Wadj_gpu[3,3,widx]*x3 + Wadj_gpu[3,4,widx]*x4
-                a4 += Wadj_gpu[4,1,widx]*x1 + Wadj_gpu[4,2,widx]*x2 + Wadj_gpu[4,3,widx]*x3 + Wadj_gpu[4,4,widx]*x4
-            end
-            ci_all[c, 1, b, r, i] = a1
-            ci_all[c, 2, b, r, i] = a2
-            ci_all[c, 3, b, r, i] = a3
-            ci_all[c, 4, b, r, i] = a4
-        end
-    end
-    return nothing
-end
-
-"""
-    batched_delta!(ci_all, Wadj_gpu, d_all, blocksize, rsize, Out, npaths)
-
-DeltaRule의 gpuaddmul! 625회 → 1회 커널.
-d_all은 원본 d (conj는 커널 내부에서 수행).
-"""
-function batched_delta!(ci_all, Wadj_gpu, d_all, blocksize, rsize, Out, npaths)
-    NC = 3; NG = 4
-    CUDA.@cuda threads=blocksize blocks=rsize _cudakernel_batched_delta!(
-        ci_all, Wadj_gpu, d_all, NC, NG, Out, npaths)
-end
-
-function _cudakernel_adjoint_W!(Wadj, W, n)
-    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    if idx > n; return; end
-    @inbounds for j in 1:4, i in 1:4
-        Wadj[i, j, idx] = conj(W[j, i, idx])
-    end
-    return nothing
-end
-
-"""W_gpu → Wadj_gpu (transpose-conjugate, GPU 위에서)"""
-function sync_Wadj_gpu!(Wadj_gpu, W_gpu)
-    n = size(W_gpu, 3)
-    threads = min(256, n)
-    nblocks = cld(n, threads)
-    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adjoint_W!(Wadj_gpu, W_gpu, n)
+function _init_hop_tables!(layer::PTLayer)
+    dirs_cpu, nsteps_cpu, max_steps = _hop_direction_table(layer.paths)
+    layer._hop_max_steps  = max_steps
+    layer._hop_dirs_gpu   = CuArray(dirs_cpu)
+    layer._hop_nsteps_gpu = CuArray(nsteps_cpu)
+    return layer
 end

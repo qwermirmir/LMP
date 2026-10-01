@@ -1,29 +1,49 @@
-# DenseLinearLayer: maps In input fields to Out output fields by spin-matrix
-# weights, y_j = sum_i W_ji x_i.
+# DenseLinearLayer: mixes In input fields into Out output fields with
+# spin-matrix weights, without any parallel transport.
 
+"""
+    DenseLinearLayer(In, Out, cuda, activation=Identity())
+
+Linear layer on fermion fields with `In` inputs and `Out` outputs:
+
+    y[i] = sum_k W[(k-1)*Out + i] * x[k],    i = 1..Out
+
+Each `W[n]` is a 4x4 spin matrix applied at every site. `cuda` selects GPU
+(`Spin_matrix_GPU`) or CPU (`Spin_matrix`) weights.
+
+Backward pass, for output deltas `d[1:Out]`:
+
+    delta[k] = sum_i conj(W[(k-1)*Out + i]^dagger conj(d[i]))
+
+Weight gradient: `dL/dW[(k-1)*Out + i] = Matmul!(d[i], x[k])`, the 4x4 matrix
+`sum_x d[i][a](x) x[k][b](x)`.
+
+On the GPU it uses the batched kernels in `core/spin_mixing.jl` with the In
+inputs in place of paths.
+"""
 mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
-    W::Vector{T}
+    W::Vector{T}              # W[(k-1)*Out + i]: weight from input k to output i
     In::Int
     Out::Int
     cuda::Bool
     activation::ActivationFunction
-    # --- 캐시 버퍼 ---
-    _result::Vector{WF3x1}
-    _yi::Vector{WF3x1}          # yi 버퍼 (1-element)
+    # CPU buffers
+    _result::Vector{WF3x1}    # output fields
+    _yi::Vector{WF3x1}        # 1-element work field
     _dl_init::Bool
-    _conj_buf::Vector{WF3x1}   # conj 작업용 버퍼 (DeltaRule!에서 재사용)
+    _conj_buf::Vector{WF3x1}  # [conj(d[i]), conj(y)] for DeltaRule!
     _delta_init_dl::Bool
-    # --- GPU batched 버퍼 ---
-    _W_gpu::Any           # CuArray{ComplexF64,3} (NG,NG,NW)
-    _Wadj_gpu::Any        # CuArray{ComplexF64,3}
-    _input_all::Any       # CuArray{ComplexF64,5} (NC,NG,bs,rs,In)
-    _result_all::Any      # CuArray{ComplexF64,5} (NC,NG,bs,rs,Out)
-    _d_buf::Any           # CuArray{ComplexF64,5} (NC,NG,bs,rs,Out)
-    _ci_all::Any          # CuArray{ComplexF64,5} (NC,NG,bs,rs,In)
-    _grad_gpu::Any        # CuArray{ComplexF64,3} (NG,NG,NW)
+    # GPU arrays
+    _W_gpu::Any               # CuArray{ComplexF64,3} (4, 4, NW)
+    _Wadj_gpu::Any            # CuArray{ComplexF64,3} (4, 4, NW), W^dagger
+    _input_all::Any           # CuArray{ComplexF64,5} (NC, NG, bs, rs, In)
+    _result_all::Any          # CuArray{ComplexF64,5} (NC, NG, bs, rs, Out)
+    _d_buf::Any               # CuArray{ComplexF64,5} (NC, NG, bs, rs, Out)
+    _ci_all::Any              # CuArray{ComplexF64,5} (NC, NG, bs, rs, In)
+    _grad_gpu::Any            # CuArray{ComplexF64,3} (4, 4, NW)
     _adam_m_gpu::Any
     _adam_v_gpu::Any
-    _W_cpu_buf::Any          # Array{ComplexF64,3} (NG,NG,NW) — sync_W_from_gpu! staging
+    _W_cpu_buf::Any           # Array{ComplexF64,3} (4, 4, NW), staging for sync_W_from_gpu!
 
     function DenseLinearLayer(In::Int, Out::Int, cuda::Bool, activation::ActivationFunction=Identity() )
         if cuda == true
@@ -42,48 +62,9 @@ mutable struct DenseLinearLayer{T<:AbstractSpinMatrix} <: Layer
     end
 end
 
-_has_gpu(layer::DenseLinearLayer{Spin_matrix_GPU}) = true
-
-# --- DenseLinearLayer ---
-function _to_cpu(layer::DenseLinearLayer{Spin_matrix_GPU})
-    new_layer = DenseLinearLayer(layer.In, layer.Out, false, layer.activation)
-    W_cpu = Convertsm(layer.W)
-    for j in eachindex(W_cpu)
-        new_layer.W[j] = W_cpu[j]
-    end
-    return new_layer
-end
-
-# --- DenseLinearLayer ---
-function _to_gpu(layer::DenseLinearLayer{Spin_matrix}, blocks=nothing)
-    new_layer = DenseLinearLayer(layer.In, layer.Out, true, layer.activation)
-    W_gpu = [Spin_matrix_GPU(w) for w in layer.W]
-    for j in eachindex(W_gpu)
-        new_layer.W[j] = W_gpu[j]
-    end
-    return new_layer
-end
-
-# function (layer::DenseLinearLayer)(x::Vector{WF3x1CPU}) 
-#     Out=layer.Out
-#     W=layer.W
-
-
-# @assert length(W) == length(x)*Out "W Out ."
-
-#     result = Vector{WF3x1}(undef, Out)
-
-#     for k in 1:length(x)
-#         @inbounds for i in 1:Out
-#             result[i]=W[i+(k-1)*Out]*x[k]
-#             result[i] = layer.activation(result[i])
-#         end
-#     end
-
-#     return result
-    
-# end
-
+# ---------------------------------------------------------------------------
+# Forward pass
+# ---------------------------------------------------------------------------
 
 function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     Out = layer.Out
@@ -106,7 +87,6 @@ function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     result = layer._result
 
     if x[1] isa WF3x1GPU
-        # GPU batched path: collapse many small kernels into one batched kernel.
         NC = 3; NG = 4
         blocksize = x[1].blockinfo.blocksize
         rsize     = x[1].blockinfo.rsize
@@ -127,7 +107,6 @@ function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
         batched_forward!(layer._result_all, layer._W_gpu, layer._input_all, blocksize, rsize, In, Out)
         unpack_fermions!(result, layer._result_all)
     else
-        # CPU path
         yi = layer._yi[1]
         @inbounds for j in 1:Out
             zero_wf!(result[j])
@@ -142,34 +121,99 @@ function (layer::DenseLinearLayer)(x::AbstractVector{T}) where {T<:WF3x1}
     return result
 end
 
-# function gradient(layer::DenseLinearLayer, ::Identity, z::Vector{WF3x1CPU}, d::Vector{T} ,  γ::Vector{Spin_matrix} ) where T<:WF3x1
+# ---------------------------------------------------------------------------
+# Backward pass
+# ---------------------------------------------------------------------------
 
+function DeltaRule!(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{<:WF3x1}, delta::Vector{<:WF3x1}) where T<:WF3x1
 
-#     grad=Vector{Spin_matrix}(undef, length(layer.W))
+    W   = layer.W
+    In  = layer.In
+    Out = layer.Out
+    NW  = length(W)
 
-#     for i in 1:length(layer.W)
-#         grad[i]=similar(layer.W[i])
-#     end
+    if z[1] isa WF3x1GPU && layer._W_gpu !== nothing
+        NC = 3; NG = 4
+        blocksize = z[1].blockinfo.blocksize
+        rsize     = z[1].blockinfo.rsize
 
+        if layer._Wadj_gpu === nothing
+            layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
+        end
+        sync_Wadj_gpu!(layer._Wadj_gpu, layer._W_gpu)
 
+        if layer._d_buf === nothing || size(layer._d_buf, 5) != Out
+            layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Out)
+        end
+        pack_fermions!(layer._d_buf, d)
 
-#     for i in 1:length(layer.W)
-#         grad[i]=Matmul!(d[i],z[i])
-#     end
+        if layer._ci_all === nothing || size(layer._ci_all, 5) != In
+            layer._ci_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, In)
+        end
 
-#     return [grad]
+        batched_delta!(layer._ci_all, layer._Wadj_gpu, layer._d_buf, blocksize, rsize, Out, In)
+        unpack_fermions!(delta, layer._ci_all)
+        # batched_delta! computes W^dagger conj(d); the outer conj matches the CPU path.
+        for k in 1:In
+            conj_fermion!(delta[k], delta[k])
+        end
+    else
+        if !layer._delta_init_dl || typeof(layer._conj_buf[1]) != typeof(z[1])
+            layer._conj_buf = [deepcopy(z[1]), deepcopy(z[1])]  # [conj_d, conj_y]
+            layer._delta_init_dl = true
+        end
+        conj_d = layer._conj_buf[1]
+        conj_y = layer._conj_buf[2]
+        y = layer._yi[1]
 
+        zero_wf!(delta)
+        for k in 1:In
+            for i in 1:Out
+                conj_fermion!(conj_d, d[i])
+                mul!(y, adjoint(W[i+(k-1)*Out]), conj_d)
+                conj_fermion!(conj_y, y)
+                axpby!(1, conj_y, 1, delta[k])
+            end
+        end
+    end
+    return nothing
+end
+
+# Allocating version of DeltaRule!. It does not rely on the forward-pass buffers.
+function DeltaRule(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{WF3x1} ) where T<:WF3x1
+
+    W=layer.W
+
+    result=Vector{WF3x1}(undef,length(z))
+    y=similar(z[1])
+    for i in 1:length(z)
+        result[i]=deepcopy(y)
+    end
+
+    for k in 1:length(z)
+        for i in 1:length(d)
+            mul!(y,adjoint(W[i+(k-1)*length(d)]),(conj(d[i])))
+            axpby!(1,conj(y),1,result[k])
+        end
+    end
+    return result
+end
+
+# ---------------------------------------------------------------------------
+# Weight gradient
+# ---------------------------------------------------------------------------
+
+# Returns [grad_gpu] on the GPU and a vector of spin matrices on the CPU.
 function gradient(layer::DenseLinearLayer, ::Identity,
                   z::AbstractVector{TZ},
                   d::AbstractVector{TD},
                   M::Any) where {TZ<:WF3x1, TD<:WF3x1}
-    
+
     n = length(layer.W)
     nd = length(d)
     nz = length(z)
 
     if d[1] isa WF3x1GPU && layer._W_gpu !== nothing
-        # GPU batched gradient: 1회 커널
         NC = 3; NG = 4
         blocksize = d[1].blockinfo.blocksize
         rsize     = d[1].blockinfo.rsize
@@ -177,8 +221,7 @@ function gradient(layer::DenseLinearLayer, ::Identity,
         if layer._grad_gpu === nothing
             layer._grad_gpu = CUDA.zeros(ComplexF64, NG, NG, n)
         end
-        # d_buf, input_all should already be packed from forward/backward
-        # but repack to be safe (d may differ from backward's d)
+        # Pack d and z again: the buffers may hold other fields by now.
         if layer._d_buf === nothing || size(layer._d_buf, 5) != nd
             layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, nd)
         end
@@ -204,90 +247,11 @@ function gradient(layer::DenseLinearLayer, ::Identity,
     end
 end
 
-function DeltaRule(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{WF3x1} ) where T<:WF3x1
-
-    W=layer.W
-
-
-    result=Vector{WF3x1}(undef,length(z))
-    y=similar(z[1])
-    for i in 1:length(z)
-        result[i]=deepcopy(y)
-    end
-
-    for k in 1:length(z)
-
-        for i in 1:length(d)
-
-            # addmul!(result,adjoint(W[i]),(conj(d[i])))
-
-            mul!(y,adjoint(W[i+(k-1)*length(d)]),(conj(d[i])))
-
-            axpby!(1,conj(y),1,result[k])
-            # result=result+y
-        end 
-    end 
-    return result
-end
-
-function DeltaRule!(layer::DenseLinearLayer, ::Identity, z::Vector{T}, d::Vector{<:WF3x1}, delta::Vector{<:WF3x1}) where T<:WF3x1
-
-    W   = layer.W
-    In  = layer.In
-    Out = layer.Out
-    NW  = length(W)
-
-    if z[1] isa WF3x1GPU && layer._W_gpu !== nothing
-        # GPU batched: Wadj * conj(d) → delta, 1회 커널
-        NC = 3; NG = 4
-        blocksize = z[1].blockinfo.blocksize
-        rsize     = z[1].blockinfo.rsize
-
-        if layer._Wadj_gpu === nothing
-            layer._Wadj_gpu = CUDA.zeros(ComplexF64, NG, NG, NW)
-        end
-        sync_Wadj_gpu!(layer._Wadj_gpu, layer._W_gpu)
-
-        if layer._d_buf === nothing || size(layer._d_buf, 5) != Out
-            layer._d_buf = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, Out)
-        end
-        pack_fermions!(layer._d_buf, d)
-
-        if layer._ci_all === nothing || size(layer._ci_all, 5) != In
-            layer._ci_all = CUDA.zeros(ComplexF64, NC, NG, blocksize, rsize, In)
-        end
-
-        batched_delta!(layer._ci_all, layer._Wadj_gpu, layer._d_buf, blocksize, rsize, Out, In)
-        unpack_fermions!(delta, layer._ci_all)
-        # batched_delta!는 Wadj*conj(d)만 계산 — CPU 경로의 conj(W†*conj(d))와 맞추려면 outer conj 필요
-        for k in 1:In
-            conj_fermion!(delta[k], delta[k])
-        end
-    else
-        # CPU path
-        if !layer._delta_init_dl || typeof(layer._conj_buf[1]) != typeof(z[1])
-            layer._conj_buf = [deepcopy(z[1]), deepcopy(z[1])]  # [conj_d, conj_y]
-            layer._delta_init_dl = true
-        end
-        conj_d = layer._conj_buf[1]
-        conj_y = layer._conj_buf[2]
-        y = layer._yi[1]
-
-        zero_wf!(delta)
-        for k in 1:In
-            for i in 1:Out
-                conj_fermion!(conj_d, d[i])
-                mul!(y, adjoint(W[i+(k-1)*Out]), conj_d)
-                conj_fermion!(conj_y, y)
-                axpby!(1, conj_y, 1, delta[k])
-            end
-        end
-    end
-    return nothing
-end
+# ---------------------------------------------------------------------------
+# Adam update
+# ---------------------------------------------------------------------------
 
 function update!(layer::DenseLinearLayer, opt::Adam, grad)
-    # GPU batched path: grad[1]이 CuArray이면 GPU Adam
     if grad[1] isa CuArray
         NW = length(layer.W)
         NG = 4
@@ -307,4 +271,28 @@ function update!(layer::DenseLinearLayer, opt::Adam, grad)
             end
         end
     end
+end
+
+# ---------------------------------------------------------------------------
+# CPU/GPU conversion
+# ---------------------------------------------------------------------------
+
+_has_gpu(layer::DenseLinearLayer{Spin_matrix_GPU}) = true
+
+function _to_cpu(layer::DenseLinearLayer{Spin_matrix_GPU})
+    new_layer = DenseLinearLayer(layer.In, layer.Out, false, layer.activation)
+    W_cpu = Convertsm(layer.W)
+    for j in eachindex(W_cpu)
+        new_layer.W[j] = W_cpu[j]
+    end
+    return new_layer
+end
+
+function _to_gpu(layer::DenseLinearLayer{Spin_matrix}, blocks=nothing)
+    new_layer = DenseLinearLayer(layer.In, layer.Out, true, layer.activation)
+    W_gpu = [Spin_matrix_GPU(w) for w in layer.W]
+    for j in eachindex(W_gpu)
+        new_layer.W[j] = W_gpu[j]
+    end
+    return new_layer
 end
