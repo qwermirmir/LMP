@@ -165,6 +165,35 @@ function backward_and_gradient!(
     end
 end
 
+# Builds the delta buffers of backward_and_gradient! from one forward pass.
+# The body of the model is the run of layers whose outputs have as many
+# fields as u[4]; the tail is everything from the first layer after the body
+# to the loss.
+function _backward_buffer_setup!(layers, D, depth::Int)
+    u, _ = forward_propagation(layers, D, D)
+
+    body_size = length(u[min(4, depth)])
+
+    # Tail layers get their own delta buffers.
+    delta_tail = Dict{Int,Any}(depth-1 => deepcopy(u[depth]))
+    for j in 3:depth-2
+        length(u[j+1]) != body_size && (delta_tail[j] = deepcopy(u[j+1]))
+    end
+    transition_j = minimum(keys(delta_tail))
+    for j in transition_j:depth-1
+        haskey(delta_tail, j) || (delta_tail[j] = deepcopy(u[j+1]))
+    end
+
+    # Two alternating body buffers shaped like u[transition_j].
+    buf_a = deepcopy(u[transition_j])
+    buf_b = deepcopy(u[transition_j])
+
+    # u[1] is [D], so the delta at u[2] needs its own buffer.
+    delta1_buf = depth >= 2 ? deepcopy(u[2]) : nothing
+
+    return u, delta_tail, transition_j, buf_a, buf_b, delta1_buf
+end
+
 # Adds a layer gradient into the accumulator d[j]. Some layers return their own
 # cached gradient buffer, so with batch > 1 the first sample's gradient can be
 # overwritten by the next one (see CLEANUP_PLAN.md).
