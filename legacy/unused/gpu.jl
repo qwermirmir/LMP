@@ -664,3 +664,31 @@ function fused_hopping_gpu!(V::AbstractVector{<:WF3x1GPU}, x::WF3x1GPU,
         end
     end
 end
+
+# Sum over spin and colour at every site. Its only caller was a disabled
+# branch of the BlockScalar gradient.
+
+function _sum_spin_color_kernel!(
+    out::CuDeviceVector{ComplexF64},
+    x::CuDeviceVector{ComplexF64},
+    nc_ng::Int32,
+    n_sites::Int32
+)
+    tid = Int32(threadIdx().x) + (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x)
+    if tid <= n_sites
+        s = ComplexF64(0.0)
+        base = nc_ng * (tid - Int32(1))
+        for j in Int32(1):nc_ng
+            @inbounds s += x[base + j]
+        end
+        @inbounds out[tid] = s
+    end
+    nothing
+end
+
+function _sum_spin_color!(out::CuArray{ComplexF64}, x::CuArray{ComplexF64,4})
+    nc_ng   = Int32(size(x, 1) * size(x, 2))
+    n_sites = Int32(size(x, 3) * size(x, 4))
+    @cuda threads=256 blocks=cld(Int(n_sites), 256) _sum_spin_color_kernel!(
+        reshape(out, :), reshape(x, :), nc_ng, n_sites)
+end

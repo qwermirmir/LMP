@@ -1,17 +1,35 @@
-# NormLayer: normalises each field to unit norm.
+# NormLayer: scales each field to a fixed norm. It has no trainable weights.
 
+"""
+    NormLayer(activation=Identity(), alpha=1.0)
+
+Normalisation layer:
+
+    y[i] = alpha * x[i] / ||x[i]||
+
+Backward pass, for output deltas `d`:
+
+    delta[i] = d[i] / ||z[i]|| - Re(sum_x z[i](x) d[i](x)) * conj(z[i]) / ||z[i]||^3
+
+The backward pass omits the factor `alpha`, so it is exact only for
+`alpha = 1`, the value every current model uses.
+"""
 mutable struct NormLayer <: Layer
     activation::ActivationFunction
     alpha::Float64
     _result::Vector{WF3x1}
     _norm_init::Bool
-    _conj_buf::Vector{WF3x1}   # conj 작업용 버퍼 (DeltaRule!에서 재사용)
+    _conj_buf::Vector{WF3x1}  # conj(z[i]) for DeltaRule!
 
     function NormLayer(activation::ActivationFunction= Identity(),alpha::Float64=1.0)
         new(activation,alpha, WF3x1[], false, WF3x1[])
     end
 
-end 
+end
+
+# ---------------------------------------------------------------------------
+# Forward pass
+# ---------------------------------------------------------------------------
 
 function (layer::NormLayer)(x::AbstractVector{<:WF3x1})
     n = length(x)
@@ -35,32 +53,9 @@ function (layer::NormLayer)(x::AbstractVector{<:WF3x1})
     return result
 end
 
-function gradient(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  γ::Vector{Spin_matrix} )where T<:WF3x1
-
-    return nothing
-end
-
-# function DeltaRule(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}) where T<:WF3x1
-
-
-
-#     result = Vector{WF3x1}(undef, length(z))
-#     α = layer.alpha
-
-
-#     @inbounds for i in 1:length(z)
-#         cz=conj(z[i])
-#         norm = sqrt(norm2(z[i]))
-#         eta1 = inner_product(cz, d[i])/2                  # z† d
-#         eta2 = inner_product(z[i], conj(d[i]))/2            # zᵗ d*
-
-#         result[i] = d[i] / norm
-#         result[i] -= (eta1 * cz) / norm^3
-#         result[i] -= (eta2 * cz) / norm^3
-#     end
-
-#     return result
-# end
+# ---------------------------------------------------------------------------
+# Backward pass
+# ---------------------------------------------------------------------------
 
 function DeltaRule!(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}, delta::Vector{WF3x1}) where T<:WF3x1
 
@@ -93,30 +88,23 @@ function DeltaRule!(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T}
 
 end
 
-# NormLayer용 update! 추가
-function update!(layer::NormLayer, opt::Adam, grad::Float64)
-    key = objectid(layer)
-    state = get!(opt.scalar_state, key) do
-        AdamState{Float64}(0.0, 0.0)
-    end
+# ---------------------------------------------------------------------------
+# No weights: no gradient and no update
+# ---------------------------------------------------------------------------
 
-    state.m = opt.β1 * state.m + (1 - opt.β1) * grad
-    state.v = opt.β2 * state.v + (1 - opt.β2) * grad^2
-
-    m_hat = state.m / (1 - opt.β1^opt.t)
-    v_hat = state.v / (1 - opt.β2^opt.t)
-    layer.W -= opt.α * m_hat / (sqrt(v_hat) + opt.ε)
+function gradient(layer::NormLayer, ::Identity, z::Vector{WF3x1}, d::Vector{T} ,  γ::Vector{Spin_matrix} )where T<:WF3x1
+    return nothing
 end
 
 function update!(layer::NormLayer, opt::Adam, grad::Any)
-
    return
-end 
+end
 
-# ==============================================================
-#  NormLayer per-field fused kernels — pack/unpack 없이 직접 처리
-# ==============================================================
+# ---------------------------------------------------------------------------
+# GPU kernels: one field per launch, reduced in shared memory
+# ---------------------------------------------------------------------------
 
+# out = alpha * x / ||x||
 function _normlayer_fwd_kernel!(
     out  ::CuDeviceArray{ComplexF64,4},
     x    ::CuDeviceArray{ComplexF64,4},
@@ -158,6 +146,7 @@ function _normlayer_fwd!(out::CuArray{ComplexF64,4}, x::CuArray{ComplexF64,4}, a
         out, x, alpha, total)
 end
 
+# out = d / ||z|| - Re(sum z d) conj(z) / ||z||^3
 function _normlayer_bwd_kernel!(
     out  ::CuDeviceArray{ComplexF64,4},
     z    ::CuDeviceArray{ComplexF64,4},

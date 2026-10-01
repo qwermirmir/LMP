@@ -1,34 +1,40 @@
-# BlockScalar_Layer: multiplies each field by a complex scalar that is constant
+# BlockScalar_Layer: multiplies each field by complex scalars that are constant
 # on blocks of r^4 sites.
 
 """
-    BlockScalar_Layer
+    BlockScalar_Layer(x, n, r, residual=false, activation=Identity())
 
-blockize로 블록화된 벡터 각각에 스칼라(복소수) 가중치를 곱하는 학습 레이어.
+Block-wise scalar layer for `n` fields shaped like `x`. The lattice is divided
+into blocks of `r^4` sites, and field `k` is multiplied by the weight of the
+block that contains each site:
 
-# Fields
-- `W::Vector{ComplexF64}` — 블록 개수만큼의 스칼라 가중치
-- `r::Int` — blockize에 사용되는 블록 크기
-- `residual::Bool` — residual connection 활성화 여부
-- `activation::ActivationFunction` — 활성화 함수
+    y[k](site) = W[block(site), k] * x[k](site)        (+ x[k](site) if residual)
+
+`W` is an `nblocks x n` complex matrix, initialised to ones.
+
+Backward pass: `delta[k](site) = W[block(site), k] * d[k](site)` (plus `d[k]`
+with the residual connection).
+
+Weight gradient: `dL/dW[b, k] = sum over sites in block b and over spin and
+colour of d[k] * z[k]`.
 """
 mutable struct BlockScalar_Layer <: Layer
-    W::Matrix{ComplexF64}   # (nblocks, n) — 블록별 × 벡터별 스칼라 가중치
-    r::Int
+    W::Matrix{ComplexF64}     # (nblocks, n): weight of each block for each field
+    r::Int                    # block edge length
     residual::Bool
     activation::ActivationFunction
-    # --- 캐시 버퍼 (매 호출 deepcopy/blockize 방지) ---
-    _result::Vector{WF3x1}      # forward/DeltaRule 출력 버퍼
-    _blocks::Vector{Vector{WF3x1}}  # 벡터별 blockize 결과 캐시 (CPU)
-    _block_map::Vector{Int}     # site→block_id 인덱스 맵 (CPU, 전체 사이트 수)
-    _gpu_block_map::Vector{Int} # (b_idx, r_idx) → block_id 맵 (GPU용, blocksize*rsize)
-    _gpu_w_buf::Any             # CuArray{ComplexF64,4} 재사용 버퍼 (1,1,blocksize,rsize)
-    _gpu_w_cpu::Matrix{ComplexF64}  # CPU 작업 배열 (blocksize, rsize)
+    # Buffers
+    _result::Vector{WF3x1}    # output fields of the forward pass and DeltaRule
+    _blocks::Vector{Vector{WF3x1}}  # unused
+    _block_map::Vector{Int}   # CPU: block id of every site, x fastest
+    _gpu_block_map::Vector{Int}  # GPU: block id of every (site in block, block) index
+    _gpu_w_buf::Any           # GPU cache Dict: weights, block maps, gradient, Adam moments
+    _gpu_w_cpu::Matrix{ComplexF64}  # (blocksize, rsize) staging array
     _initialized::Bool
-    _grad_prod_buf::Any             # CuArray{ComplexF64,4} for gradient elementwise product
-    _grad_site_buf::Any             # CuArray for site-level sum result
-    _grad_site_cpu::Vector{ComplexF64}  # CPU buffer for site inner products
-    _grad_W::Matrix{ComplexF64}         # pre-allocated gradient accumulator (nblocks, n)
+    _grad_prod_buf::Any       # unused
+    _grad_site_buf::Any       # unused
+    _grad_site_cpu::Vector{ComplexF64}  # unused
+    _grad_W::Matrix{ComplexF64}  # CPU gradient, (nblocks, n)
 
     function BlockScalar_Layer(x::WF3x1, n::Int, r::Int,
                                residual::Bool=false,
@@ -42,74 +48,67 @@ mutable struct BlockScalar_Layer <: Layer
     end
 end
 
-# --- BlockScalar_Layer: reset GPU caches before reuse ---
-function _to_cpu(layer::BlockScalar_Layer)
-    layer._gpu_w_buf = nothing
-    layer._gpu_w_cpu = Matrix{ComplexF64}(undef, 0, 0)
-    layer._gpu_block_map = Int[]
-    layer._result = WF3x1[]
-    layer._initialized = false
-    return layer
-end
-
-# --- BlockScalar_Layer: reset GPU caches before reuse ---
-function _to_gpu(layer::BlockScalar_Layer, blocks=nothing)
-    layer._gpu_w_buf = nothing
-    layer._gpu_w_cpu = Matrix{ComplexF64}(undef, 0, 0)
-    layer._gpu_block_map = Int[]
-    layer._result = WF3x1[]
-    layer._block_map = Int[]
-    layer._initialized = false
-    return layer
-end
+# ---------------------------------------------------------------------------
+# Forward pass
+# ---------------------------------------------------------------------------
 
 function (layer::BlockScalar_Layer)(x::AbstractVector{<:WF3x1})
-    n = length(x)
-    nblocks = size(layer.W, 1)
-    r = layer.r
+    result = _ensure_block_buffers!(layer, x)
+    _apply_block_scalars!(result, x, layer)
+    return result
+end
 
-    # GPU path for batch size 1.
-    if !layer._initialized || length(layer._result) != n || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(x[1]))
+# Allocates the output buffers and the site-to-block map on first use, and
+# again when the number of fields or their device changes.
+function _ensure_block_buffers!(layer::BlockScalar_Layer, fields)
+    n = length(fields)
+    if !layer._initialized || length(layer._result) != n || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(fields[1]))
         layer._result = Vector{WF3x1}(undef, n)
         for k in 1:n
-            layer._result[k] = deepcopy(x[k])
+            layer._result[k] = deepcopy(fields[k])
         end
-        if x[1] isa WF3x1GPU
-            # Prepare GPU block map and CuArray weights.
-            _init_gpu_block_cache!(layer, x[1])
+        if fields[1] isa WF3x1GPU
+            _init_gpu_block_cache!(layer, fields[1])
         else
-            # CPU block_map stores 1-based block ids.
-            NX, NY, NZ, NT = x[1].NX, x[1].NY, x[1].NZ, x[1].NT
-            NBX = div(NX, r); NBY = div(NY, r); NBZ = div(NZ, r); NBT = div(NT, r)
-            nsites = NX * NY * NZ * NT
-            layer._block_map = Vector{Int}(undef, nsites)
-            idx = 0
-            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
-                idx += 1
-                bx = div(ix - 1, r) + 1; by = div(iy - 1, r) + 1
-                bz = div(iz - 1, r) + 1; bt = div(it - 1, r) + 1
-                layer._block_map[idx] = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
-            end
+            layer._block_map = _cpu_block_map(fields[1], layer.r)
         end
         layer._initialized = true
     end
+    return layer._result
+end
 
-    result = layer._result
+# Block id (1-based) of every site, in the order ix, iy, iz, it with ix fastest.
+function _cpu_block_map(x::WF3x1, r::Int)
+    NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
+    NBX = div(NX, r); NBY = div(NY, r); NBZ = div(NZ, r)
+    bmap = Vector{Int}(undef, NX * NY * NZ * NT)
+    idx = 0
+    @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+        idx += 1
+        bx = div(ix - 1, r) + 1; by = div(iy - 1, r) + 1
+        bz = div(iz - 1, r) + 1; bt = div(it - 1, r) + 1
+        bmap[idx] = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
+    end
+    return bmap
+end
 
+# out[k](site) = W[block(site), k] * x[k](site), plus x[k] with the residual
+# connection. Used by the forward pass and, with d in place of x, the backward pass.
+function _apply_block_scalars!(out, x, layer::BlockScalar_Layer)
+    n = length(x)
     if x[1] isa WF3x1GPU
         W_gpu, bmap_gpu, _ = _sync_blockscalar_W_gpu!(layer; upload=false)
         for k in 1:n
-            blockscalar_apply_gpu!(result[k].f, x[k].f, W_gpu, bmap_gpu, k, layer.residual)
+            blockscalar_apply_gpu!(out[k].f, x[k].f, W_gpu, bmap_gpu, k, layer.residual)
         end
     else
-        # CPU path uses block_map with blockize/unblockize.
         NC, NG = x[1].NC, x[1].NG
         NX, NY, NZ, NT = x[1].NX, x[1].NY, x[1].NZ, x[1].NT
         bmap = layer._block_map
         W = layer.W
 
         for k in 1:n
-            rk = result[k]
+            ok = out[k]
             xk = x[k]
             site = 0
             @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
@@ -117,20 +116,41 @@ function (layer::BlockScalar_Layer)(x::AbstractVector{<:WF3x1})
                 w = W[bmap[site], k]
                 for ig in 1:NG
                     @simd for ic in 1:NC
-                        rk[ic, ix, iy, iz, it, ig] = w * xk[ic, ix, iy, iz, it, ig]
+                        ok[ic, ix, iy, iz, it, ig] = w * xk[ic, ix, iy, iz, it, ig]
                     end
                 end
             end
             if layer.residual
-                axpby!(1, xk, 1, rk)
+                axpby!(1, xk, 1, ok)
             end
         end
     end
-
-    return result
+    return out
 end
 
-# --- BlockScalar_Layer ---
+# ---------------------------------------------------------------------------
+# Backward pass
+# ---------------------------------------------------------------------------
+
+function DeltaRule!(layer::BlockScalar_Layer, ::Identity,
+                    z::Vector{<:WF3x1}, d::Vector{T}, delta::Vector{<:WF3x1}) where T<:WF3x1
+    _apply_block_scalars!(delta, d, layer)
+    return nothing
+end
+
+# Writes into the layer's output buffer, like the forward pass.
+function DeltaRule(layer::BlockScalar_Layer, ::Identity,
+                   z::Vector{<:WF3x1}, d::Vector{T}) where T<:WF3x1
+    result = _ensure_block_buffers!(layer, d)
+    return _apply_block_scalars!(result, d, layer)
+end
+
+# ---------------------------------------------------------------------------
+# Weight gradient
+# ---------------------------------------------------------------------------
+
+# Returns [grad] with grad an (nblocks, n) CuArray on the GPU, and the
+# (nblocks, n) matrix itself on the CPU.
 function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{<:WF3x1}, d::Vector{T}, γ::Vector{Spin_matrix}) where T<:WF3x1
     if z[1] isa WF3x1GPU
         return [blockscalar_gradient_gpu!(layer, z, d)]
@@ -144,166 +164,36 @@ function gradient(layer::BlockScalar_Layer, ::Identity, z::Vector{<:WF3x1}, d::V
     end
     grad_W = layer._grad_W
 
-    if false
-        # GPU: preallocated buffers로 사이트별 내적 → 블록별 합산 (alloc 0)
-        blockscalar_gradient_gpu!(grad_W, layer, z, d)
-        return grad_W
-        bmap = layer._gpu_block_map
-        nblocks_total = length(bmap)
-        fref = d[1].f  # CuArray{ComplexF64,4} reference
+    NC, NG = z[1].NC, z[1].NG
+    NX, NY, NZ, NT = z[1].NX, z[1].NY, z[1].NZ, z[1].NT
+    bmap = layer._block_map
 
-        # 1회만 버퍼 초기화
-        if layer._grad_prod_buf === nothing || size(layer._grad_prod_buf) != size(fref)
-            layer._grad_prod_buf = CUDA.zeros(ComplexF64, size(fref)...)
-            layer._grad_site_buf = CUDA.zeros(ComplexF64, 1, 1, size(fref,3), size(fref,4))
-            layer._grad_site_cpu = Vector{ComplexF64}(undef, nblocks_total)
-        end
-        prod_buf = layer._grad_prod_buf
-        site_buf = layer._grad_site_buf
-
-        for k in 1:n
-            prod_buf .= d[k].f .* z[k].f
-            _sum_spin_color!(site_buf, prod_buf)
-            copyto!(layer._grad_site_cpu, vec(site_buf))
-
-            @inbounds for i in 1:nblocks_total
-                # grad_W[bmap[i], k] += conj(layer._grad_site_cpu[i])
-                grad_W[bmap[i], k] += layer._grad_site_cpu[i]
-            end
-        end
-    else
-        # CPU: block_map으로 직접 내적 (blockize 제거)
-        NC, NG = z[1].NC, z[1].NG
-        NX, NY, NZ, NT = z[1].NX, z[1].NY, z[1].NZ, z[1].NT
-        bmap = layer._block_map
-
-        for k in 1:n
-            zk = z[k]; dk = d[k]
-            site = 0
-            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
-                site += 1
-                bid = bmap[site]
-                s = zero(ComplexF64)
-                for ig in 1:NG
-                    @simd for ic in 1:NC
-                        # inner_product(conj(d), z) = Σ d*z, then conj → ∂L/∂W*
-                        s += dk[ic, ix, iy, iz, it, ig] * zk[ic, ix, iy, iz, it, ig]
-                    end
+    for k in 1:n
+        zk = z[k]; dk = d[k]
+        site = 0
+        @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
+            site += 1
+            bid = bmap[site]
+            s = zero(ComplexF64)
+            for ig in 1:NG
+                @simd for ic in 1:NC
+                    s += dk[ic, ix, iy, iz, it, ig] * zk[ic, ix, iy, iz, it, ig]
                 end
-                # grad_W[bid, k] += conj(s)
-                grad_W[bid, k] += s
             end
+            grad_W[bid, k] += s
         end
     end
 
     return grad_W
 end
 
-function DeltaRule(layer::BlockScalar_Layer, ::Identity,
-                   z::Vector{<:WF3x1}, d::Vector{T}) where T<:WF3x1
-    n = length(d)
-    nblocks = size(layer.W, 1)
-    r = layer.r
+# ---------------------------------------------------------------------------
+# Adam update
+# ---------------------------------------------------------------------------
 
-    # 출력 버퍼 캐시 (deepcopy 1회만, 또는 GPU↔CPU 전환 시 재초기화)
-    if !layer._initialized || length(layer._result) != n || (!isempty(layer._result) && typeof(layer._result[1]) != typeof(d[1]))
-        layer._result = Vector{WF3x1}(undef, n)
-        for k in 1:n
-            layer._result[k] = deepcopy(d[k])
-        end
-        if d[1] isa WF3x1GPU
-            _init_gpu_block_cache!(layer, d[1])
-        elseif isempty(layer._block_map)
-            NX, NY, NZ, NT = d[1].NX, d[1].NY, d[1].NZ, d[1].NT
-            NBX = NX÷r; NBY = NY÷r; NBZ = NZ÷r; NBT = NT÷r
-            nsites = NX * NY * NZ * NT
-            layer._block_map = Vector{Int}(undef, nsites)
-            idx = 0
-            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
-                idx += 1
-                bx = (ix-1)÷r + 1; by = (iy-1)÷r + 1
-                bz = (iz-1)÷r + 1; bt = (it-1)÷r + 1
-                layer._block_map[idx] = bx + NBX*((by-1) + NBY*((bz-1) + NBZ*(bt-1)))
-            end
-        end
-        layer._initialized = true
-    end
-    result = layer._result
-
-    if d[1] isa WF3x1GPU
-        W_gpu, bmap_gpu, _ = _sync_blockscalar_W_gpu!(layer; upload=false)
-        for k in 1:n
-            blockscalar_apply_gpu!(result[k].f, d[k].f, W_gpu, bmap_gpu, k, layer.residual)
-        end
-    else
-        # CPU: block_map으로 직접 스칼라 곱 (blockize/unblockize 제거)
-        NC, NG = d[1].NC, d[1].NG
-        NX, NY, NZ, NT = d[1].NX, d[1].NY, d[1].NZ, d[1].NT
-        bmap = layer._block_map
-        W = layer.W
-
-        for k in 1:n
-            rk = result[k]
-            dk = d[k]
-            site = 0
-            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
-                site += 1
-                w = W[bmap[site], k]
-                for ig in 1:NG
-                    @simd for ic in 1:NC
-                        rk[ic, ix, iy, iz, it, ig] = w * dk[ic, ix, iy, iz, it, ig]
-                    end
-                end
-            end
-            if layer.residual
-                axpby!(1, dk, 1, rk)
-            end
-        end
-    end
-    return result
-end
-
-function DeltaRule!(layer::BlockScalar_Layer, ::Identity,
-                    z::Vector{<:WF3x1}, d::Vector{T}, delta::Vector{<:WF3x1}) where T<:WF3x1
-    n = length(d)
-    nblocks = size(layer.W, 1)
-    r = layer.r
-
-    if d[1] isa WF3x1GPU
-        W_gpu, bmap_gpu, _ = _sync_blockscalar_W_gpu!(layer; upload=false)
-        for k in 1:n
-            blockscalar_apply_gpu!(delta[k].f, d[k].f, W_gpu, bmap_gpu, k, layer.residual)
-        end
-    else
-        # CPU: block_map으로 직접 스칼라 곱 (blockize/unblockize 제거)
-        NC, NG = d[1].NC, d[1].NG
-        NX, NY, NZ, NT = d[1].NX, d[1].NY, d[1].NZ, d[1].NT
-        bmap = layer._block_map
-        W = layer.W
-
-        for k in 1:n
-            dk_out = delta[k]
-            dk = d[k]
-            site = 0
-            @inbounds for it in 1:NT, iz in 1:NZ, iy in 1:NY, ix in 1:NX
-                site += 1
-                w = W[bmap[site], k]
-                for ig in 1:NG
-                    @simd for ic in 1:NC
-                        dk_out[ic, ix, iy, iz, it, ig] = w * dk[ic, ix, iy, iz, it, ig]
-                    end
-                end
-            end
-            if layer.residual
-                axpby!(1, dk, 1, dk_out)
-            end
-        end
-    end
-end
-
+# CPU: Adam on the real and imaginary part of every weight separately.
 function update!(layer::BlockScalar_Layer, opt::Adam, grad::Matrix{ComplexF64})
     for idx in eachindex(layer.W)
-        # real part
         re_key = objectid(layer) + UInt(2idx - 1)
         st_re = get!(opt.scalar_state, re_key) do
             AdamState{Float64}(0.0, 0.0)
@@ -315,7 +205,6 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad::Matrix{ComplexF64})
         v_hat_re = st_re.v / (1 - opt.β2^opt.t)
         Δ_re = opt.α * m_hat_re / (sqrt(v_hat_re) + opt.ε)
 
-        # imag part
         im_key = objectid(layer) + UInt(2idx)
         st_im = get!(opt.scalar_state, im_key) do
             AdamState{Float64}(0.0, 0.0)
@@ -331,6 +220,7 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad::Matrix{ComplexF64})
     end
 end
 
+# GPU: grad is [CuArray]; the weights and moments live in the GPU cache.
 function update!(layer::BlockScalar_Layer, opt::Adam, grad)
     if grad isa AbstractVector && !isempty(grad) && grad[1] isa CuArray
         cache = layer._gpu_w_buf
@@ -345,19 +235,48 @@ function update!(layer::BlockScalar_Layer, opt::Adam, grad)
         end
         blockscalar_adam_update!(W_gpu, cache[:adam_m], cache[:adam_v], grad_gpu,
                         opt.α, opt.β1, opt.β2, opt.ε, opt.t)
-
-
         return layer
     end
     return update!(layer, opt, grad::Matrix{ComplexF64})
 end
 
-"""
-    _init_gpu_block_cache!(layer, x)
+function blockscalar_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
+                                  alpha, beta1, beta2, eps, t)
+    bias1 = 1.0 / (1.0 - beta1^t)
+    bias2 = 1.0 / (1.0 - beta2^t)
+    total = length(W_gpu)
+    threads = min(256, total)
+    nblocks = cld(total, threads)
+    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adam_complex!(
+        W_gpu, m_gpu, v_gpu, grad_gpu, alpha, beta1, beta2, eps, bias1, bias2)
+end
 
-GPU용 block 인덱스 맵 + 버퍼를 1회만 초기화.
-`layer._gpu_block_map[linear_idx]` = block_id 로, W 값만 갱신하면 됨.
-"""
+# ---------------------------------------------------------------------------
+# CPU/GPU conversion: both directions drop the device-specific caches
+# ---------------------------------------------------------------------------
+
+function _to_cpu(layer::BlockScalar_Layer)
+    layer._gpu_w_buf = nothing
+    layer._gpu_w_cpu = Matrix{ComplexF64}(undef, 0, 0)
+    layer._gpu_block_map = Int[]
+    layer._result = WF3x1[]
+    layer._initialized = false
+    return layer
+end
+
+function _to_gpu(layer::BlockScalar_Layer, blocks=nothing)
+    layer._gpu_w_buf = nothing
+    layer._gpu_w_cpu = Matrix{ComplexF64}(undef, 0, 0)
+    layer._gpu_block_map = Int[]
+    layer._result = WF3x1[]
+    layer._block_map = Int[]
+    layer._initialized = false
+    return layer
+end
+
+# ---------------------------------------------------------------------------
+# GPU cache
+# ---------------------------------------------------------------------------
 
 # load_checkpoint! can restore Adam moments before the GPU cache of a block
 # layer exists. Carry them into the cache when it is built, so a resumed run
@@ -369,6 +288,13 @@ function _restored_adam_moment(cache, key::Symbol, W)
     return moment isa CuArray ? moment : CuArray{ComplexF64}(moment)
 end
 
+"""
+    _init_gpu_block_cache!(layer, x)
+
+Builds the GPU block map for the blocked layout of `x`, where
+`layer._gpu_block_map[linear_idx]` is the block id of each site, and the GPU
+cache of the weights. Later calls only need to update the weights.
+"""
 function _init_gpu_block_cache!(layer, x::WF3x1GPU)
     bi = x.blockinfo
     r = layer.r
@@ -409,6 +335,8 @@ function _init_gpu_block_cache!(layer, x::WF3x1GPU)
     )
 end
 
+# Returns the GPU weights and block map, building the cache if needed. With
+# upload=true it also copies layer.W to the GPU.
 function _sync_blockscalar_W_gpu!(layer; upload::Bool=true)
     cache = layer._gpu_w_buf
     if !(cache isa Dict) || !haskey(cache, :W) || size(cache[:W]) != size(layer.W)
@@ -429,6 +357,8 @@ function _sync_blockscalar_W_gpu!(layer; upload::Bool=true)
     return cache[:W], cache[:bmap], cache
 end
 
+# Inverse of the block map: column b of `sites` lists the sites of block b,
+# and counts[b] how many there are.
 function _blockscalar_sites_by_block(bmap::Vector{Int}, nblocks::Int)
     counts = zeros(Int32, nblocks)
     @inbounds for bid in bmap
@@ -445,6 +375,11 @@ function _blockscalar_sites_by_block(bmap::Vector{Int}, nblocks::Int)
     return sites, counts
 end
 
+# ---------------------------------------------------------------------------
+# GPU kernels
+# ---------------------------------------------------------------------------
+
+# out = W[block, k] * x (+ x), one thread per field component.
 function _blockscalar_apply_kernel!(
     out::CuDeviceVector{ComplexF64},
     x::CuDeviceVector{ComplexF64},
@@ -478,6 +413,8 @@ function blockscalar_apply_gpu!(out::CuArray{ComplexF64,4}, x::CuArray{ComplexF6
     return out
 end
 
+# grad[b, k] = sum over the sites of block b of d * z. One thread block per
+# lattice block, reduced in shared memory.
 function _blockscalar_grad_by_block_kernel!(
     grad::CuDeviceMatrix{ComplexF64},
     z::CuDeviceVector{ComplexF64},
@@ -517,7 +454,6 @@ function _blockscalar_grad_by_block_kernel!(
     end
 
     if tid == Int32(1)
-        # @inbounds grad[bid, k] = conj(sh[Int32(1)])
         @inbounds grad[bid, k] = sh[Int32(1)]
     end
     return nothing
@@ -559,15 +495,4 @@ function blockscalar_gradient_gpu!(layer, z::AbstractVector, d::AbstractVector)
             block_sites, block_counts, nc_ng, Int32(k))
     end
     return grad
-end
-
-function blockscalar_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
-                                  alpha, beta1, beta2, eps, t)
-    bias1 = 1.0 / (1.0 - beta1^t)
-    bias2 = 1.0 / (1.0 - beta2^t)
-    total = length(W_gpu)
-    threads = min(256, total)
-    nblocks = cld(total, threads)
-    CUDA.@cuda threads=threads blocks=nblocks _cudakernel_adam_complex!(
-        W_gpu, m_gpu, v_gpu, grad_gpu, alpha, beta1, beta2, eps, bias1, bias2)
 end
