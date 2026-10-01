@@ -41,7 +41,7 @@ end
 """
     gpu_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu, opt)
 
-GPU 위에서 Adam update를 1회 커널로 수행. CPU 전송 0.
+Adam update of `W_gpu` on the GPU in one kernel launch, with no CPU transfer.
 """
 function gpu_adam_update!(W_gpu, m_gpu, v_gpu, grad_gpu,
                           α, β1, β2, ε, t)
@@ -69,8 +69,8 @@ mutable struct Adam <: Opt
     m::Dict{UInt, Spin_matrix}
     v::Dict{UInt, Spin_matrix}
     t::Int
-    scalar_state::Dict{UInt, AdamState{Float64}}   # 스칼라용
-    wf_state::Dict{UInt, AdamState{WF3x1}}         # WF3x1용
+    scalar_state::Dict{UInt, AdamState{Float64}}   # complex scalar weights, one entry per real and imaginary part
+    wf_state::Dict{UInt, AdamState{WF3x1}}         # fermion-field parameters
 
     function Adam(α=0.001, β1=0.9, β2=0.999, ε=1e-8)
         new(α, β1, β2, ε,
@@ -142,11 +142,11 @@ function complexProcess(param::T, opt:: Adam , grad ) where {T<:AbstractSpinMatr
 
 end   
 
-# WF3x1 한 개(param, grad)에 대해 Adam 스텝 수행
+# One Adam step for a fermion-field parameter.
 function wf_adam_step!(param::WF3x1, opt::Adam, grad::WF3x1)
     key = objectid(param)
 
-    # m, v 상태 가져오기 (없으면 similar(param)으로 초기화)
+    # Moments m and v, created as zero fields on first use.
     state = get!(opt.wf_state, key) do
         m0 = similar(param)
         v0 = similar(param)
@@ -172,7 +172,7 @@ function wf_adam_step!(param::WF3x1, opt::Adam, grad::WF3x1)
         m_re, m_im = real(mi), imag(mi)
         v_re, v_im = real(vi), imag(vi)
 
-        # 1차/2차 모멘트 업데이트
+        # First and second moments.
         m_re = β1*m_re + (1-β1)*g_re
         m_im = β1*m_im + (1-β1)*g_im
         v_re = β2*v_re + (1-β2)*(g_re*g_re)
@@ -187,7 +187,7 @@ function wf_adam_step!(param::WF3x1, opt::Adam, grad::WF3x1)
         v_hat_re = v_re / b2
         v_hat_im = v_im / b2
 
-        # 실제 업데이트 양
+        # The update.
         upd_re = α * m_hat_re / (sqrt(v_hat_re) + ε)
         upd_im = α * m_hat_im / (sqrt(v_hat_im) + ε)
 
@@ -222,7 +222,7 @@ function kernel_wf_adam!(p, m, v, g, β1, β2, α, ε, b1, b2)
         v_hat_re = v_re / b2
         v_hat_im = v_im / b2
 
-        # 수치 오차 안전장치(원래는 음수면 안 나와야 정상)
+        # Guard against rounding; v is never negative in exact arithmetic.
         v_hat_re = ifelse(v_hat_re < 0.0, 0.0, v_hat_re)
         v_hat_im = ifelse(v_hat_im < 0.0, 0.0, v_hat_im)
 
@@ -239,7 +239,7 @@ function wf_adam_step!(param::WF3x1GPU, opt::Adam, grad::WF3x1GPU)
     key = objectid(param)
 
     state = get!(opt.wf_state, key) do
-        # similar(param)이 0으로 채운다 해도, 확실히 0으로 만드는 게 안전함
+        # similar(param) may not be zeroed.
         m0 = similar(param)
         v0 = similar(param)
         zero_wf!(m0)

@@ -5,7 +5,8 @@
 """
     sync_layers!(layers)
 
-저장/substitute_Layer! 전에 호출. _W_gpu → W (CPU) 동기화.
+Copies the GPU weights (`_W_gpu`) of every layer back to `layer.W` on the CPU.
+Call it before saving a checkpoint or moving the model with `substitute_Layer!`.
 """
 function sync_layers_to_gpu!(layers)
     for layer in layers

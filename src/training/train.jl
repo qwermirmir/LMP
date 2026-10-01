@@ -73,7 +73,6 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         end
     end
     gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
-    # _sanitize_U!(U_template)
 
     CUDA.synchronize()
     x = Initialize_pseudofermion_fields(U_template[1], "Wilson")
@@ -377,7 +376,6 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                     end
                 end
                 gauge_preprocess! !== nothing && gauge_preprocess!(U_template)
-                # _sanitize_U!(U_template)
                 refresh_model!(layers, D, U_template)
                 for b in 1:batch
                     if activation_checkpoint_interval > 0
@@ -448,7 +446,6 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             refresh_model!(layers, D, U_template)
             _train_dbg && _train_debug_step("epoch $epoch substitute_next_U", _dbg_gc, _dbg_t; sync_gpu=true)
         end
-        # _sanitize_U!(U_template)
     end
 
     if _TRAIN_ALLOC_DEBUG[]

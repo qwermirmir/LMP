@@ -2,10 +2,11 @@
 # do not allocate.
 
 # ---- Pack / Unpack fermion fields ----
-# n개의 serial copyto! 대신 single CUDA kernel launch 로 전체를 처리.
-# 포인터 캐시: (buf_addr, n) 키로 CuArray{CuPtr} 를 재사용 — 첫 호출에만 할당.
+# Packing n fields uses one kernel launch instead of n copyto! calls.
+# The device pointers of the fields are cached under (buffer address, n), so
 
-# 포인터는 UInt64 로 저장 — kernel 내에서 LLVMPtr 로 reinterpret
+# only the first call allocates. They are stored as UInt64 and reinterpreted
+# as LLVMPtr inside the kernel.
 const _field_ptr_cache = Dict{Tuple{UInt64,Int}, Tuple{UInt64, CuArray{UInt64,1}}}()
 
 function _cached_field_ptrs!(buf::CuArray{ComplexF64,5}, fields)
@@ -21,17 +22,17 @@ function _cached_field_ptrs!(buf::CuArray{ComplexF64,5}, fields)
 end
 
 # ============================================================
-#  Shared GPU buffer pool — layers 간 임시 버퍼 공유
-#  (result_all, d_buf, ci_all, hop_temp 등 forward/backward 직후
-#   unpack되어 재사용 가능한 버퍼를 공유하여 GPU 메모리 절약)
+#  Shared GPU buffer pool
+#  Work buffers such as result_all, d_buf, ci_all and hop_temp are only
+#  needed until they are unpacked, so all layers share one of each.
 # ============================================================
 const _shared_gpu_pool = Dict{Tuple{Symbol,Int}, CuArray{ComplexF64,5}}()
 
 """
     get_shared_buf!(key, NC, NG, bs, rs, n) → CuArray{ComplexF64,5}
 
-Shared 5D GPU buffer. 동일 (key, n) 조합은 동일 CuArray를 반환.
-PTLayer 인스턴스 간 임시 버퍼를 공유하여 GPU 메모리를 절약.
+Shared 5D GPU work buffer of shape (NC, NG, bs, rs, n). The same (key, n)
+always returns the same CuArray, so all PTLayers share it.
 """
 function get_shared_buf!(key::Symbol, NC::Int, NG::Int, bs::Int, rs::Int, n::Int)
     k = (key, n)

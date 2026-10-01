@@ -71,13 +71,6 @@ function backward_propagation!(layers::Vector{T}, u::Vector{Any}, batch::Int, de
 end
 
 # Replace NaN/Inf values with zero using a GPU-native in-place map.
-# function _sanitize_U!(U::Vector)
-#     for ui in U
-#         if hasproperty(ui, :U) && ui.U isa CuArray
-#             map!(x -> (isnan(x) || isinf(x)) ? zero(x) : x, ui.U, ui.U)
-#         end
-#     end
-# end
 
 # Backward + gradient with ping-pong buffers.
 # delta_tail stores tail deltas that do not fit the body ping-pong buffers.

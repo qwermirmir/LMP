@@ -1,17 +1,31 @@
 # Parallel transport of fermion fields along paths (Hopping_operator), on the
-# CPU and on the GPU, including the batched GPU kernels used by PTLayer.
+# CPU and the GPU, and the batched GPU kernels that transport many paths at
+# once.
 
-# CPU 버전 _copy_fermion! - inplace copy (메모리 할당 없음)
-function _copy_fermion!(dest::WF3x1CPU, src::WF3x1CPU)
-    @assert size(dest.f) == size(src.f) "dest와 src의 크기가 같아야 합니다."
-    copyto!(dest.f, src.f)
-    return dest
-end
+"""
+    Hopping_operator(U, P)
 
+Parallel transport of fermion fields along the paths `P` through the links
+`U`. `hop(x)` returns one transported copy of `x` per path, and `hop(x, V)`
+writes them into `V`. A path is applied step by step:
+
+    step +mu:  (T psi)(n) = U_mu(n - mu)^dagger psi(n - mu)
+    step -mu:  (T psi)(n) = U_mu(n) psi(n + mu)
+    step 0:    no transport
+
+so the field moves one site along +mu or -mu and stays gauge covariant. The
+fermion boundary condition is periodic in space and antiperiodic in time.
+"""
 mutable struct Hopping_operator{G<:AbstractGaugefields}
     Gauge::Vector{G}
     P::Paths
 end
+
+Base.:length(hop::Hopping_operator) = length(hop.P)
+
+# ---------------------------------------------------------------------------
+# CPU transport
+# ---------------------------------------------------------------------------
 
 function (hop::Hopping_operator)(x::WF3x1CPU)
 
@@ -19,14 +33,13 @@ function (hop::Hopping_operator)(x::WF3x1CPU)
     shifts = Vector{WF3x1}()
 
     for k in 1:length(hop.P.various)
-        # Ucopy 삭제 - U는 읽기만 하므로 deepcopy 불필요
         copyx = deepcopy(x)
         for step in hop.P.various[k].steps
             a = step.f
             if a > 0
 
                 shift_x=shift_fermion(copyx , -a)
-                Uminus = shift_U(U[a], -a)  # Ucopy 대신 U 사용
+                Uminus = shift_U(U[a], -a)
 
                 mul!(copyx, Uminus',shift_x)
 
@@ -37,7 +50,7 @@ function (hop::Hopping_operator)(x::WF3x1CPU)
 
                 shift_x=shift_fermion(copyx, a)
 
-                mul!(copyx, U[a], shift_x)  # Ucopy 대신 U 사용
+                mul!(copyx, U[a], shift_x)
             
             elseif a == 0
 
@@ -59,14 +72,13 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
     shifts = Vector{WF3x1}()
 
     for k in 1:length(hop.P.various)
-        # Ucopy 삭제 - U는 읽기만 하므로 deepcopy 불필요
         copyx = deepcopy(x[k])
         for step in hop.P.various[k].steps
             a = step.f
             if a > 0
 
                 shift_x=shift_fermion(copyx , -a)
-                Uminus = shift_U(U[a], -a)  # Ucopy 대신 U 사용
+                Uminus = shift_U(U[a], -a)
 
                 mul!(copyx, Uminus',shift_x)
             
@@ -75,7 +87,7 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
 
                 shift_x=shift_fermion(copyx, a)
 
-                mul!(copyx, U[a], shift_x)  # Ucopy 대신 U 사용
+                mul!(copyx, U[a], shift_x)
             elseif a == 0
                 copyx = deepcopy(x[k])
                 
@@ -88,14 +100,47 @@ function (hop::Hopping_operator)(x::Vector{WF3x1CPU})
     return shifts
 end
 
-# ============================================================
-# Zero-allocation hop step 함수들
-# shift_fermion/shift_U의 래퍼 구조체 할당을 완전히 제거
-# ============================================================
+# Writes the transported copies of x into V, one per path, without allocating.
+function (hop::Hopping_operator)(x::WF3x1CPU, V::AbstractVector{T}) where {T<:WF3x1CPU}
+    @assert length(V) == length(hop.P.various) "length(V) must equal the number of paths."
+    
+    U = hop.Gauge
+
+    @inbounds for k in eachindex(V)
+        copyx = V[k]
+
+        _copy_fermion!(copyx, x)
+
+        for step in hop.P.various[k].steps
+            a = step.f
+            if a > 0
+                _hop_step_forward!(copyx, U[a], a)
+
+            elseif a < 0
+                _hop_step_backward!(copyx, U[-a], -a)
+            
+            else
+                _copy_fermion!(copyx, x)
+            end
+        end
+    end
+
+    return V
+end
+
+# dest .= src on the CPU, without allocating.
+function _copy_fermion!(dest::WF3x1CPU, src::WF3x1CPU)
+    @assert size(dest.f) == size(src.f) "dest and src must have the same size."
+    copyto!(dest.f, src.f)
+    return dest
+end
+
+# Single transport steps that write into the field's own buffers instead of
+# allocating shifted copies.
 
 const _bc_default = Int8[1, 1, 1, -1]
 
-# shifted_fermion! 인라인 버전: copyx.f → copyx.fshifted (BC 적용)
+# F.fshifted(n) = bc * F.f(n + shift), with the boundary sign bc.
 function _shifted_fermion_inplace!(F::WF3x1CPU, shift::NTuple{4,Int})
     bc = _bc_default
     NX = F.NX; NY = F.NY; NZ = F.NZ; NT = F.NT
@@ -138,8 +183,8 @@ function _shifted_fermion_inplace!(F::WF3x1CPU, shift::NTuple{4,Int})
     return nothing
 end
 
-# Forward step: copyx[site] = U†(site-μ̂) * copyx_old(site-μ̂)
-# shift_U 제거: 게이지도 같은 shifted 인덱스에서 직접 읽음
+# Step +mu: copyx(n) <- U_mu(n - mu)^dagger copyx(n - mu). The link is read at
+# the shifted site directly, so no shifted copy of U is made.
 function _hop_step_forward!(copyx::WF3x1CPU, U_mu, mu::Int)
     bc = _bc_default
     NX = copyx.NX; NY = copyx.NY; NZ = copyx.NZ; NT = copyx.NT
@@ -203,19 +248,15 @@ function _hop_step_forward!(copyx::WF3x1CPU, U_mu, mu::Int)
             end
         end
     end
-    # fshifted → f 복사
     copyto!(sf, fsh)
     return nothing
 end
 
-# Backward step: copyx[site] = U_μ(site) * copyx_old(site+μ̂)
-# 게이지는 shift 불필요 (현재 site에서 읽음)
+# Step -mu: copyx(n) <- U_mu(n) copyx(n + mu).
 function _hop_step_backward!(copyx::WF3x1CPU, U_mu, mu::Int)
-    # fermion만 shift: copyx.f → copyx.fshifted
     shift = ntuple(i -> (i == mu) ? 1 : 0, 4)
     _shifted_fermion_inplace!(copyx, shift)
 
-    # fshifted에서 읽고 U*fshifted 결과를 f에 씀
     fsh = copyx.fshifted
     Ug = U_mu.U
     df = copyx.f
@@ -244,40 +285,9 @@ function _hop_step_backward!(copyx::WF3x1CPU, U_mu, mu::Int)
     return nothing
 end
 
-# Preallocated 버퍼를 받는 버전 - 메모리 할당 완전 제거
-function (hop::Hopping_operator)(x::WF3x1CPU, V::AbstractVector{T}) where {T<:WF3x1CPU}
-    @assert length(V) == length(hop.P.various) "V의 길이는 paths의 개수와 같아야 합니다."
-    
-    U = hop.Gauge
-
-    @inbounds for k in eachindex(V)
-        copyx = V[k]
-        
-        # copyx를 x로 초기화 (inplace copy)
-        _copy_fermion!(copyx, x)
-
-        for step in hop.P.various[k].steps
-            a = step.f
-            if a > 0
-                _hop_step_forward!(copyx, U[a], a)
-
-            elseif a < 0
-                _hop_step_backward!(copyx, U[-a], -a)
-            
-            else
-                # a == 0: copyx를 x로 재설정
-                _copy_fermion!(copyx, x)
-            end
-        end
-    end
-
-    return V
-end
-
-function Base.:length(hop::Hopping_operator)
-    return length(hop.P)
-
-end
+# ---------------------------------------------------------------------------
+# GPU transport
+# ---------------------------------------------------------------------------
 
 function (hop::Hopping_operator)(x::WF3x1GPU)
 
@@ -313,8 +323,7 @@ function (hop::Hopping_operator)( x::WF3x1GPU,V::AbstractVector{T}) where {T<:WF
     @inbounds for k in eachindex(V)
         copyx = V[k]
 
-        # copyx를 "x로 초기화" (새로 할당 X)
-        substitute_fermion!(copyx, x)   # 당신 코드에 이미 있는 in-place copy라고 가정
+        substitute_fermion!(copyx, x)
 
         for step in hop.P.various[k].steps
             a = step.f
@@ -322,7 +331,7 @@ function (hop::Hopping_operator)( x::WF3x1GPU,V::AbstractVector{T}) where {T<:WF
             if a > 0
                 mul!(copyx, adjoint(hop.Gauge[a]), copyx)
 
-                # 여기 shift_fermion이 out-of-place면 여기가 또 할당 포인트
+                # shift_fermion allocates a shifted copy.
                 shift_x = shift_fermion(copyx, -a)
                 substitute_fermion!(copyx, shift_x)
 
@@ -340,14 +349,18 @@ function (hop::Hopping_operator)( x::WF3x1GPU,V::AbstractVector{T}) where {T<:WF
     return V
 end
 
-# ============================================================
-#  Batched multi-path hopping — 57 kernel launches → max_steps
-# ============================================================
+# ---------------------------------------------------------------------------
+# Batched GPU transport
+# ---------------------------------------------------------------------------
+
+# Transports the fields of all paths together, one kernel launch per step
+# instead of one per path and step. Paths are padded to max_steps; a path
+# that has finished, or an empty step, copies its field through.
 
 function _cudakernel_batched_hop_step!(
     dst, src, U1, U2, U3, U4,
     dirs,         # CuDeviceArray{Int8,2} (max_steps, npaths)
-    nsteps_arr,   # CuDeviceArray{Int32,1} (npaths,)sync_W_to_gpu!
+    nsteps_arr,   # CuDeviceArray{Int32,1} (npaths,)
     step_idx,     # Int32
     npaths,       # Int32
     blockinfo, bc,
@@ -423,8 +436,9 @@ end
                                 dirs_gpu, nsteps_gpu, max_steps, npaths,
                                 blocksize, rsize)
 
-25개 fused_hopping_gpu! (57 커널) → max_steps 커널.
-Double-buffering: hopped_all ↔ temp_5d, step별 1 커널.
+Packs `x_fields` into `hopped_all` and transports field i along path i, one
+kernel per step, alternating between `hopped_all` and `temp_5d`. The result
+is left in `hopped_all`.
 """
 function batched_hopping_steps_gpu!(hopped_all, temp_5d, x_fields,
                                     Gauge, dirs_gpu, nsteps_gpu, max_steps, npaths,
@@ -460,9 +474,9 @@ end
                               inv_dirs_gpu, nsteps_gpu, max_steps, npaths,
                               blocksize, rsize, bi, NX, NY, NZ, NT)
 
-DeltaRule! 역경로 hop을 batched로 수행.
-ci_all을 in-place double-buffering으로 처리 (ci_all ↔ temp_5d).
-결과는 ci_all에 저장됨.
+Transports the packed fields in `ci_all` along the reversed paths for the
+PTLayer backward pass, alternating between `ci_all` and `temp_5d`. The result
+is left in `ci_all`.
 """
 function batched_inv_hopping_gpu!(ci_all, temp_5d, Gauge,
                                    inv_dirs_gpu, nsteps_gpu, max_steps, npaths,

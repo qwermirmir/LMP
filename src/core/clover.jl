@@ -8,7 +8,7 @@
 # ============================================================
 
 
-# --- 좌표 한 칸 이동 (periodic BC) ---
+# Coordinate one step away, with periodic boundaries.
 @inline function _pbc(x::Int, shift::Int, N::Int)
     xs = x + shift
     xs > N && return xs - N
@@ -16,7 +16,7 @@
     return xs
 end
 
-# --- 한 사이트의 3×3 게이지 링크를 SMatrix로 읽기 ---
+# The 3x3 link at one site as an SMatrix.
 @inline function _read_link(Ug, ix, iy, iz, it)
     @inbounds SMatrix{3,3,ComplexF64,9}(
         Ug[1,1,ix,iy,iz,it], Ug[2,1,ix,iy,iz,it], Ug[3,1,ix,iy,iz,it],
@@ -25,7 +25,7 @@ end
     )
 end
 
-# --- 주어진 방향으로 사이트 인덱스를 ±1 이동 ---
+# Site index one step along mu, with sign +1 or -1.
 @inline function _site_shift(ix, iy, iz, it, mu, sign, NX, NY, NZ, NT)
     if mu == 1
         return (_pbc(ix, sign, NX), iy, iz, it)
@@ -41,8 +41,9 @@ end
 """
     compute_Fmunu(U, mu, nu)
 
-Clover field strength tensor F̂_μν(n)을 계산.
-반에르미트 (anti-hermitian) 결과를 반환.
+Clover field strength F̂_μν(n), the average of the four plaquettes around n
+in the μν plane: F̂ = (Q - Q^†)/8. The result is anti-hermitian; its trace is
+not removed.
 
 Returns: Array{ComplexF64, 6} of shape (3, 3, NX, NY, NZ, NT)
 """
@@ -56,7 +57,7 @@ function compute_Fmunu(U::Vector, mu::Int, nu::Int)
 
     @inbounds for it = 1:NT, iz = 1:NZ, iy = 1:NY, ix = 1:NX
         n  = (ix, iy, iz, it)
-        # 이웃 사이트 인덱스
+        # Neighbouring sites.
         n_pmu       = _site_shift(ix,iy,iz,it, mu, +1, NX,NY,NZ,NT)
         n_pnu       = _site_shift(ix,iy,iz,it, nu, +1, NX,NY,NZ,NT)
         n_mmu       = _site_shift(ix,iy,iz,it, mu, -1, NX,NY,NZ,NT)
@@ -65,7 +66,7 @@ function compute_Fmunu(U::Vector, mu::Int, nu::Int)
         n_mmu_pnu   = _site_shift(n_mmu..., nu, +1, NX,NY,NZ,NT)
         n_mmu_mnu   = _site_shift(n_mmu..., nu, -1, NX,NY,NZ,NT)
 
-        # 링크 읽기
+        # Links.
         U_mu_n       = _read_link(Umu, n...)
         U_nu_n       = _read_link(Unu, n...)
         U_nu_pmu     = _read_link(Unu, n_pmu...)
@@ -80,7 +81,7 @@ function compute_Fmunu(U::Vector, mu::Int, nu::Int)
         U_mu_mnu     = _read_link(Umu, n_mnu...)
         U_nu_pmu_mnu = _read_link(Unu, n_pmu_mnu...)
 
-        # ---- 4개의 plaquette (clover leaf) ----
+        # The four plaquettes (clover leaves).
         # P1 (+μ,+ν): U_μ(n) U_ν(n+μ̂) U_μ†(n+ν̂) U_ν†(n)
         P1 = U_mu_n * U_nu_pmu * U_mu_pnu' * U_nu_n'
 
@@ -99,7 +100,7 @@ function compute_Fmunu(U::Vector, mu::Int, nu::Int)
         # F̂ = (Q − Q†)/8  (anti-hermitian)
         F_site = (Q - Q') / 8
 
-        # 결과 저장
+
         for jc = 1:3, ic = 1:3
             Fmn[ic, jc, ix, iy, iz, it] = F_site[ic, jc]
         end
@@ -107,10 +108,10 @@ function compute_Fmunu(U::Vector, mu::Int, nu::Int)
     return Fmn
 end
 
-# σ_μν 행렬 6개를 (μ,ν) = (1,2),(1,3),(1,4),(2,3),(2,4),(3,4) 순서로 생성
-# LatticeDiracOperators의 γ convention (Euclidean chiral basis)을 사용
+# The six matrices σ_μν = (i/2)[γ_μ, γ_ν] in the order (1,2), (1,3), (1,4),
+# (2,3), (2,4), (3,4), in the γ convention of LatticeDiracOperators.
 function _build_sigma_munu()
-    # LatticeDiracOperators mk_gamma() 의 γ 행렬 (Euclidean, hermitian, {γ_μ,γ_ν}=2δ_μν)
+    # γ matrices of LatticeDiracOperators.mk_gamma(): Euclidean, hermitian, {γ_μ,γ_ν} = 2δ_μν.
     g = Vector{Matrix{ComplexF64}}(undef, 4)
 
     g[1] = ComplexF64[0 0 0 -im;  0 0 -im 0;  0 im 0 0;  im 0 0 0]
@@ -144,10 +145,10 @@ mutable struct CloverDiracOperator
     sigma::Vector{Matrix{ComplexF64}}      # 6 σ_μν matrices (4×4)
 
     function CloverDiracOperator(D_W, U::Vector, csw::Float64 = 1.0; κ::Union{Nothing,Real}=nothing)
-        # σ_μν 계산
+
         sigma = _build_sigma_munu()
 
-        # F̂_μν 계산 (6 planes)
+        # F̂_μν in the six planes.
         Fmunu = Vector{Array{ComplexF64, 6}}()
         for mu = 1:4, nu = (mu+1):4
             push!(Fmunu, compute_Fmunu(U, mu, nu))
@@ -158,13 +159,13 @@ mutable struct CloverDiracOperator
     end
 end
 
-# DdagD_Wilson_operator 등 wrapper에서도 κ를 꺼내올 수 있게 재귀적으로 탐색
+# κ of a Dirac operator, looking inside wrappers such as DdagD_Wilson_operator.
 function _extract_kappa(D)
     if hasproperty(D, :κ)
         return Float64(getfield(D, :κ))
     elseif hasproperty(D, :dirac)        # DdagD_Wilson_operator → inner Wilson
         return _extract_kappa(getfield(D, :dirac))
-    elseif hasproperty(D, :D)            # 기타 wrapper
+    elseif hasproperty(D, :D)            # other wrappers
         return _extract_kappa(getfield(D, :D))
     else
         error("CloverDiracOperator: cannot find `κ` on $(typeof(D)). " *
@@ -172,7 +173,7 @@ function _extract_kappa(D)
     end
 end
 
-# ---- Clover term 적용: y += (i*c_SW*κ) Σ_{μ<ν} σ_μν ⊗ F̂_μν * x ----
+# Clover term: y += (i c_SW κ) sum_{μ<ν} σ_μν ⊗ F̂_μν x.
 function _apply_clover_term!(y::WF3x1CPU, x::WF3x1CPU, Dcl::CloverDiracOperator)
     csw = Dcl.csw
     κ   = Dcl.κ
@@ -180,13 +181,13 @@ function _apply_clover_term!(y::WF3x1CPU, x::WF3x1CPU, Dcl::CloverDiracOperator)
     coeff = im * csw * κ
 
     @inbounds for it = 1:NT, iz = 1:NZ, iy = 1:NY, ix = 1:NX
-        # 이 사이트의 fermion 성분 읽기: x_buf[dirac, color]
+        # x at this site as x_buf[spin, colour].
         x_buf = MMatrix{4, 3, ComplexF64, 12}(undef)
         for ig = 1:4, ic = 1:3
             x_buf[ig, ic] = x[ic, ix, iy, iz, it, ig]
         end
 
-        # accum[dirac, color] — clover 기여분 축적
+        # accum[spin, colour]: the clover term at this site.
         accum = @MMatrix zeros(ComplexF64, 4, 3)
 
         for p = 1:6   # 6 planes
@@ -207,7 +208,7 @@ function _apply_clover_term!(y::WF3x1CPU, x::WF3x1CPU, Dcl::CloverDiracOperator)
             end
         end
 
-        # y에 clover 기여분 추가
+
         for ig = 1:4, ic = 1:3
             y[ic, ix, iy, iz, it, ig] += coeff * accum[ig, ic]
         end
@@ -230,7 +231,7 @@ function Base.:*(Dcl::CloverDiracOperator, x::WF3x1)
     return y
 end
 
-# F̂_μν 재계산 (게이지 업데이트 후 호출)
+# Recomputes F̂_μν; call after the gauge field changes.
 function refresh_clover!(Dcl::CloverDiracOperator)
     idx = 0
     for mu = 1:4, nu = (mu+1):4

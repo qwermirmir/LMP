@@ -6,19 +6,16 @@ mutable struct Spin_matrix <: AbstractSpinMatrix
     sm::Matrix{ComplexF64}
 end
 
-# 배열 크기 반환
 size(S::Spin_matrix) = size(S.sm)  
 
-# 배열 원소 개수 반환
 length(S::Spin_matrix) = length(S.sm)  
 
-# 차원 수 반환 (2차원 행렬이므로 2)
 ndims(S::Spin_matrix) = 2
 
 # Overload Base.adjoint for Spin_matrix
 Base.adjoint(S::Spin_matrix) = Spin_matrix(adjoint(S.sm))
 
-broadcastable(S::Spin_matrix) = S.sm  # 내부 행렬을 브로드캐스팅 가능하게 변환
+broadcastable(S::Spin_matrix) = S.sm  # broadcast over the underlying matrix
 
 function Base.adjoint(S::Vector{Spin_matrix})
     return [adjoint(s) for s in S]
@@ -26,12 +23,9 @@ end
 
 function Random_SpinM(matrix_type::String = "complex")
     if matrix_type == "complex"
-        # 4x4 복소 랜덤 행렬 생성
         mat = randn(4,4) .+ im*randn(4,4)
     elseif matrix_type == "real"
-        # 4x4 실수 랜덤 행렬 생성
         mat = randn(4,4)
-        # 모든성분이 0인 행렬 생성 
     elseif matrix_type=="zero"
         mat = zeros(ComplexF64, 4,4)
 
@@ -39,13 +33,12 @@ function Random_SpinM(matrix_type::String = "complex")
         mat = Matrix{ComplexF64}(I, 4, 4)
     
     else
-        error("지원하지 않는 matrix_type 입니다. 'complex' 혹은 'real'을 사용하세요.")
+        error("unsupported matrix_type; use 'complex' or 'real'.")
     end
     
     return Spin_matrix(mat)
 end
 
-# getindex 정의
 function Base.getindex(A::Spin_matrix, I...)
     return A.sm[I...]
 end
@@ -145,7 +138,7 @@ end
 function Clifford()
     basis = Vector{Spin_matrix}()
 
-    # 1) 첫번째 기저: 단위행렬(Identity)
+    # 1) the identity
     id4 = Random_SpinM("zero")
     for i in 1:4
         id4[i,i] = 1
@@ -160,7 +153,7 @@ function Clifford()
     gamma1[4,2] = 1
     push!(basis, gamma1)
 
-    # 3) gamma2  (복소 항)
+    # 3) gamma2
     gamma2 = Random_SpinM("zero")
     gamma2[1,4] = -im
     gamma2[2,3] =  im
@@ -176,7 +169,7 @@ function Clifford()
     gamma3[4,2] =  1
     push!(basis, gamma3)
 
-    # 5) gamma4 (혹은 gamma0)
+    # 5) gamma4
     gamma4 = Random_SpinM("zero")
     gamma4[1,2] = 1
     gamma4[2,1] = 1
@@ -184,7 +177,7 @@ function Clifford()
     gamma4[4,3] = -1
     push!(basis, gamma4)
 
-    # 6) gamma5 (단순 예: 대각에 -1, -1, +1, +1 인 경우)
+    # 6) gamma5 = diag(-1, -1, +1, +1)
     gamma5 = Random_SpinM("zero")
     gamma5[1,1] = -1
     gamma5[2,2] = -1
@@ -201,7 +194,7 @@ function Clifford()
     push!(basis,gamma2*gamma4)
     push!(basis,gamma3*gamma4)
 
-    # 8) gamma^5 gamma^mu (4개)
+    # 8) gamma5 gamma_mu, four matrices
     push!(basis, gamma5*gamma1)
     push!(basis, gamma5*gamma2)
     push!(basis, gamma5*gamma3)
@@ -219,7 +212,7 @@ function Clifford(W::AbstractSpinMatrix)
         temp .+= W[i,u] .* basis[4*(i-1)+u].sm
     end
 
-    return typeof(W)(temp)  # 원래 타입으로 래핑
+    return typeof(W)(temp)
 end
 
 function Clifford(W::Vector{T}) where{T<:AbstractSpinMatrix}
@@ -236,7 +229,7 @@ function Clifford(W::Vector{T}) where{T<:AbstractSpinMatrix}
 
 end
 
-# GPU 버전
+# GPU spin matrices, stored as a static 4x4 matrix.
 
 mutable struct Spin_matrix_GPU <: AbstractSpinMatrix
     sm::MMatrix{4,4,ComplexF64}
@@ -252,7 +245,7 @@ function Random_SpinM_GPU(matrix_type::String = "complex")
     elseif matrix_type == "Init"
         mat = Matrix{ComplexF64}(I, 4, 4)
     else
-        error("지원하지 않는 matrix_type 입니다. 'complex', 'real', 'zero', 'Init' 중 선택하세요.")
+        error("unsupported matrix_type; use 'complex', 'real', 'zero' or 'Init'.")
     end
 
     return Spin_matrix_GPU(MMatrix{4,4,ComplexF64}(mat))
@@ -280,13 +273,12 @@ end
 @inline Base.:*(a::Spin_matrix_GPU, c::Number) = c * a
 
 function Base.:*(W::Spin_matrix_GPU, K::Spin_matrix_GPU)
-    # W는 Spin_matrix_GPU, K는 Spin_matrix_GPU
     return Spin_matrix_GPU(W.sm * K.sm)
 end
 
 function Base.:*(W::Vector{Spin_matrix_GPU}, K::Vector{Spin_matrix_GPU})
     if length(W) != length(K)
-        throw(ArgumentError("W와 K의 길이가 일치하지 않습니다."))
+        throw(ArgumentError("W and K must have the same length."))
     end
 
     result = similar(K)
@@ -298,22 +290,20 @@ function Base.:*(W::Vector{Spin_matrix_GPU}, K::Vector{Spin_matrix_GPU})
     return result
 end
 
-# 항상 0으로 초기화된 Spin_matrix_GPU 생성 (Matrix 할당 없이)
+# A zero Spin_matrix_GPU, without allocating a Matrix.
 @inline function zero_spinmat_gpu()
     sm = MMatrix{4,4,ComplexF64}(undef)
     fill!(sm, zero(ComplexF64))
     return Spin_matrix_GPU(sm)
 end
 
-# (Spin_matrix_GPU, ComplexF64, (4,4)) -> 0행렬
+# similar returns zero matrices.
 Base.similar(::Spin_matrix_GPU, ::Type{ComplexF64}, dims::Dims{2}) =
     dims == (4,4) ? zero_spinmat_gpu() :
-    throw(ArgumentError("Spin_matrix_GPU는 4×4만 지원합니다. dims=$dims"))
+    throw(ArgumentError("Spin_matrix_GPU is always 4x4; got dims=$dims"))
 
-# Spin_matrix_GPU 하나의 similar도 필요하면 이것도 추가 (0행렬)
 Base.similar(::Spin_matrix_GPU) = zero_spinmat_gpu()
 
-# Vector{Spin_matrix_GPU}의 similar도 각 원소를 0행렬로
 Base.similar(A::Vector{Spin_matrix_GPU}) = [zero_spinmat_gpu() for _ in eachindex(A)]
 
 function Base.:/(W::Spin_matrix_GPU, a::Number)
@@ -347,11 +337,11 @@ function cudakernel_spinmat_mul!(out, M, inp)
 end
 
 function Base.:+(a::Spin_matrix_GPU, b::Spin_matrix_GPU)
-    return Spin_matrix_GPU(a.sm .+ b.sm)  # ⬅ broadcast 연산으로 StaticArrays 최적화 사용
+    return Spin_matrix_GPU(a.sm .+ b.sm)
 end
 
 function Base.:+(a::Vector{Spin_matrix_GPU}, b::Vector{Spin_matrix_GPU})
-    @assert length(a) == length(b) "a와 b의 길이가 일치하지 않습니다."
+    @assert length(a) == length(b) "a and b must have the same length."
 
     result = Vector{Spin_matrix_GPU}(undef, length(a))
 
@@ -380,7 +370,7 @@ end
 function Base.:-(a::Vector{Spin_matrix_GPU}, b::Vector{Spin_matrix_GPU})
 
     if length(a) != length(b)
-        throw(ArgumentError("a와 b의 길이가 일치하지 않습니다."))
+        throw(ArgumentError("a and b must have the same length."))
     end
 
     result = similar(a)
@@ -405,11 +395,10 @@ function Convertsm(W::Vector{Spin_matrix_GPU})
 end 
 
 # ============================================================
-#  Batched PTLayer kernels — GPU-resident W, 단일 커널 launch
+#  Copying a vector of spin-matrix weights to and from a 4 x 4 x NW CuArray
 # ============================================================
 
 
-# ---- W ↔ CuArray 동기화 ----
 
 """CPU Vector{Spin_matrix_GPU} → GPU CuArray{ComplexF64, 3} (4,4,NW)"""
 function sync_W_to_gpu!(W_gpu::CuArray{ComplexF64, 3}, W::AbstractVector{<:AbstractSpinMatrix})

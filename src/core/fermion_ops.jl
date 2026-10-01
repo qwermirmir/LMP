@@ -90,7 +90,7 @@ end
 function mul!(f::WF3x1, M::Spin_matrix, x::WF3x1)
     NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT; NC = x.NC
 
-    # M 요소를 미리 로컬 변수에 빼놓기 (인덱싱 비용 줄이기)
+    # Copy the entries of M into locals.
     m11 = M[1,1]; m12 = M[1,2]; m13 = M[1,3]; m14 = M[1,4]
     m21 = M[2,1]; m22 = M[2,2]; m23 = M[2,3]; m24 = M[2,4]
     m31 = M[3,1]; m32 = M[3,2]; m33 = M[3,3]; m34 = M[3,4]
@@ -126,7 +126,7 @@ end
 function addmul!(f::WF3x1, M::AbstractSpinMatrix, x::WF3x1)
     NX = x.NX; NY = x.NY; NZ = x.NZ; NT = x.NT; NC = x.NC
 
-    # M 요소를 미리 로컬 변수에 빼놓기 (인덱싱 비용 줄이기)
+    # Copy the entries of M into locals.
     m11 = M[1,1]; m12 = M[1,2]; m13 = M[1,3]; m14 = M[1,4]
     m21 = M[2,1]; m22 = M[2,2]; m23 = M[2,3]; m24 = M[2,4]
     m31 = M[3,1]; m32 = M[3,2]; m33 = M[3,3]; m34 = M[3,4]
@@ -390,9 +390,8 @@ function Base.:*(v::Array{ComplexF64}, x::WF3x1)
 end 
 
 function Base.:*(W::Vector{Spin_matrix_GPU}, x::Vector{WF3x1GPU})
-    # W는 Spin_matrix_GPU의 벡터, x는 WF3x1GPU의 벡터
     if length(W) != length(x)
-        throw(ArgumentError("W와 x의 길이가 일치하지 않습니다."))
+        throw(ArgumentError("W and x must have the same length."))
     end
 
     result = similar(x)
@@ -416,16 +415,16 @@ end
 
 function Base.:*(W::Vector{Spin_matrix_GPU}, x::Vector{Union{WF3x1GPU, WF3x1CPU}})
     if length(W) != length(x)
-        throw(ArgumentError("W와 x의 길이가 일치하지 않습니다."))
+        throw(ArgumentError("W and x must have the same length."))
     end
 
     result = similar(x)
 
     for i in 1:length(W)
         if x[i] isa WF3x1GPU
-            result[i] = W[i] * x[i]  # GPU 연산
+            result[i] = W[i] * x[i]
         else
-            throw(ArgumentError("알 수 없는 타입: $(typeof(x[i]))"))
+            throw(ArgumentError("unsupported field type: $(typeof(x[i]))"))
         end
     end
 
@@ -433,7 +432,6 @@ function Base.:*(W::Vector{Spin_matrix_GPU}, x::Vector{Union{WF3x1GPU, WF3x1CPU}
 end
 
 function norm2(x::WF3x1GPU)
-    # x는 WF3x1GPU 타입
     return dot(x, x)
 end
 
@@ -446,7 +444,7 @@ function Base.conj(x::WF3x1GPU)
     return out
 end
 
-# CUDA 커널 정의
+# Kernels for applying a spin matrix to a GPU field.
 function kernel_conj_1D!(
     out::CuDeviceArray{ComplexF64, 4},
     inp::CuDeviceArray{ComplexF64, 4}
@@ -495,7 +493,7 @@ end
 
 function Base.:*(M::Spin_matrix_GPU, x::WF3x1GPU)
     f  = deepcopy(x)
-    Ms = SMatrix{4,4,ComplexF64}(M.sm)   # 16개 값, 커널 인자로 “값” 전달 (CuArray 생성 X)
+    Ms = SMatrix{4,4,ComplexF64}(M.sm)   # passed to the kernel by value
 
     CUDA.@cuda threads=x.blockinfo.blocksize blocks=x.blockinfo.rsize cudakernel_spinmat_mul!(f.f, Ms, x.f)
 
@@ -528,11 +526,11 @@ function Base.conj(W::Spin_matrix_GPU)
     return Spin_matrix_GPU(conj(W.sm))
 end
 
-# ====== Batched Matmul: N 개의 (Q,K) 쌍을 한번에 계산, GPU→CPU sync 1회 ======
+# Batched Matmul: N pairs (Q, K) at once, with one GPU-to-CPU copy.
 function kernel_matmul_batched!(
     M_all::CuDeviceArray{ComplexF64,3},   # (NG, NG, batch)
-    Q_ptrs::CuDeviceArray{ComplexF64,4},  # 현재 Q의 f
-    K_ptrs::CuDeviceArray{ComplexF64,4},  # 현재 K의 f
+    Q_ptrs::CuDeviceArray{ComplexF64,4},
+    K_ptrs::CuDeviceArray{ComplexF64,4},
     NC::Int, NG::Int, blocksize::Int, rsize::Int,
     batch_idx::Int
 )
@@ -583,7 +581,7 @@ end
 """
     Matmul_batch(Qs, Ks) → Vector{Spin_matrix_GPU}
 
-N개의 (Q,K) 쌍에 대해 Matmul을 계산. GPU→CPU sync는 1회만 수행.
+`Matmul!` for N pairs (Q, K) with a single GPU-to-CPU copy.
 """
 function Matmul_batch(Qs::AbstractVector{<:WF3x1GPU}, Ks::AbstractVector{<:WF3x1GPU})
     n = length(Qs)
@@ -602,7 +600,7 @@ function Matmul_batch(Qs::AbstractVector{<:WF3x1GPU}, Ks::AbstractVector{<:WF3x1
             M_all, Qs[idx].f, Ks[idx].f, NC, NG, blocksize, rsize, idx)
     end
 
-    # GPU→CPU sync 1회
+    # One GPU-to-CPU copy.
     M_cpu = Array(M_all)
 
     result = Vector{Spin_matrix_GPU}(undef, n)
@@ -630,7 +628,7 @@ function kernel_matmul!(
 
     N = NC * blocksize * rsize
 
-    # 각 스레드의 부분합
+    # Partial sum of this thread.
     acc = zero(ComplexF64)
 
     # flatten index k -> (ic,b,r)
@@ -648,8 +646,8 @@ function kernel_matmul!(
         k += stride
     end
 
-    # 블록 내 reduction (shared memory)
-    sh = CUDA.CuStaticSharedArray(ComplexF64, 256)  # threads=256 가정
+    # Reduction within the block in shared memory.
+    sh = CUDA.CuStaticSharedArray(ComplexF64, 256)  # assumes 256 threads
     @inbounds sh[tid] = acc
     CUDA.sync_threads()
 
@@ -680,7 +678,7 @@ function Matmul!(Q::WF3x1GPU, K::WF3x1GPU)
 
     CUDA.@cuda threads=threads blocks=blocks kernel_matmul!(M_d, Q.f, K.f, NC, NG, blocksize, rsize)
 
-    # 4×4만 가져오니 전송 자체는 작음(하지만 호출이 너무 잦으면 여기서도 손해)
+    # Only a 4x4 matrix is copied, but the copy synchronises.
     M_cpu = Array(M_d)
     return Spin_matrix_GPU(MMatrix{4,4,ComplexF64}(M_cpu))
 end
@@ -706,7 +704,7 @@ function Matmul!(Q::WF3x1CPU,K::WF3x1CPU)
             for iy = 1:NY
                 for ix = 1:NX
                     for ic = 1:NC
-                        # Q와 K의 각 성분을 곱하여 M에 누적
+
                         for fg = 1:NG
                             for xg= 1:NG
                                 M[fg,xg]+=Q[ic,ix,iy,iz,it,fg]*K[ic,ix,iy,iz,it,xg]
@@ -729,8 +727,8 @@ function substitute_fermion!(
     src::Shifted_fermionfields_4D_accelerator{NC,<:WF3x1GPU}
 ) where {NC}
     parent = src.parent
-    @assert parent.fshifted !== nothing "noshiftfield=true라서 fshifted 버퍼가 없습니다."
-    copyto!(dest.f, parent.fshifted)   # ✅ GPU memcpy
+    @assert parent.fshifted !== nothing "the field was created with noshiftfield=true and has no fshifted buffer."
+    copyto!(dest.f, parent.fshifted)
     return dest
 end
 
@@ -769,7 +767,7 @@ function zero_wf!(x::WF3x1CPU)
     NC = x.NC
     NG = x.NG
 
-    z0 = zero(typeof(x[1,1,1,1,1,1]))  # 예: 0.0 + 0.0im
+    z0 = zero(typeof(x[1,1,1,1,1,1]))
 
     @inbounds for ic = 1:NC
         for it = 1:NT
@@ -820,7 +818,7 @@ function pack_fermions!(buf::CuArray{ComplexF64, 5}, fields::AbstractVector)
     end
 end
 
-"""CuArray{ComplexF64, 5} → Vector{WF3x1GPU}  (각 field의 .f에 복사)"""
+"""Copies slice i of a packed (NC, NG, bs, rs, n) array into fields[i].f."""
 function unpack_fermions!(fields::AbstractVector, buf::CuArray{ComplexF64, 5})
     len = size(buf,1) * size(buf,2) * size(buf,3) * size(buf,4)
     @inbounds for j in eachindex(fields)
@@ -829,10 +827,10 @@ function unpack_fermions!(fields::AbstractVector, buf::CuArray{ComplexF64, 5})
 end
 
 # ============================================================
-#  WF3x1GPU deepcopy override — fshifted를 1-element 더미로 대체
-#  LMP GPU path는 result 버퍼의 fshifted를 절대 사용하지 않음.
-#  freed CuArray deepcopy 오류 방지: 해제 대신 tiny placeholder 할당.
-#  24 MB → 16 bytes per result buffer (~18.6 GB 총 절약, 31×25 field 기준)
+#  deepcopy of a GPU field replaces its fshifted buffer by a 1-element
+#  placeholder. The GPU code never uses fshifted of its result buffers, and
+#  this avoids copying a freed CuArray. On a 16^3x32 lattice it saves 24 MB per
+#  buffer, about 18.6 GB for 31 layers x 25 fields.
 # ============================================================
 function Base.deepcopy_internal(x::WF3x1GPU, dict::IdDict)
     haskey(dict, x) && return dict[x]::WF3x1GPU
@@ -853,7 +851,7 @@ function Base.deepcopy_internal(x::WF3x1GPU, dict::IdDict)
 end
 
 function _alloc_result_wf(x::WF3x1GPU)
-    return deepcopy(x)  # 위의 deepcopy_internal이 fshifted를 자동으로 교체
+    return deepcopy(x)  # fshifted is replaced by the deepcopy_internal method above
 end
 
 _alloc_result_wf(x::WF3x1CPU) = deepcopy(x)
