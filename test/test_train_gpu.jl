@@ -58,6 +58,45 @@ end
         @test isapprox(losses, golden; rtol=1.0e-12)
     end
 
+    # Keeping only every second activation and recomputing the rest in the
+    # backward pass must not change the result.
+    @testset "activation checkpointing" begin
+        losses = train_losses!(gpu_golden_layers(), Adam(1.0e-3); epochs=2,
+                               gauge_paths=[raw_path], gauge_format=:raw,
+                               activation_checkpoint_interval=2)
+        @test losses[1] ≈ golden[1] rtol=1.0e-12
+        # Freeing the forward buffers makes BlockScalar_Layer rebuild its GPU
+        # cache from the stale CPU weights, so its update is lost every step.
+        # The second loss equals that of a step with BlockScalar frozen.
+        @test_broken isapprox(losses[2], golden[2]; rtol=1.0e-12)
+    end
+
+    # The test loss is evaluated after the update, so at step 1 on the
+    # training configuration it equals the golden loss after one step.
+    @testset "test loss, $(fmt)" for (fmt, source) in (
+            (:raw, (; gauge_paths=[raw_path], test_paths=[raw_path], gauge_format=:raw)),
+            (:jld2, (; gauge_paths=[jld2_path], test_paths=[jld2_path], gauge_format=:jld2)))
+        log = tempname() * ".log"
+        train(Adam(1.0e-3), gpu_golden_layers(), source.gauge_paths, gpu_gauge_template(),
+              TRAIN_PARAMS; epochs=1, logfile=log, test_paths=source.test_paths,
+              test_interval=1, gauge_format=source.gauge_format)
+        test_losses = [parse(Float64, match(r"Test Loss: ([-+0-9.eE]+)", line).captures[1])
+                       for line in eachline(log) if occursin("[Test]", line)]
+        rm(log)
+        @test length(test_losses) == 1
+        @test isapprox(test_losses[1], golden[2]; rtol=1.0e-12)
+    end
+
+    @testset "checkpoints written during training" begin
+        written = String[]
+        checkpoint_fn(step) = (path = joinpath(dir, "step_$(step).jld2"); push!(written, path); path)
+        train_losses!(gpu_golden_layers(), Adam(1.0e-3); epochs=2, gauge_paths=[raw_path],
+                      gauge_format=:raw, checkpoint_every=1, checkpoint_fn=checkpoint_fn)
+        @test length(written) == 2
+        @test all(isfile, written)
+        @test [JLD2.load(p, "opt_t") for p in written] == [1, 2]
+    end
+
     @testset "resuming from a checkpoint continues the run" begin
         source = (; gauge_paths=[raw_path], gauge_format=:raw)
         continuous = train_losses!(gpu_golden_layers(), Adam(1.0e-3); epochs=3, source...)
