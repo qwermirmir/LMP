@@ -1,6 +1,17 @@
 # ZeroMode_Layer: loss that measures how close the input fields are to the null
 # space of the Dirac operator.
 
+"""
+    ZeroMode_Layer(D, activation=Identity(), Out=1)
+
+Loss layer. For input fields `x[1:l]`:
+
+    loss = (1/l) sum_i ||D x[i]||^2
+
+Backward pass: `delta[i] = (2/l) conj(D^dagger D z[i])`, using the
+`D^dagger D z[i]` kept by the forward pass. The norms `||x[i]||^2` are stored in
+`_denoms` but do not enter the loss.
+"""
 mutable struct ZeroMode_Layer <: Layer
     D::Any
     activation::ActivationFunction
@@ -19,6 +30,81 @@ end
 function Base.show(io::IO, layer::ZeroMode_Layer)
     print(io, "ZeroMode_Layer(Out=$(layer.Out))")
 end
+
+# ---------------------------------------------------------------------------
+# Forward pass
+# ---------------------------------------------------------------------------
+
+function (layer::ZeroMode_Layer)(x::AbstractVector{<:WF3x1})
+    l = length(x)
+
+    need_reinit = !layer._zeromode_init || length(layer._Dz) != l
+    if !need_reinit
+        need_reinit = typeof(layer._Dz[1]) != typeof(x[1])
+    end
+    if need_reinit
+        layer._Dz = Vector{Any}(undef, l)
+        layer._DdagDz = Vector{Any}(undef, l)
+        layer._losses = zeros(Float64, l)
+        layer._denoms = zeros(Float64, l)
+        for i in 1:l
+            layer._Dz[i] = _alloc_result_wf(x[1])
+            layer._DdagDz[i] = _alloc_result_wf(x[1])
+        end
+        layer._zeromode_init = true
+    end
+
+    Dx = layer._Dz
+    DdagDx = layer._DdagDz
+    if x[1] isa WF3x1GPU
+        _kappa = _dirac_kappa(layer.D)
+        _U = layer.D.U
+        @inbounds for i in 1:l
+            fused_wilson_mul_gpu!(Dx[i], x[i], _U, _kappa, false)
+            fused_wilson_mul_gpu!(DdagDx[i], Dx[i], _U, _kappa, true)
+        end
+    else
+        @inbounds for i in 1:l
+            mul!(Dx[i], layer.D, x[i])
+            mul!(DdagDx[i], layer.D', Dx[i])
+        end
+    end
+
+    total = 0.0
+    @inbounds for i in 1:l
+        li = real(inner_product(Dx[i], Dx[i]))
+        layer._losses[i] = li
+        layer._denoms[i] = real(inner_product(x[i], x[i]))
+        total += li
+    end
+    return total / l
+end
+
+# ---------------------------------------------------------------------------
+# Backward pass
+# ---------------------------------------------------------------------------
+
+function DeltaRule(layer::ZeroMode_Layer, ::Identity, z::AbstractVector{<:WF3x1}, batch::Int)
+    result = similar(z)
+    for i in eachindex(z)
+        result[i] = similar(z[i])
+    end
+    return DeltaRule!(layer, layer.activation, z, result, batch)
+end
+
+function DeltaRule!(layer::ZeroMode_Layer, ::Identity, z::AbstractVector{<:WF3x1}, delta::AbstractVector{<:WF3x1}, batch::Int)
+    l = length(z)
+    length(layer._DdagDz) == l || error("ZeroMode_Layer forward must run before backward")
+    for i in eachindex(delta)
+        conj_fermion!(delta[i], layer._DdagDz[i])
+        delta[i].f .= (2 / l) .* delta[i].f
+    end
+    return delta
+end
+
+# ---------------------------------------------------------------------------
+# CPU/GPU conversion: moves D and drops the cached work fields
+# ---------------------------------------------------------------------------
 
 function _get_blocks(layer::ZeroMode_Layer)
     try
@@ -84,67 +170,4 @@ function _refresh_layer!(layer::ZeroMode_Layer, D_new, U_new)
     layer._losses = Float64[]
     layer._denoms = Float64[]
     return nothing
-end
-
-function (layer::ZeroMode_Layer)(x::AbstractVector{<:WF3x1})
-    l = length(x)
-
-    need_reinit = !layer._zeromode_init || length(layer._Dz) != l
-    if !need_reinit
-        need_reinit = typeof(layer._Dz[1]) != typeof(x[1])
-    end
-    if need_reinit
-        layer._Dz = Vector{Any}(undef, l)
-        layer._DdagDz = Vector{Any}(undef, l)
-        layer._losses = zeros(Float64, l)
-        layer._denoms = zeros(Float64, l)
-        for i in 1:l
-            layer._Dz[i] = _alloc_result_wf(x[1])
-            layer._DdagDz[i] = _alloc_result_wf(x[1])
-        end
-        layer._zeromode_init = true
-    end
-
-    Dx = layer._Dz
-    DdagDx = layer._DdagDz
-    if x[1] isa WF3x1GPU
-        _kappa = _dirac_kappa(layer.D)
-        _U = layer.D.U
-        @inbounds for i in 1:l
-            fused_wilson_mul_gpu!(Dx[i], x[i], _U, _kappa, false)
-            fused_wilson_mul_gpu!(DdagDx[i], Dx[i], _U, _kappa, true)
-        end
-    else
-        @inbounds for i in 1:l
-            mul!(Dx[i], layer.D, x[i])
-            mul!(DdagDx[i], layer.D', Dx[i])
-        end
-    end
-
-    total = 0.0
-    @inbounds for i in 1:l
-        li = real(inner_product(Dx[i], Dx[i]))
-        layer._losses[i] = li
-        layer._denoms[i] = real(inner_product(x[i], x[i]))
-        total += li
-    end
-    return total / l
-end
-
-function DeltaRule(layer::ZeroMode_Layer, ::Identity, z::AbstractVector{<:WF3x1}, batch::Int)
-    result = similar(z)
-    for i in eachindex(z)
-        result[i] = similar(z[i])
-    end
-    return DeltaRule!(layer, layer.activation, z, result, batch)
-end
-
-function DeltaRule!(layer::ZeroMode_Layer, ::Identity, z::AbstractVector{<:WF3x1}, delta::AbstractVector{<:WF3x1}, batch::Int)
-    l = length(z)
-    length(layer._DdagDz) == l || error("ZeroMode_Layer forward must run before backward")
-    for i in eachindex(delta)
-        conj_fermion!(delta[i], layer._DdagDz[i])
-        delta[i].f .= (2 / l) .* delta[i].f
-    end
-    return delta
 end
