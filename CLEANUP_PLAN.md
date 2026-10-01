@@ -122,13 +122,14 @@
 ### Phase 3. 모듈 구조와 공개 API
 
 - [ ] `__precompile__(false)` 제거. 의존 패키지의 precompile을 막고 있다. `NVTX.activate()` 같은 로드 시점 부작용은 `__init__`으로 옮긴다.
-- [ ] 모듈 경계 정리: `CoarseCorrectionLoss`, `GDlambdaAMG`, Adapter가 `LMP` 최상위에 그냥 include되어 이름공간을 공유한다 (`GDlambdaAMG`가 `CoarseCorrectionLoss`의 `_field_norm`에 의존). 모듈로 감싸거나 분리한다.
+- [ ] 모듈 경계 정리 (일부 완료: 핵심 하위 모듈 6개를 `LMP` 하나로 합침, `f1f465b`): `CoarseCorrectionLoss`, `GDlambdaAMG`, Adapter가 `LMP` 최상위에 그냥 include되어 이름공간을 공유한다 (`GDlambdaAMG`가 `CoarseCorrectionLoss`의 `_field_norm`에 의존). 모듈로 감싸거나 분리한다.
 - [ ] export 정리
   - [x] 정의되지 않은 이름 제거: `BatchedFieldBuffer`, `materialize_fields`, `preD`, `doubletrain`, `HalfPAttention_Layer`, `ReLU`/`Sigmoid`/`Tanh` 등 19개(export 문 기준 21건). 사용자 코드에서 이미 `UndefVarError`이거나 Base/LatticeDiracOperators로 해석되던 이름이라 동작 변화 없음
-  - [ ] 존재하지 않는 `RealAttention_Layer` import 제거
+  - [x] 존재하지 않는 `RealAttention_Layer` import 제거 (모듈 병합 때 import 문 전체가 사라짐)
+  - [x] legacy로 옮긴 이름 30개를 export에서 제거
   - 내부용 제거: `_to_cpu`, `_to_gpu`, 디버그용 `Ref`
   - 충돌 위험 이름: `mean`(Statistics), `conj!`(Base와 별개 함수로 정의됨), `gradient`/`update!`/`train`/`Identity`(Flux·Zygote와 충돌). Base 확장으로 바꾸거나 이름을 바꾸거나 export에서 뺀다
-  - `substitute_fermion!` 이중 정의 해소
+  - [x] `substitute_fermion!` 이중 정의 해소: elementry_base 쪽을 `_copy_fermion!`으로, gpu의 2인자 `conj!`를 `conj_fermion!`으로
 - [ ] 공개 API 확정. 바깥 스크립트 사용 빈도가 실질적인 API다:
   `PTLayer`, `DenseLinearLayer`, `NormLayer`, `BlockScalar_Layer`, `Ritz_Layer`, `fermionfield_Layer`, `Adam`, `train`, `load_checkpoint!`, `refresh_model!`, `inner_product`, `norm2`, `Paths`, `build_lmp_32pt_layers`, `deflated_initial_guess`
 - [ ] 스크립트에서 반복되는 비공개 호출을 공개 함수로 승격
@@ -136,7 +137,7 @@
   - `_default_lmp_paths(max_len; path_variant)` → 공개 path 빌더
   - `_to_gpu_fermions`, `_cvt_br` → CPU/GPU 전송 헬퍼
 - [ ] `load_lmp_model`이 파일 이름을 정규식으로 파싱해 하이퍼파라미터를 추정하는 부분 → 체크포인트 안에 설정을 저장
-- [ ] 이름 일관성: `elementry` → `elementary`, `PrallelTransportAttention_Layer` 오타, 레이어 이름 규칙 통일 (`PTLayer`/`NormLayer` 형태로). 파일명도 CamelCase로 통일
+- [ ] 이름 일관성: 레이어 이름 규칙 통일 (`PTLayer`/`NormLayer` 형태로). 파일 이름은 `core/`, `layers/` 등 폴더 아래 snake_case로 정리됨. `elementry`와 `PrallelTransportAttention_Layer`는 legacy로 감
 
 ### Phase 4. 코드 정리
 
@@ -147,19 +148,22 @@
     - 직접 스캔 결과 외부 함수 × 외부 타입 메서드 23개: `*` 7, `+` 4, `-` 4, `/` 1, `conj` 2, `broadcast!`, `minmax`, `ndims`, `deepcopy_internal`, `LatticeDiracOperators.substitute_fermion!` 각 1. 대부분 `elementry_base.jl`, 일부 `gpu.jl`
     - Aqua.jl `test_piracies`는 이것들을 잡지 못했음(하위 모듈 메서드를 보지 않는 것으로 보임). CI에 넣을 때 주의
   - `gpu.jl:1869` `deepcopy_internal`이 `fshifted`를 몰래 더미로 바꾸는 동작 → 명시적 복사 함수로
+- [ ] 활성화 체크포인팅에서 BlockScalar 가중치가 갱신되지 않음: 순전파 버퍼를 비우면 BlockScalar가 GPU 캐시를 CPU의 옛 가중치로 다시 만든다. `_init_gpu_block_cache!`가 기존 캐시의 가중치를 이어받게 하면 됨 (`test_train_gpu.jl`의 broken이 통과해야 함). 체크포인팅을 쓰는 스크립트는 `train_lmp_path9_depth417.jl`(interval 32, BlockScalar 포함)
+- [ ] NormLayer 역전파에 `alpha`가 빠져 있음 (모든 모델이 alpha = 1이라 현재는 영향 없음)
+- [ ] 연구 브랜치의 `5845cb1 fix: preserve gauge order when resuming training`을 이 브랜치로 가져오기 (batch 1 경로의 config 순서가 `epoch_offset`을 무시함)
 - [ ] batch > 1 학습 수정: 배치 평균으로 모으고, 레이어가 반환하는 캐시 버퍼를 복사해서 누적 (`test_train_gpu.jl`의 broken 두 개가 통과해야 함)
 - [ ] CPU 체크포인트 지원: PT/DenseLinear 가중치와 CPU Adam 상태 저장, CPU 모델로 불러오기 (`test_checkpoint.jl`의 broken이 통과해야 함)
-- [ ] `WF3x1CPU/GPU` 별칭이 8개 파일에 중복 정의 → 한 곳에서 정의
-- [ ] 레거시 레이어 약 3.5k줄 제거 (결정 사항 1에 따라)
-- [ ] 주석 처리된 코드 약 300줄, `if false` 블록 제거
-- [ ] `train` 3개 메서드와 `train_timed` 통합. 공통 루프 하나에 옵션(타이밍, 로깅 콜백)으로
+- [x] `WF3x1CPU/GPU` 별칭이 8개 파일에 중복 정의 → `core/types.jl` 한 곳에서 정의
+- [x] 레거시 레이어를 `legacy/`로 이동 (사용자 결정: 삭제 대신 이동). 스크립트·테스트·현재 모델에서 닿지 않는 함수도 `legacy/unused/`로
+- [x] 주석 처리된 코드와 `if false` 블록 제거 (src 기준)
+- [x] `train` 정리: 스크립트가 쓰지 않는 `train` 2개 메서드와 `train_timed`는 legacy로. 남은 `train`은 batch 1/2 경로를 하나의 루프로 합치고 디버그 계측 제거 (`96b4ba9`)
 - [ ] `train`의 PyPlot 라이브 플롯 → 콜백 인자. 로그 파일도 기본으로 작업 디렉터리에 쓰지 않게
 - [ ] `println` → `@debug`/`@info`, `verbose` 인자
 - [ ] ENV 변수로 동작을 바꾸는 부분(`CoarseCorrectionLoss.jl:952`, `Layer_sequence.jl:3405`) → 함수 인자로
 - [ ] 전역 포인터 캐시(`gpu.jl:1370`)가 `fields[1]`만 검증해 stale 포인터 위험 → 검증 강화 또는 명시적 캐시 객체
-- [ ] `Layer_sequence.jl`(4.2k줄) 분할: forward, CPU/GPU 전송, 학습 루프, 게이지 I/O, 메모리 디버깅
-- [ ] `activation.jl`은 실제로 역전파 코드이므로 이름 변경 (예: `backward.jl`)
-- [ ] 한글 주석과 에러 메시지, 이모지를 영어로 (사용자에게 보이는 에러 메시지부터)
+- [x] `Layer_sequence.jl` 분할 → `layers/`, `model/`, `training/`
+- [x] `activation.jl`(역전파)은 레이어별 파일로 흩어짐
+- [x] 한글 주석과 에러 메시지, 이모지를 영어로 (src 기준. 레이어 파일에는 수식이 들어간 docstring 추가)
 
 ### Phase 5. 문서와 예제
 

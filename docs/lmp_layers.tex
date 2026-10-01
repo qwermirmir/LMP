@@ -128,18 +128,20 @@ representation to Dirac-operator low modes.
 
 The source layout relevant for layer documentation is:
 \begin{itemize}[leftmargin=*]
-  \item \code{src/LMP.jl}: top-level module, includes submodules, and exports
-        public constructors.
-  \item \code{src/Layer_types.jl}: layer structs and activation-function types.
-  \item \code{src/Layer_sequence.jl}: forward maps, normalization, objective
-        layers, sequence execution, CPU/GPU conversion helpers, and many
-        gradient/update definitions.
-  \item \code{src/elementry_base.jl}: fermion-field algebra, spin matrices,
-        path data structures, hopping/parallel transport, inner products, block
-        utilities, and clover-field utilities.
-  \item \code{src/Gauge.jl}: gauge-transformation helpers.
-  \item \code{src/gpu.jl}: GPU versions of spin matrices, packing routines,
-        batched kernels, and GPU helper functions.
+  \item \code{src/LMP.jl}: the module, the include order and the exports.
+  \item \code{src/core/}: fermion-field algebra, spin matrices, paths,
+        parallel transport (\code{hopping.jl}), the Wilson and clover Dirac
+        operators, gauge transformations, and the batched spin-mixing kernels.
+  \item \code{src/layers/}: one file per layer, holding its struct, forward
+        map, backward pass, weight gradient, Adam update and GPU kernels.
+  \item \code{src/model/}: forward and backward passes through a layer
+        list, moving a model between CPU and GPU, and building the standard
+        model.
+  \item \code{src/training/}: Adam, the training loop, checkpoints, gauge-file
+        I/O and logging.
+  \item \code{legacy/}: layers that no current model uses (PTC, CPTC,
+        attention, siteweight, Rayleigh-quotient and others). This code is
+        kept for reference and is not loaded.
 \end{itemize}
 
 \subsection{What to focus on when presenting \LMP{}}
@@ -235,7 +237,7 @@ The squared norm is
   \norm{x}^{2} = \inner{x}{x}.
 \]
 These appear as \code{inner_product(x,f)} and \code{norm2(x)} in
-\code{src/elementry_base.jl}.
+\code{src/core/fermion_ops.jl}.
 
 \section{Gauge-covariant paths and parallel transport}
 
@@ -269,7 +271,7 @@ where $\Delta p$ is the endpoint displacement and the product uses either a
 link or its Hermitian adjoint depending on path orientation. In the code this is
 implemented by \code{Hopping_operator}.
 
-The CPU implementation in \code{src/elementry_base.jl} follows the rule:
+The CPU implementation in \code{src/core/hopping.jl} follows the rule:
 \begin{align}
   s=+\mu:\quad
   \field'(n)
@@ -339,9 +341,9 @@ ordinary convolutional network.
 \subsection[PTC Layer: parallel-transport convolution]{\texttt{PTC\_Layer}: parallel-transport convolution}
 
 \paragraph{Implementation.}
-Defined in \code{src/Layer_types.jl}; forward map in
-\code{src/Layer_sequence.jl}; functional helper \code{PTC} in
-\code{src/elementry_base.jl}.
+Legacy: no current model uses it. The code is in
+\code{legacy/layers/ptc.jl}, and the functional helper \code{PTC} in
+\code{legacy/unused/elementry_base.jl}; neither is loaded by the package.
 
 \paragraph{Inputs and parameters.}
 Let $\paths=\{p_1,\dots,p_K\}$ be the paths stored in a \code{Hopping_operator}.
@@ -386,9 +388,9 @@ feature extractor.
 \subsection[CPTC Layer: Clifford parallel-transport convolution]{\texttt{CPTC\_Layer}: Clifford parallel-transport convolution}
 
 \paragraph{Implementation.}
-Defined in \code{src/Layer_types.jl}; forward map in
-\code{src/Layer_sequence.jl}; helper \code{CPTC} in
-\code{src/elementry_base.jl}.
+Legacy: no current model uses it. The code is in
+\code{legacy/layers/cptc.jl}, and the helper \code{CPTC} in
+\code{legacy/unused/elementry_base.jl}; neither is loaded by the package.
 
 \paragraph{Forward map.}
 \code{CPTC_Layer} has the same transport structure as \code{PTC_Layer}, but it
@@ -410,8 +412,9 @@ restriction of the spin-space part of the convolution.
 \subsection[PTLayer: multi-input path transport layer]{\texttt{PTLayer}: multi-input path transport layer}
 
 \paragraph{Implementation.}
-Defined in \code{src/Layer_types.jl}; forward map in
-\code{src/Layer_sequence.jl}; CPU and GPU paths are both implemented.
+Defined in \code{src/layers/parallel_transport.jl}, with its backward pass,
+weight gradient and the CPU and GPU paths. The batched GPU mixing kernels are
+in \code{src/core/spin_mixing.jl}.
 
 \paragraph{Inputs and parameters.}
 \code{PTLayer} acts on a vector of fermion fields
@@ -446,8 +449,7 @@ gauge background.
 \subsection[DenseLinearLayer: spin-matrix dense channel mixing]{\texttt{DenseLinearLayer}: spin-matrix dense channel mixing}
 
 \paragraph{Implementation.}
-Defined in \code{src/Layer_types.jl}; forward map in
-\code{src/Layer_sequence.jl}.
+Defined in \code{src/layers/dense_linear.jl}.
 
 \paragraph{Forward map.}
 For input fields $x_1,\dots,x_I$ and output fields $y_1,\dots,y_O$,
@@ -497,8 +499,9 @@ implemented by \code{Matmul!} or \code{spincolortrace}, depending on the layer.
 \subsection[Attention Layer]{\texttt{Attention\_Layer}}
 
 \paragraph{Implementation.}
-Defined in \code{src/Layer_types.jl}; forward map starts at
-\code{Attention_Layer} in \code{src/Layer_sequence.jl}.
+Legacy: no current model uses the attention layers. The code is in
+\code{legacy/layers/attention.jl} and its neighbours, and is not loaded by the
+package.
 
 \paragraph{Forward map.}
 The code first Clifford-transforms the Q/K/V weights:
@@ -655,8 +658,8 @@ of the Dirac operator.
 \subsection[RayleighQuotient Layer]{\texttt{RayleighQuotient\_Layer}}
 
 \paragraph{Implementation.}
-Defined in \code{src/Layer_types.jl}; forward map in
-\code{src/Layer_sequence.jl}.
+Legacy: superseded by \code{Ritz_Layer}. The code is in
+\code{legacy/layers/rayleigh_quotient.jl} and is not loaded by the package.
 
 \paragraph{Forward map.}
 For the stored field $x$ and input operator $\dirac$,
@@ -700,9 +703,8 @@ with low modes.
 \subsection[Ritz Layer]{\texttt{Ritz\_Layer}}
 
 \paragraph{Implementation.}
-Defined in \code{src/Layer_types.jl}; forward map in
-\code{src/Layer_sequence.jl}; GPU code uses CUSOLVER for the generalized
-Hermitian eigenproblem.
+Defined in \code{src/layers/ritz.jl}; the GPU code uses CUSOLVER for the
+generalized Hermitian eigenproblem.
 
 \paragraph{Forward map.}
 Given a set of candidate vectors $V=\{x_1,\dots,x_l\}$, the layer builds Gram
@@ -796,8 +798,8 @@ hurt numerical stability. \code{NormLayer} explicitly fixes the field norm.
 \subsection[BlockScalar Layer]{\texttt{BlockScalar\_Layer}}
 
 \paragraph{Implementation.}
-Defined in \code{src/Layer_types.jl}; forward map in
-\code{src/Layer_sequence.jl}; block utilities in \code{src/elementry_base.jl}.
+Defined in \code{src/layers/block_scalar.jl}, which also builds the
+site-to-block maps on the CPU and the GPU.
 
 \paragraph{Forward map.}
 The lattice is decomposed into blocks of linear size $r$. Let $b(n)$ be the
@@ -830,7 +832,7 @@ non-trainable layer.
 
 \subsection{Clover Dirac support}
 
-\code{src/elementry_base.jl} also contains utilities for a clover-improved
+\code{src/core/clover.jl} contains utilities for a clover-improved
 Dirac operator. The documented formula in the source is
 \[
   D_{\mathrm{cl}}
@@ -901,14 +903,16 @@ Block scalar & $w_{b(n),k}x_k(n)$ & Block/domain scaling \\
 
 \begin{itemize}[leftmargin=*]
   \item Public exports: \code{src/LMP.jl}.
-  \item Layer type definitions: \code{src/Layer_types.jl}.
-  \item Forward maps and layer sequencing: \code{src/Layer_sequence.jl}.
-  \item Path representation and hopping: \code{src/elementry_base.jl}.
-  \item Gauge transformation: \code{src/Gauge.jl}.
-  \item GPU helpers and batched kernels: \code{src/gpu.jl}.
-  \item Basic attention tests: \code{test/Attention_layer.jl} and
-        \code{test/Attention_gradient.jl}.
-  \item Hopping covariance test: \code{test/hopping_covariance_test.jl}.
+  \item Layers: \code{src/layers/}, one file per layer.
+  \item Forward and backward passes through a model: \code{src/model/propagation.jl}.
+  \item Paths and parallel transport: \code{src/core/paths.jl} and
+        \code{src/core/hopping.jl}.
+  \item Gauge transformation: \code{src/core/gauge_transform.jl}.
+  \item Batched GPU kernels: in the layer files and \code{src/core/spin_mixing.jl}.
+  \item Training: \code{src/training/}.
+  \item Tests: \code{test/runtests.jl}; gradients are checked against finite
+        differences in \code{test/test_gradients.jl}, and gauge covariance
+        in \code{test/test_gauge_covariance.jl}.
 \end{itemize}
 
 \section{Practical interpretation}
