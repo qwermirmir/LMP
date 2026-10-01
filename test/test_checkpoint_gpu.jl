@@ -15,7 +15,7 @@ function gpu_model(build)
 end
 
 @testset "GPU checkpoint resume, $name" for (name, build) in
-        (("BlockScalar model", golden_model), ("BlockMatrix model", blockmatrix_model))
+        (("4^4 model", golden_model), ("asymmetric model", asymmetric_model))
     path = tempname() * ".jld2"
 
     layers = gpu_model(build)

@@ -2,12 +2,8 @@
 #
 # `gradient` returns, for every complex weight w,
 #     g = dL/dRe(w) - i dL/dIm(w),
-# so steepest descent is w -= eta * conj(g). The Adam updates in Optimizer.jl
-# and gpu.jl rely on this convention.
-#
-# BlockMatrix_Layer is the exception: it returns the conjugate,
-# g = dL/dRe(w) + i dL/dIm(w), and its Adam update (CPU and
-# `_cudakernel_adam_complex_standard!`) is written for that.
+# so steepest descent is w -= eta * conj(g). The Adam updates in
+# training/adam.jl and the layer files rely on this convention.
 
 using Test
 using Random
@@ -65,19 +61,17 @@ end
 probes(layer::fermionfield_Layer, g, rng, n) = _array_probes(layer.x[1].f, g[1].f, rng, n)
 probes(layer::DenseLinearLayer, g, rng, n) = _spin_probes(layer.W, g, rng, n)
 probes(layer::PTLayer, g, rng, n) = _spin_probes(layer.W, only(g), rng, n)
-probes(layer::Union{BlockScalar_Layer,BlockMatrix_Layer}, g, rng, n) =
-    _array_probes(layer.W, g, rng, n)
+probes(layer::BlockScalar_Layer, g, rng, n) = _array_probes(layer.W, g, rng, n)
 
-# Maps dL/dRe + i dL/dIm to the convention the layer's gradient uses.
+# Maps dL/dRe + i dL/dIm to the convention the gradients use.
 expected_gradient(layer, fd) = conj(fd)
-expected_gradient(::BlockMatrix_Layer, fd) = fd
 
 # All trainable arrays of a layer, and the matching gradient arrays (copied,
 # because some layers return a cached buffer).
 weight_arrays(layer::fermionfield_Layer, g) = ([layer.x[1].f], [copy(g[1].f)])
 weight_arrays(layer::DenseLinearLayer, g) = ([W.sm for W in layer.W], [copy(G.sm) for G in g])
 weight_arrays(layer::PTLayer, g) = ([W.sm for W in layer.W], [copy(G.sm) for G in only(g)])
-weight_arrays(layer::Union{BlockScalar_Layer,BlockMatrix_Layer}, g) = ([layer.W], [copy(g)])
+weight_arrays(layer::BlockScalar_Layer, g) = ([layer.W], [copy(g)])
 
 # Moves every weight of the layer at once along a random unit direction v and
 # returns the central-difference slope together with the slope the gradient
@@ -114,10 +108,8 @@ function adam_step_losses(layers, D)
 end
 
 const MODELS = (
-    ("BlockScalar model", golden_model),
-    ("BlockMatrix model", blockmatrix_model),
-    ("asymmetric BlockScalar model", asymmetric_model),
-    ("asymmetric BlockMatrix model", () -> blockmatrix_model(dims=ASYM_DIMS, max_len=ASYM_MAX_LEN)),
+    ("4^4 model", golden_model),
+    ("asymmetric model", asymmetric_model),
 )
 
 @testset "gradients" begin

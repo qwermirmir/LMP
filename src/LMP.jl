@@ -1,3 +1,24 @@
+"""
+    LMP
+
+Machine-learning models built directly on lattice QCD fermion fields. The layers
+are gauge covariant: they combine parallel transport along gauge links with
+trainable 4x4 spin matrices, and the models are trained with Rayleigh-Ritz
+objectives to learn low modes of the Wilson Dirac operator.
+
+Source layout:
+
+- `core/`: fermion fields, spin matrices, paths, parallel transport and the
+  Dirac operator, on CPU and GPU.
+- `layers/`: one file per layer type, holding its struct, forward pass,
+  backward pass, weight gradient, CPU/GPU conversion and GPU kernels.
+- `model/`: forward and backward passes through a list of layers, moving a
+  model between CPU and GPU, and building the standard model.
+- `training/`: the Adam optimizer, the training loop, checkpoints, gauge-file
+  I/O and the training log.
+- `solvers/`: DDalphaAMG and related multigrid solvers.
+- `analysis/`: subspace comparison utilities.
+"""
 module LMP
 
 __precompile__(false)
@@ -22,237 +43,87 @@ import LinearAlgebra: mul!
 import Gaugefields: add_U!, clear_U!
 import LatticeDiracOperators.Dirac_operators: substitute_fermion!, Shifted_fermionfields_4D_accelerator
 
-include("elementry_base.jl")
-include("gpu.jl")
-include("Layer_types.jl")
-include("activation.jl")
-include("Optimizer.jl")
-include("Layer_sequence.jl")
-include("Gauge.jl")
-include("DDalphaAMG.jl")
-include("GDlambdaAMGDDalphaAdapter.jl")
-include("CoarseCorrectionLoss.jl")
-include("GDlambdaAMG.jl")
-include("SubspaceSimilarity.jl")
+# NVTX ranges mark GPU work for the Nsight profilers.
+const NVTX = CUDA.NVTX
+NVTX.activate()
 
-using .Gauge
+include("core/types.jl")
+include("core/spin_matrix.jl")
+include("core/paths.jl")
+include("core/gpu_lattice.jl")
+include("core/gpu_buffers.jl")
+include("core/fermion_ops.jl")
+include("core/hopping.jl")
+include("core/dirac.jl")
+include("core/clover.jl")
+include("core/gauge_transform.jl")
+
+# Layers add update! methods for Adam, so the optimizer comes first.
+include("training/adam.jl")
+
+include("layers/fermion_field.jl")
+include("layers/dense_linear.jl")
+include("layers/parallel_transport.jl")
+include("layers/norm.jl")
+include("layers/block_scalar.jl")
+include("layers/ritz.jl")
+include("layers/zero_mode.jl")
+include("layers/orthogonal.jl")
+include("layers/loss_sum.jl")
+
+include("model/device.jl")
+include("model/propagation.jl")
+
+include("training/logging.jl")
+include("training/gauge_io.jl")
+include("training/checkpoint.jl")
+include("training/train.jl")
+
+include("solvers/ddalpha_amg.jl")
+include("solvers/gdlambda_ddalpha_adapter.jl")
+include("layers/coarse_correction_loss.jl")
+include("solvers/gdlambda_amg.jl")
+include("analysis/subspace_similarity.jl")
+
+include("model/build.jl")
+
 using .DDalphaAMG
 
+# Fields, spin matrices and paths
+export Spin_matrix, Spin_matrix_GPU, Random_SpinM, Random_SpinM_GPU, Convertsm, Clifford, xavier_init!
+export Paths, reverse_paths, Hopping_operator, gUgshift!
+export inner_product, norm2, mean, addmul!, zero_wf!, Matmul!
+export CloverDiracOperator, compute_Fmunu, refresh_clover!
+
+# Layers
+export Identity, Operator
+export fermionfield_Layer, DenseLinearLayer, PTLayer, NormLayer, BlockScalar_Layer
+export Ritz_Layer, ZeroMode_Layer, Orthogonal_Layer
+export CoarseCorrectionLoss_Layer, coarse_correction_loss_forward!
+
+# Models
+export forward_propagation, forward_propagation!, backward_propagation!, gradient, DeltaRule
+export substitute_Layer!, refresh_model!, refresh_fermionfield!, _to_cpu, _to_gpu, _to_cpu_gauge
+export build_lmp_32pt_layers, load_lmp_model
+
+# Training
 export Opt, Adam, update!, advance_step!, sync_layers!, save_checkpoint, load_checkpoint!
-export Hopping_operator
-export Onestep
-export Paths
-export PTC
-export CPTC
-export Random_SpinM
-export Generate_weight
-export Spin_matrix
-export Spin_matrix_GPU
-export norm2
-export reverse_paths
-export Lossfunction
-export PTC_Layer
-export CPTC_Layer
-export forward_propagation
-export train 
-export Identity
-export backward_propagation
-export Clifford
-export inner_product
-export Attention_Layer
-export Matmul!
-export Operator
-export Softmax
-export NormLayer
-export test_Layer
-export FullPTCAttention_Layer
-export mean 
-export Spin_matrix_GPU
-export Random_SpinM_GPU
-export PrallelTransportAttention_Layer
-#----------------------------------------------
-export gUgshift!
-export xavier_init!
-export complexNormLayer
-export minmaxNormLayer
-export minmax
-export gradient 
-export standardization
-export DeltaRule
-export Dirac_Layer
-export ModRelu
-export g2vector_generator!
-export siteweight_Layer
-export RayleighQuotient_Layer
-export PtcRayleighQuotient_Layer
-export HoppingRayleighQuotient_Layer
-export DenseLinearLayer
-export PTLayer
-export addmul!
-export fermionfield_Layer
-export Orthogonal_Layer
-export Ritz_Layer
-export ZeroMode_Layer
-export Convertsm
-export gpuaddmul!
-export GramSchmidt_Layer
-export BlockScalar_Layer
-export BlockMatrix_Layer
-export backward_propagation!,forward_propagation!
-export zero_wf!
-export refresh_fermionfield!, refresh_model!
-export substitute_Layer!
-export blockize
-export unblockize
+export train
+
+# Multigrid solvers
 export DDalphaAMG_Setup, CoarseVector
 export setup_DDalphaAMG, solve_DDalphaAMG, vcycle
 export restrict_f2c, prolongate_c2f, coarse_apply
 export restrict_f2c!, prolongate_c2f!, coarse_apply!
 export precompute_coarse_operator!
 export mr_smooth!, sap_smooth!
-export block_orthonormalize!,deflated_initial_guess,_to_cpu,_to_gpu,_to_cpu_gauge
+export block_orthonormalize!, deflated_initial_guess
 export gamma5!, chiral_project!
-export CoarseCorrectionLoss_Layer, coarse_correction_loss_forward!
 export ShiftedGamma5DiracOperator, Gamma5LeftShiftedDiracOperator
-export shifted_coarse_correction!
-export shifted_amg_vcycle!
-export shifted_chiral_coarse_stencil
+export shifted_coarse_correction!, shifted_amg_vcycle!, shifted_chiral_coarse_stencil
 export gd_global_orthonormalize!, gd_coarse_odd_even_relative_residual
 export gd_coarse_gmres, gd_adaptive_vcycle, gd_adaptive_amg_setup
 export flexible_gmres!, harmonic_ritz_pencil, harmonic_ritz, generalized_davidson
 export gd_eigenpair_audit
-export CloverDiracOperator, compute_Fmunu, refresh_clover!
-export train_timed
-export build_lmp_32pt_layers, load_lmp_model
 
-function _default_lmp_paths(max_len::Int=4)
-    P = Vector{Paths}(undef, 9)
-    for i in 1:9
-        if i <= 5
-            P[i] = Paths([[i - 1]])
-        else
-            P[i] = Paths([[-(i - 5)]])
-        end
-    end
-
-    dirs = [1, 2, 3, 4, -1, -2, -3, -4]
-    lengths = [2^k for k in 1:floor(Int, log2(max_len))]
-    if !(max_len in lengths)
-        push!(lengths, max_len)
-    end
-    for d in dirs, len in lengths
-        push!(P, Paths([fill(d, len)]))
-    end
-    return P
-end
-
-"""
-    build_lmp_32pt_layers(U, x, D; max_len=4, init_gpu=true)
-
-Builds the 16x32 32-PT Ritz model architecture used by `train_lmp.jl`.
-This creates the layer objects only; checkpoint weights can then be loaded into
-them with `load_lmp_model(path; U, x, D)`.
-"""
-function build_lmp_32pt_layers(U, x, D; max_len::Int=4, num_eig::Int=4, block_r::Int=4, init_gpu::Bool=true)
-    P = _default_lmp_paths(max_len)
-    pl = length(P)
-
-    dl = DenseLinearLayer(1, pl, true)
-    PT_layers = [PTLayer(P, U, pl) for _ in 1:32]
-    PT32 = PTLayer(P, U, num_eig)
-
-    fe = fermionfield_Layer(x, 1)
-    bs5 = BlockScalar_Layer(x, num_eig, block_r)
-    Norm = NormLayer()
-    Norm2 = NormLayer()
-    Ritz = Ritz_Layer(D)
-
-    layers = [
-        fe, dl,
-        PT_layers[2:17]...,
-        Norm,
-        PT_layers[18:32]...,
-        PT32, bs5, Norm2, Ritz,
-    ]
-
-    if init_gpu
-        substitute_Layer!(layers)
-        substitute_Layer!(layers)
-    end
-
-    return layers
-end
-
-function _infer_lmp_max_len_from_path(path::AbstractString, fallback::Int=4)
-    m = match(r"maxlen(\d+)", basename(path))
-    m === nothing && return fallback
-    return parse(Int, m.captures[1])
-end
-
-function _infer_lmp_num_eig_from_path(path::AbstractString, fallback::Int=4)
-    m = match(r"\((\d+)eig\)", basename(path))
-    m === nothing && return fallback
-    return parse(Int, m.captures[1])
-end
-
-"""
-    load_lmp_model(path; layers=nothing, opt=Adam(), gpu=false, U=nothing, x=nothing, D=nothing, max_len=nothing, num_eig=nothing)
-
-Loads either legacy checkpoints that contain a `"layers"` key or newer W-only
-checkpoints created by `save_checkpoint`.
-
-Legacy files return their stored layers directly. W-only checkpoints need a live
-`layers` object with the same architecture, or `U`, `x`, and `D` so the standard
-32-PT Ritz architecture can be created automatically. If `max_len` is not given,
-W-only checkpoints infer it from filenames like `maxlen5`, falling back to 4.
-If `num_eig` is not given, W-only checkpoints infer it from filenames like
-`(6eig)`, falling back to 4.
-"""
-function load_lmp_model(path::AbstractString;
-                        layers=nothing,
-                        opt::Adam=Adam(),
-                        gpu::Bool=false,
-                        U=nothing,
-                        x=nothing,
-                        D=nothing,
-                        max_len=nothing,
-                        num_eig=nothing)
-    keys_in_file = JLD2.jldopen(path, "r") do f
-        Set(String.(keys(f)))
-    end
-
-    if "layers" in keys_in_file
-        loaded_layers = JLD2.load(path, "layers")
-        if gpu
-            substitute_Layer!(loaded_layers)
-        end
-        return (; layers=loaded_layers, opt, format=:legacy)
-    end
-
-    if "opt_t" in keys_in_file
-        if layers === nothing
-            if U !== nothing && x !== nothing && D !== nothing
-                inferred_max_len = max_len === nothing ? _infer_lmp_max_len_from_path(path) : max_len
-                inferred_num_eig = num_eig === nothing ? _infer_lmp_num_eig_from_path(path) : num_eig
-                layers = build_lmp_32pt_layers(U, x, D; max_len=inferred_max_len, num_eig=inferred_num_eig)
-            else
-                ks = sort!(collect(keys_in_file))
-                preview = join(ks[1:min(end, 8)], ", ")
-                error("""
-                $path is a W-only checkpoint, so it does not contain a full `"layers"` object.
-                Pass either existing `layers`, or pass `U`, `x`, and `D` so the standard
-                32-PT model can be created automatically:
-
-                    model = load_lmp_model(path; U=U, x=x, D=D, opt=opt)
-
-                Available keys start with: $preview
-                """)
-            end
-        end
-        load_checkpoint!(path, layers, opt)
-        return (; layers, opt, format=:checkpoint)
-    end
-
-    error("Unsupported LMP checkpoint format in $path. Available keys: $(collect(keys_in_file))")
-end
-end  # module LMP
+end # module LMP

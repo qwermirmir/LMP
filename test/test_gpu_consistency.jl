@@ -18,11 +18,8 @@ const COMPARED_KEYS = (:loss, :activations, :grad_norm2, :loss_after_step)
 
 @testset "GPU matches CPU" begin
     @testset "$name" for (name, build) in (
-            ("BlockScalar model", golden_model),
-            ("BlockMatrix model", blockmatrix_model),
-            ("asymmetric BlockScalar model", asymmetric_model),
-            ("asymmetric BlockMatrix model",
-             () -> blockmatrix_model(dims=ASYM_DIMS, max_len=ASYM_MAX_LEN)))
+            ("4^4 model", golden_model),
+            ("asymmetric model", asymmetric_model))
         cpu = golden_measure(build().layers)
         layers = build().layers
         substitute_Layer!(layers, GPU_BLOCKS)
