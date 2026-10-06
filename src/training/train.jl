@@ -84,12 +84,14 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
     end
 
     # ---- First configuration and the Dirac operator ----
+    # A resumed run starts at the configuration of its absolute step.
+    initial_k = _training_config_index(epoch_offset, 1, batch, 1, N)
     staging = _make_gauge_staging(U_template)
     raw_buffers = gauge_format === :raw ? _make_raw_cpu_buffers(gauge_paths[1], U_template) : nothing
     if gauge_format === :raw
-        _read_raw_gauge_to_gpu!(U_template, gauge_paths[1], staging, raw_buffers)
+        _read_raw_gauge_to_gpu!(U_template, gauge_paths[initial_k], staging, raw_buffers)
     else
-        first_U = gauge_cache === nothing ? JLD2.load(gauge_paths[1], "U") : gauge_cache[1]
+        first_U = gauge_cache === nothing ? JLD2.load(gauge_paths[initial_k], "U") : gauge_cache[initial_k]
         substitute_U!(U_template, first_U)
         _copy_gauge_to_template!(U_template, first_U, staging)
     end
@@ -237,10 +239,10 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
                 error("ML-style gauge batch currently requires activation_checkpoint_interval=0")
             # Load each configuration of the batch and accumulate its gradient.
             current_loss = 0.0
-            first_k = mod1((epoch_offset + step - 1) * batch + 1, N)
+            first_k = _training_config_index(epoch_offset, step, batch, 1, N)
             last_k = first_k
             for b in 1:batch
-                last_k = mod1((epoch_offset + step - 1) * batch + b, N)
+                last_k = _training_config_index(epoch_offset, step, batch, b, N)
                 load_training_gauge!(last_k)
                 current_loss += real(forward_backward!(b))
             end
@@ -250,8 +252,8 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
         else
             # U_template already holds this step's configuration. Start
             # reading the next one from disk while the GPU works.
-            current_k = mod1(step, N)
-            next_k = mod(step, N) + 1
+            current_k = _training_config_index(epoch_offset, step, batch, 1, N)
+            next_k = _training_config_index(epoch_offset, step + 1, batch, 1, N)
             next_U = nothing
             next_U_task = nothing
             if gauge_format !== :raw
@@ -318,6 +320,12 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
 
     return loss_history
 end
+
+# Index of the configuration used at a given step and batch position, counted
+# from the start of training so that a resumed run continues the same order.
+_training_config_index(epoch_offset::Int, step::Int, batch::Int,
+                       batch_position::Int, count::Int) =
+    mod1((epoch_offset + step - 1) * batch + batch_position, count)
 
 # Copies a CPU gauge configuration into the GPU template, link by link,
 # through the pinned staging buffers.

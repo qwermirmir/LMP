@@ -16,6 +16,7 @@ const CPU_TESTS = [
     "test_gauge_covariance.jl",
     "test_clover.jl",
     "test_checkpoint.jl",
+    "test_compat.jl",
     "subspace_similarity.jl",
     "ddalphaamg_setup_modes.jl",
     "gdlambda_amg.jl",

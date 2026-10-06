@@ -87,6 +87,7 @@ include("solvers/gdlambda_amg.jl")
 include("analysis/subspace_similarity.jl")
 
 include("model/build.jl")
+include("compat.jl")
 
 using .DDalphaAMG
 

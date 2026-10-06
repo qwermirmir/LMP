@@ -112,6 +112,26 @@ end
         @test isapprox(vcat(first, rest), continuous; rtol=1.0e-12)
     end
 
+    # With two configurations, a run resumed after one step must continue on
+    # the second configuration, as the uninterrupted run does.
+    @testset "resuming keeps the configuration order" begin
+        U_cold = Initialize_Gaugefields(3, 0, GOLDEN_DIMS...; condition="cold", cuda=false)
+        two = (; gauge_cache=[U, U_cold])
+        continuous = train_losses!(gpu_golden_layers(), Adam(1.0e-3); epochs=3, two...)
+
+        layers = gpu_golden_layers()
+        opt = Adam(1.0e-3)
+        first = train_losses!(layers, opt; epochs=1, two...)
+        checkpoint = joinpath(dir, "checkpoint_two.jld2")
+        save_checkpoint(checkpoint, layers, opt)
+
+        layers = gpu_golden_layers()
+        opt = Adam(1.0e-3)
+        load_checkpoint!(checkpoint, layers, opt)
+        rest = train_losses!(layers, opt; epochs=2, epoch_offset=1, two...)
+        @test isapprox(vcat(first, rest), continuous; rtol=1.0e-12)
+    end
+
     # With eps = 1 the Adam step is proportional to the gradient, so a batch
     # gradient that is a sum instead of a mean shows up.
     @testset "batch 2" begin
