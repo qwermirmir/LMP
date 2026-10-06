@@ -148,7 +148,7 @@
     - 직접 스캔 결과 외부 함수 × 외부 타입 메서드 23개: `*` 7, `+` 4, `-` 4, `/` 1, `conj` 2, `broadcast!`, `minmax`, `ndims`, `deepcopy_internal`, `LatticeDiracOperators.substitute_fermion!` 각 1. 대부분 `elementry_base.jl`, 일부 `gpu.jl`
     - Aqua.jl `test_piracies`는 이것들을 잡지 못했음(하위 모듈 메서드를 보지 않는 것으로 보임). CI에 넣을 때 주의
   - `gpu.jl:1869` `deepcopy_internal`이 `fshifted`를 몰래 더미로 바꾸는 동작 → 명시적 복사 함수로
-- [ ] 활성화 체크포인팅에서 BlockScalar 가중치가 갱신되지 않음: 순전파 버퍼를 비우면 BlockScalar가 GPU 캐시를 CPU의 옛 가중치로 다시 만든다. `_init_gpu_block_cache!`가 기존 캐시의 가중치를 이어받게 하면 됨 (`test_train_gpu.jl`의 broken이 통과해야 함). 체크포인팅을 쓰는 스크립트는 `train_lmp_path9_depth417.jl`(interval 32, BlockScalar 포함)
+- [x] (수정함) 활성화 체크포인팅에서 BlockScalar 가중치가 갱신되지 않음: 순전파 버퍼를 비우면 BlockScalar가 GPU 캐시를 CPU의 옛 가중치로 다시 만든다. `_init_gpu_block_cache!`가 기존 캐시의 가중치를 이어받게 하면 됨 (`test_train_gpu.jl`의 broken이 통과해야 함). 체크포인팅을 쓰는 스크립트는 `train_lmp_path9_depth417.jl`(interval 32, BlockScalar 포함)
 - [ ] NormLayer 역전파에 `alpha`가 빠져 있음 (모든 모델이 alpha = 1이라 현재는 영향 없음)
 - [ ] 연구 브랜치의 `5845cb1 fix: preserve gauge order when resuming training`을 이 브랜치로 가져오기 (batch 1 경로의 config 순서가 `epoch_offset`을 무시함)
 - [ ] batch > 1 학습 수정: 배치 평균으로 모으고, 레이어가 반환하는 캐시 버퍼를 복사해서 누적 (`test_train_gpu.jl`의 broken 두 개가 통과해야 함)
