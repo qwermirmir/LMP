@@ -39,6 +39,21 @@ function forward_propagation(layers::Vector{T}, input::Any, target::Any) where {
 end
 
 """
+    (layers::Vector{<:Layer})(x)
+
+Calling a model applies its layers in turn without keeping the activations,
+so `layers([U])` returns the loss. The training scripts use it to print the
+final loss.
+"""
+function (layers::Vector{T})(x::Any) where T<:Layer
+    result = x
+    for layer in layers
+        result = layer(result)
+    end
+    return result
+end
+
+"""
     forward_propagation!(layers, input, target, u) -> loss
 
 Same as `forward_propagation`, writing the activations into an existing `u`.

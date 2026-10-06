@@ -19,3 +19,8 @@ const CASES = (("4^4 lattice", golden_model, GOLDEN_REFERENCE),
         end
     end
 end
+
+@testset "calling a model returns its loss" begin
+    (; layers, D) = golden_model()
+    @test isapprox(layers([D]), GOLDEN_REFERENCE.loss; rtol=1.0e-10)
+end
