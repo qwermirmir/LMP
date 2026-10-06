@@ -64,11 +64,9 @@ end
         losses = train_losses!(gpu_golden_layers(), Adam(1.0e-3); epochs=2,
                                gauge_paths=[raw_path], gauge_format=:raw,
                                activation_checkpoint_interval=2)
-        @test losses[1] ≈ golden[1] rtol=1.0e-12
         # Freeing the forward buffers makes BlockScalar_Layer rebuild its GPU
-        # cache from the stale CPU weights, so its update is lost every step.
-        # The second loss equals that of a step with BlockScalar frozen.
-        @test_broken isapprox(losses[2], golden[2]; rtol=1.0e-12)
+        # cache; the rebuilt cache must keep the trained weights.
+        @test isapprox(losses, golden; rtol=1.0e-12)
     end
 
     # The test loss is evaluated after the update, so at step 1 on the

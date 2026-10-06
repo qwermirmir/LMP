@@ -294,8 +294,16 @@ end
 Builds the GPU block map for the blocked layout of `x`, where
 `layer._gpu_block_map[linear_idx]` is the block id of each site, and the GPU
 cache of the weights. Later calls only need to update the weights.
+
+On the GPU the Adam update writes only the cached weights, so when a cache
+already exists (the forward buffers were freed, as activation checkpointing
+does every step) its weights are kept instead of the stale `layer.W`.
 """
 function _init_gpu_block_cache!(layer, x::WF3x1GPU)
+    old = layer._gpu_w_buf
+    if old isa Dict && get(old, :W, nothing) !== nothing && size(old[:W]) == size(layer.W)
+        copyto!(layer.W, old[:W])
+    end
     bi = x.blockinfo
     r = layer.r
     NX, NY, NZ, NT = x.NX, x.NY, x.NZ, x.NT
