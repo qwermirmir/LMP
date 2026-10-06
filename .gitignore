@@ -1,8 +1,30 @@
-.ipynb_checkpoints/
-*.jld2
+# Julia
 Manifest.toml
+Manifest-v*.toml
+
+# Data, checkpoints, and outputs
+*.jld2
+*.gbin
+/results/
+train_log_*.txt
+
+# Notebooks
+.ipynb_checkpoints/
+
+# LaTeX build outputs
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.pdf
+
+# Editor and tool settings
+.vscode/
+.claude/
+.superpowers/
+
+# Research branch: local scripts and scratch notebooks stay untracked.
+# Tracked files under test/ are not affected; add new ones with `git add -f`.
+/test/
 Untitled-Copy1.ipynb
 research/Untitled.ipynb
-test/DDeltaAMG_test.ipynb
-/results/
-/test/
