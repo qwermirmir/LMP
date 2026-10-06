@@ -7,8 +7,9 @@ Builds the 16x32 32-PT Ritz model architecture used by `train_lmp.jl`.
 This creates the layer objects only; checkpoint weights can then be loaded into
 them with `load_lmp_model(path; U, x, D)`.
 """
-function build_lmp_32pt_layers(U, x, D; max_len::Int=4, num_eig::Int=4, block_r::Int=4, init_gpu::Bool=true)
-    P = _default_lmp_paths(max_len)
+function build_lmp_32pt_layers(U, x, D; max_len::Int=4, num_eig::Int=4, block_r::Int=4, init_gpu::Bool=true,
+                             path_variant::Symbol=:long)
+    P = _default_lmp_paths(max_len; path_variant=path_variant)
     pl = length(P)
 
     dl = DenseLinearLayer(1, pl, true)

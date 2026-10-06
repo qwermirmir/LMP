@@ -17,6 +17,7 @@ const CPU_TESTS = [
     "test_clover.jl",
     "test_checkpoint.jl",
     "test_compat.jl",
+    "test_paths.jl",
     "subspace_similarity.jl",
     "ddalphaamg_setup_modes.jl",
     "gdlambda_amg.jl",

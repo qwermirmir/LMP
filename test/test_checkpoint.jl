@@ -21,3 +21,15 @@ include(joinpath(@__DIR__, "golden", "model.jl"))
     @test_broken all("layer_$(i)_W" in saved
                      for (i, l) in enumerate(layers) if l isa Union{PTLayer,DenseLinearLayer})
 end
+
+@testset "checkpoint refuses a model with other paths" begin
+    layers = golden_model().layers
+    opt = Adam(1.0e-3)
+    path = tempname() * ".jld2"
+    save_checkpoint(path, layers, opt)
+    @test haskey(JLD2.load(path), "layer_3_paths")
+
+    other = golden_model(max_len=4).layers
+    @test_throws ArgumentError load_checkpoint!(path, other, Adam(1.0e-3))
+    rm(path)
+end

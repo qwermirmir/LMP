@@ -88,14 +88,56 @@ function reverse_paths(paths::Paths)
 end
 
 """
-    _default_lmp_paths(max_len=4)
+    _default_lmp_paths(max_len=4; path_variant=:long)
 
-The path set of the standard LMP models: the empty path, the eight single
-steps, and for each of the eight directions a straight path of every length
-2, 4, 8, ... up to `max_len` (and `max_len` itself if it is not a power of
-two). `max_len = 2` gives 17 paths, `max_len = 4` gives 25.
+The path sets of the LMP models. Every set starts with the empty path.
+
+- `:long`: the eight single steps, and for each of the eight directions a
+  straight path of every length 2, 4, 8, ... up to `max_len` (and `max_len`
+  itself if it is not a power of two). `max_len = 2` gives 17 paths,
+  `max_len = 4` gives 25.
+- `:long_only1248`: straight paths of length 1, 2, 4 and 8 in each direction
+  (33 paths); `max_len` is ignored.
+- `:long_only2468`: straight paths of length 2, 4, 6 and 8 (33 paths).
+- `:corner33_ordered`: the eight single steps and the 24 two-step corners
+  (+-mu, +-nu) for mu < nu (33 paths).
+- `:short_repeat4`: the eight single steps, repeated four times (33 paths).
 """
-function _default_lmp_paths(max_len::Int=4)
+function _default_lmp_paths(max_len::Int=4; path_variant::Symbol=:long)
+    if path_variant == :long_only1248
+        P = Paths[Paths([[0]])]
+        for len in (1, 2, 4, 8), d in (1, 2, 3, 4, -1, -2, -3, -4)
+            push!(P, Paths([fill(d, len)]))
+        end
+        return P
+    end
+    if path_variant == :corner33_ordered
+        P = Paths[Paths([[0]])]
+        for d in (1, 2, 3, 4, -1, -2, -3, -4)
+            push!(P, Paths([[d]]))
+        end
+        for (mu, nu) in ((1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4))
+            for (smu, snu) in ((1, 1), (1, -1), (-1, 1), (-1, -1))
+                push!(P, Paths([[smu * mu, snu * nu]]))
+            end
+        end
+        return P
+    end
+    if path_variant == :long_only2468
+        P = Paths[Paths([[0]])]
+        for len in (2, 4, 6, 8), d in (1, 2, 3, 4, -1, -2, -3, -4)
+            push!(P, Paths([fill(d, len)]))
+        end
+        return P
+    end
+    if path_variant == :short_repeat4
+        P = Paths[Paths([[0]])]
+        for _ in 1:4, d in (1, 2, 3, 4, -1, -2, -3, -4)
+            push!(P, Paths([[d]]))
+        end
+        return P
+    end
+    path_variant == :long || throw(ArgumentError("Unknown path variant: $path_variant"))
     P = Vector{Paths}(undef, 9)
     for i in 1:9
         if i <= 5

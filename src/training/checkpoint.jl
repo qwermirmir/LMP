@@ -12,6 +12,12 @@ function save_checkpoint(path::AbstractString, layers, opt::Adam)
     data = Dict{String,Any}("opt_t" => opt.t)
 
     for (i, layer) in enumerate(layers)
+        # The paths are stored so that loading can refuse a model built with a
+        # different path set: weights of the same size are not interchangeable.
+        if layer isa PTLayer
+            data["layer_$(i)_paths"] = [[Int[step.f for step in p.steps] for p in path.various]
+                                       for path in layer.paths]
+        end
         if (layer isa PTLayer || layer isa DenseLinearLayer) && layer._W_gpu !== nothing
             # _W_cpu_buf is the (NG,NG,NW) staging buffer populated by sync_layers!
             data["layer_$(i)_W"] = layer._W_cpu_buf !== nothing ?
@@ -313,6 +319,16 @@ Falls back silently if a layer's key is absent (partial checkpoint).
 """
 function load_checkpoint!(path::AbstractString, layers, opt::Adam)
     data = JLD2.load(path)
+    # Check every stored path set before changing the model or the optimizer.
+    for (i, layer) in enumerate(layers)
+        key = "layer_$(i)_paths"
+        if haskey(data, key)
+            layer isa PTLayer || throw(ArgumentError("Checkpoint expects PTLayer at layer $i"))
+            actual = [[Int[step.f for step in p.steps] for p in path.various]
+                      for path in layer.paths]
+            data[key] == actual || throw(ArgumentError("Checkpoint PT paths mismatch at layer $i; build the matching path_variant"))
+        end
+    end
     opt.t = Int(get(data, "opt_t", 0))
     lattice_dims = _lattice_dims_from_layers(layers)
 
