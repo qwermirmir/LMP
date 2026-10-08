@@ -28,6 +28,7 @@ const GPU_TESTS = [
     "test_checkpoint_gpu.jl",
     "test_train_gpu.jl",
     "ddalphaamg_setup_modes_gpu.jl",
+    "test_shared_fshifted_gpu.jl",
 ]
 
 function run_test_file(file)

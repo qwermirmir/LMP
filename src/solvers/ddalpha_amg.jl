@@ -1,6 +1,6 @@
 module DDalphaAMG
 
-using ..LMP: inner_product, fused_wilson_mul_gpu!, zero_wf!
+using ..LMP: inner_product, fused_wilson_mul_gpu!, zero_wf!, _is_shared_fshifted
 using Gaugefields
 using LatticeDiracOperators
 using LinearAlgebra
@@ -101,13 +101,15 @@ storage.
 # field. The solver allocates work fields in its inner loops, so build the same
 # zeroed field from device arrays instead. The field type has only a
 # lattice-size constructor, so the struct is assembled the way Base.deepcopy
-# builds immutable structs. deepcopy itself must not be used: it leaves the
-# copied fshifted buffer with a 16-byte allocation, which breaks shifts.
+# builds immutable structs. A field made by deepcopy keeps sharing its fshifted
+# scratch buffer (see deepcopy_internal in fermion_ops.jl) instead of getting
+# its own.
 function _amg_similar(x::WF3x1GPU)
     T = typeof(x)
     fields = Any[getfield(x, name) for name in fieldnames(T)]
     for (i, value) in enumerate(fields)
-        value isa CuArray && (fields[i] = CUDA.zeros(eltype(value), size(value)))
+        value isa CuArray && !_is_shared_fshifted(value) &&
+            (fields[i] = CUDA.zeros(eltype(value), size(value)))
     end
     return ccall(:jl_new_structv, Any, (Any, Ptr{Any}, UInt32), T, fields, length(fields))::T
 end

@@ -827,11 +827,24 @@ function unpack_fermions!(fields::AbstractVector, buf::CuArray{ComplexF64, 5})
 end
 
 # ============================================================
-#  deepcopy of a GPU field replaces its fshifted buffer by a 1-element
-#  placeholder. The GPU code never uses fshifted of its result buffers, and
-#  this avoids copying a freed CuArray. On a 16^3x32 lattice it saves 24 MB per
-#  buffer, about 18.6 GB for 31 layers x 25 fields.
+#  deepcopy of a GPU field points its fshifted buffer at one scratch array
+#  shared by every copy of the same size. fshifted only holds the shifted copy
+#  of a field between a LatticeDiracOperators shift and the multiplication that
+#  reads it, so copies can share it as long as no single operation needs the
+#  shifted data of two copies at once; the LMP GPU kernels never use it. On a
+#  16^3x32 lattice this saves 24 MB per buffer, about 18.6 GB for 31 layers x
+#  25 fields. A smaller placeholder would make LatticeDiracOperators' mul!
+#  write past it and return wrong results.
 # ============================================================
+const _SHARED_FSHIFTED = Dict{Any,CuArray{ComplexF64,4,CUDA.DeviceMemory}}()
+
+function _shared_fshifted(x::WF3x1GPU)
+    dims = size(x.f)
+    return get!(() -> CUDA.zeros(ComplexF64, dims), _SHARED_FSHIFTED, (CUDA.device(), dims))
+end
+
+_is_shared_fshifted(buffer) = any(shared -> shared === buffer, values(_SHARED_FSHIFTED))
+
 function Base.deepcopy_internal(x::WF3x1GPU, dict::IdDict)
     haskey(dict, x) && return dict[x]::WF3x1GPU
     # immutable struct: collect all fields first, then construct via jl_new_structv
@@ -839,8 +852,7 @@ function Base.deepcopy_internal(x::WF3x1GPU, dict::IdDict)
     fields = Vector{Any}(undef, nf)
     for i in 1:nf
         if fieldname(WF3x1GPU, i) === :fshifted
-            # tiny 1-element placeholder: 16 bytes instead of 24 MB
-            fields[i] = CuArray{ComplexF64,4,CUDA.DeviceMemory}(undef, 1, 1, 1, 1)
+            fields[i] = _shared_fshifted(x)
         elseif isdefined(x, i)
             fields[i] = Base.deepcopy_internal(getfield(x, i), dict)
         end
@@ -851,7 +863,7 @@ function Base.deepcopy_internal(x::WF3x1GPU, dict::IdDict)
 end
 
 function _alloc_result_wf(x::WF3x1GPU)
-    return deepcopy(x)  # fshifted is replaced by the deepcopy_internal method above
+    return deepcopy(x)  # shares fshifted, see the deepcopy_internal method above
 end
 
 _alloc_result_wf(x::WF3x1CPU) = deepcopy(x)
