@@ -96,8 +96,25 @@ storage.
 @inline _coarse_vector(Nv::Int, Nblocks::Int, template::WF3x1) =
     CoarseVector(Nv, Nblocks, _amg_device(template))
 
+# LatticeDiracOperators' similar builds zeroed CPU arrays and copies them to
+# the GPU, which costs about 70 ms and 265 MB of host memory for a 24^3x48
+# field. The solver allocates work fields in its inner loops, so build the same
+# zeroed field from device arrays instead. The field type has only a
+# lattice-size constructor, so the struct is assembled the way Base.deepcopy
+# builds immutable structs. deepcopy itself must not be used: it leaves the
+# copied fshifted buffer with a 16-byte allocation, which breaks shifts.
+function _amg_similar(x::WF3x1GPU)
+    T = typeof(x)
+    fields = Any[getfield(x, name) for name in fieldnames(T)]
+    for (i, value) in enumerate(fields)
+        value isa CuArray && (fields[i] = CUDA.zeros(eltype(value), size(value)))
+    end
+    return ccall(:jl_new_structv, Any, (Any, Ptr{Any}, UInt32), T, fields, length(fields))::T
+end
+_amg_similar(x) = similar(x)
+
 function _copy_wf(x::T) where {T<:WF3x1}
-    y = similar(x)
+    y = _amg_similar(x)
     LatticeDiracOperators.substitute_fermion!(y, x)
     return y
 end
@@ -625,9 +642,9 @@ end
 function ensure_coarse_gmres_cache!(setup::DDalphaAMG_Setup, template::CoarseVector, restart::Int)
     m = min(restart, length(template.data))
     if setup._gmres_restart != m || length(setup._gmres_V) != m + 1
-        setup._gmres_V = [similar(template) for _ in 1:(m + 1)]
-        setup._gmres_w = similar(template)
-        setup._gmres_r = similar(template)
+        setup._gmres_V = [_amg_similar(template) for _ in 1:(m + 1)]
+        setup._gmres_w = _amg_similar(template)
+        setup._gmres_r = _amg_similar(template)
         setup._gmres_H = zeros(ComplexF64, m + 1, m)
         setup._gmres_e1 = zeros(ComplexF64, m + 1)
         setup._gmres_restart = m
@@ -2659,14 +2676,14 @@ Prolongate a coarse-grid vector to the fine grid:
 """
 function prolongate_c2f(setup::DDalphaAMG_Setup, cv::CoarseVector)
     if setup.test_vectors[1] isa WF3x1GPU
-        f = similar(setup.test_vectors[1])
+        f = _amg_similar(setup.test_vectors[1])
         return prolongate_c2f!(f, setup, cv)
     end
     r = setup.r; Nv = setup.Nv
     NBX, NBY, NBZ, NBT = setup.NBX, setup.NBY, setup.NBZ, setup.NBT
     NC, NG = setup.NC, setup.NG
 
-    f = similar(setup.test_vectors[1])
+    f = _amg_similar(setup.test_vectors[1])
 
     @inbounds for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
         bidx = block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
@@ -2746,7 +2763,7 @@ already contains separately coarsened chiral sectors.
 """
 function coarse_apply(setup::DDalphaAMG_Setup, D, cv::CoarseVector)
     fine_v = prolongate_c2f(setup, cv)
-    Dfine_v = similar(fine_v)
+    Dfine_v = _amg_similar(fine_v)
     _amg_mul_dirac!(Dfine_v, D, fine_v)
     return restrict_f2c(setup, Dfine_v)
 end
@@ -2860,8 +2877,8 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
         end
 
         e_c = _coarse_vector(Nv, Nblocks, setup.test_vectors[1])
-        fine_buf1 = similar(setup.test_vectors[1])
-        fine_buf2 = similar(setup.test_vectors[1])
+        fine_buf1 = _amg_similar(setup.test_vectors[1])
+        fine_buf2 = _amg_similar(setup.test_vectors[1])
         result_c = _coarse_vector(Nv, Nblocks, setup.test_vectors[1])
         nb_plus_dev = use_gpu ? CuArray(Int32.(nb_plus)) : nb_plus
         nb_minus_dev = use_gpu ? CuArray(Int32.(nb_minus)) : nb_minus
@@ -2926,8 +2943,8 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
 
     Dc = zeros(ComplexF64, n, n)
     e_c = _coarse_vector(Nv, Nblocks, setup.test_vectors[1])
-    fine_buf1 = similar(setup.test_vectors[1])
-    fine_buf2 = similar(setup.test_vectors[1])
+    fine_buf1 = _amg_similar(setup.test_vectors[1])
+    fine_buf2 = _amg_similar(setup.test_vectors[1])
     result_c = _coarse_vector(Nv, Nblocks, setup.test_vectors[1])
 
     for j in 1:n
@@ -2987,8 +3004,8 @@ function mr_smooth!(x::WF3x1, D, b::WF3x1; niter::Int=4,
                     fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                     flop_counter::Union{Nothing,Ref{Int}}=nothing)
 
-    Dr = similar(x)  # D*r work buffer
-    r = similar(x)   # b - D*x work buffer
+    Dr = _amg_similar(x)  # D*r work buffer
+    r = _amg_similar(x)   # b - D*x work buffer
     zero_wf!(Dr)
     zero_wf!(r)
     for _ = 1:niter
@@ -3207,20 +3224,20 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
     NBX, NBY, NBZ, NBT = setup.NBX, setup.NBY, setup.NBZ, setup.NBT
 
     # Preallocate reusable work buffers.
-    δ      = similar(x)
-    res    = similar(x)
-    Ddelta = similar(x)
-    local_r = block_solver == :mr ? similar(x) : nothing
-    Alr = block_solver == :mr ? similar(x) : nothing
-    oe_b_odd = odd_even ? similar(x) : nothing
-    oe_A_b_odd = odd_even ? similar(x) : nothing
-    oe_schur_r = odd_even ? similar(x) : nothing
-    oe_schur_Ar = odd_even ? similar(x) : nothing
-    oe_odd_part = odd_even ? similar(x) : nothing
-    oe_A_odd_part = odd_even ? similar(x) : nothing
-    oe_delta_odd = odd_even ? similar(x) : nothing
-    gmres_V = block_solver == :gmres ? [similar(x) for _ in 1:(nblock_gmres + 1)] : WF3x1[]
-    gmres_w = block_solver == :gmres ? similar(x) : nothing
+    δ      = _amg_similar(x)
+    res    = _amg_similar(x)
+    Ddelta = _amg_similar(x)
+    local_r = block_solver == :mr ? _amg_similar(x) : nothing
+    Alr = block_solver == :mr ? _amg_similar(x) : nothing
+    oe_b_odd = odd_even ? _amg_similar(x) : nothing
+    oe_A_b_odd = odd_even ? _amg_similar(x) : nothing
+    oe_schur_r = odd_even ? _amg_similar(x) : nothing
+    oe_schur_Ar = odd_even ? _amg_similar(x) : nothing
+    oe_odd_part = odd_even ? _amg_similar(x) : nothing
+    oe_A_odd_part = odd_even ? _amg_similar(x) : nothing
+    oe_delta_odd = odd_even ? _amg_similar(x) : nothing
+    gmres_V = block_solver == :gmres ? [_amg_similar(x) for _ in 1:(nblock_gmres + 1)] : WF3x1[]
+    gmres_w = block_solver == :gmres ? _amg_similar(x) : nothing
     gmres_H = block_solver == :gmres ? zeros(ComplexF64, nblock_gmres + 1, nblock_gmres) : zeros(ComplexF64, 0, 0)
     gmres_e1 = block_solver == :gmres ? zeros(ComplexF64, nblock_gmres + 1) : ComplexF64[]
     block_dofs = r_blk^4 * setup.NC * setup.NG
@@ -3299,7 +3316,7 @@ function _amg_initial_inverse_smooth!(test_vectors::Vector{T}, D,
                                       fine_apply_counter::Union{Nothing,Ref{Int}}=nothing) where {T<:WF3x1}
     nstages > 0 || throw(ArgumentError("nstages must be positive, got $nstages"))
     _amg_sap_schedule_code(sap_schedule)
-    work = similar(test_vectors[1])
+    work = _amg_similar(test_vectors[1])
     for v in eachindex(test_vectors)
         for stage in 1:nstages
             zero_wf!(work)
@@ -3335,7 +3352,7 @@ function _amg_initial_direct_smooth!(test_vectors::Vector{T}, D,
                                      sap_schedule::Symbol=:twocolor,
                                      fine_apply_counter::Union{Nothing,Ref{Int}}=nothing) where {T<:WF3x1}
     niter > 0 || throw(ArgumentError("niter must be positive, got $niter"))
-    zero_rhs = similar(test_vectors[1])
+    zero_rhs = _amg_similar(test_vectors[1])
     zero_wf!(zero_rhs)
     for vector in test_vectors
         if smoother == :sap
@@ -3453,8 +3470,8 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
     # Allocate a fine-grid buffer only when no precomputed operator is available.
     local fine_buf1, fine_buf2
     if !has_Dc && !has_stencil
-        fine_buf1 = similar(setup.test_vectors[1])
-        fine_buf2 = similar(setup.test_vectors[1])
+        fine_buf1 = _amg_similar(setup.test_vectors[1])
+        fine_buf2 = _amg_similar(setup.test_vectors[1])
     end
 
     x_c = similar(b_c)
@@ -3704,8 +3721,8 @@ function _amg_coarse_gmres_restart_boundary(
     has_stencil = setup.coarse_stencil !== nothing
     local fine_buf1, fine_buf2
     if !has_Dc && !has_stencil
-        fine_buf1 = similar(setup.test_vectors[1])
-        fine_buf2 = similar(setup.test_vectors[1])
+        fine_buf1 = _amg_similar(setup.test_vectors[1])
+        fine_buf2 = _amg_similar(setup.test_vectors[1])
     end
 
     m = ensure_coarse_gmres_cache!(setup, b_c, restart)
@@ -3839,12 +3856,12 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
     coarse_gmres_mode in (:incremental, :restart_boundary) ||
         throw(ArgumentError(
             "coarse_gmres_mode must be :incremental or :restart_boundary, got $coarse_gmres_mode"))
-    x = similar(b)
+    x = _amg_similar(b)
     zero_wf!(x)
 
     # Pre-allocate work buffers to avoid temporary WF allocations in hot path.
-    r_fine = similar(b)
-    correction = similar(b)
+    r_fine = _amg_similar(b)
+    correction = _amg_similar(b)
     r_coarse = _coarse_vector(setup)
 
     # 1. Pre-smoothing
@@ -3942,11 +3959,11 @@ function _sap_smooth_gpu_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalpha
     NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ); NBT = Int32(setup.NBT)
     schedule_code = _amg_sap_schedule_code(sap_schedule)
 
-    delta = similar(x)
-    local_r = similar(x)
-    Alr = similar(x)
-    res = similar(x)
-    Ddelta = similar(x)
+    delta = _amg_similar(x)
+    local_r = _amg_similar(x)
+    Alr = _amg_similar(x)
+    res = _amg_similar(x)
+    Ddelta = _amg_similar(x)
     num = CUDA.zeros(ComplexF64, setup.Nblocks)
     den = CUDA.zeros(ComplexF64, setup.Nblocks)
     block_dofs = setup.r^4 * setup.NC * setup.NG
@@ -4014,15 +4031,15 @@ function _sap_smooth_gpu_odd_even_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
     NBX = Int32(setup.NBX); NBY = Int32(setup.NBY); NBZ = Int32(setup.NBZ); NBT = Int32(setup.NBT)
     schedule_code = _amg_sap_schedule_code(sap_schedule)
 
-    delta = similar(x)
-    schur_r = similar(x)
-    b_odd = similar(x)
-    A_b_odd = similar(x)
-    schur_Ar = similar(x)
-    odd_part = similar(x)
-    A_odd_part = similar(x)
-    res = similar(x)
-    Ddelta = similar(x)
+    delta = _amg_similar(x)
+    schur_r = _amg_similar(x)
+    b_odd = _amg_similar(x)
+    A_b_odd = _amg_similar(x)
+    schur_Ar = _amg_similar(x)
+    odd_part = _amg_similar(x)
+    A_odd_part = _amg_similar(x)
+    res = _amg_similar(x)
+    Ddelta = _amg_similar(x)
     num = CUDA.zeros(ComplexF64, setup.Nblocks)
     den = CUDA.zeros(ComplexF64, setup.Nblocks)
     block_dofs = setup.r^4 * setup.NC * setup.NG
@@ -4133,7 +4150,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 profile::Bool=false,
                 profile_synchronize::Bool=true)
 
-    x = x0 === nothing ? similar(b) : _copy_wf(x0)
+    x = x0 === nothing ? _amg_similar(b) : _copy_wf(x0)
     x0 === nothing && zero_wf!(x)
     b_norm = sqrt(real(inner_product(b, b)))
     if b_norm < 1e-30
@@ -4224,7 +4241,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
             _variable_fine_apply_counter[] += _fine_apply_counter[] - fine_before_vcycle
             _variable_coarse_apply_counter[] += _coarse_apply_counter[] - coarse_before_vcycle
 
-            w = similar(b)
+            w = _amg_similar(b)
             outer_fine_before = _fine_apply_counter[]
             _amg_profile_time!(_profile, :outer_apply_preconditioned_vector) do
                 _amg_mul_dirac!(w, D, Z[j]; fine_apply_counter=_fine_apply_counter)
@@ -4318,7 +4335,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
     end
 
     if verbose
-        r_final = similar(b)
+        r_final = _amg_similar(b)
         outer_fine_before = _fine_apply_counter[]
         _amg_mul_dirac!(r_final, D, x; fine_apply_counter=_fine_apply_counter)
         axpby!(1, b, -1, r_final)
@@ -4383,11 +4400,11 @@ function _sap_smooth_gpu_gmres_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
     m = Int32(nblock_gmres)
     mplus = Int32(nblock_gmres + 1)
 
-    δ = similar(x)
-    res = similar(x)
-    Ddelta = similar(x)
-    w = similar(x)
-    V = [similar(x) for _ in 1:(nblock_gmres + 1)]
+    δ = _amg_similar(x)
+    res = _amg_similar(x)
+    Ddelta = _amg_similar(x)
+    w = _amg_similar(x)
+    V = [_amg_similar(x) for _ in 1:(nblock_gmres + 1)]
     H = CUDA.zeros(ComplexF64, (nblock_gmres + 1) * nblock_gmres * setup.Nblocks)
     beta = CUDA.zeros(Float64, setup.Nblocks)
     dotbuf = CUDA.zeros(ComplexF64, setup.Nblocks)
@@ -4698,13 +4715,13 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             end
         end
     else
-        test_vectors = [similar(template) for _ in 1:Nv_smooth]
+        test_vectors = [_amg_similar(template) for _ in 1:Nv_smooth]
         for v in 1:Nv_smooth
             random_fermion!(test_vectors[v])
         end
 
         # 2. Smooth test vectors so they approximate low modes.
-        zero_rhs = similar(template)
+        zero_rhs = _amg_similar(template)
         zero_wf!(zero_rhs)
 
         if smoother == :vcycle
@@ -4790,8 +4807,8 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                                              fine_apply_counter=_setup_fine_apply_counter)
             end
 
-            r_fine = direct_mode ? similar(template) : nothing
-            correction = direct_mode ? similar(template) : nothing
+            r_fine = direct_mode ? _amg_similar(template) : nothing
+            correction = direct_mode ? _amg_similar(template) : nothing
 
             for iter in 1:nvcycle
                 cur_vectors = _copy_wf_vector(test_vectors)
@@ -5047,7 +5064,7 @@ end
 function deflated_initial_guess(D, b::WF3x1, test_vectors::Vector{T};
                                  verbose::Bool=false) where T<:WF3x1
     Nv = length(test_vectors)
-    Nv == 0 && return similar(b)
+    Nv == 0 && return _amg_similar(b)
     _assert_same_wf_layout("test_vectors[1]", test_vectors[1], "b", b)
     for i in 2:Nv
         _assert_same_wf_layout("test_vectors[$i]", test_vectors[i], "test_vectors[1]", test_vectors[1])
@@ -5056,7 +5073,7 @@ function deflated_initial_guess(D, b::WF3x1, test_vectors::Vector{T};
     G   = zeros(ComplexF64, Nv, Nv)
     rhs = zeros(ComplexF64, Nv)
 
-    Dv = similar(b)
+    Dv = _amg_similar(b)
     for j in 1:Nv
         _amg_mul_dirac!(Dv, D, test_vectors[j])
         for i in 1:Nv
@@ -5069,7 +5086,7 @@ function deflated_initial_guess(D, b::WF3x1, test_vectors::Vector{T};
     c = G \ rhs
 
     # x0 = Σ c_j v_j
-    x0 = similar(b)
+    x0 = _amg_similar(b)
     zero_wf!(x0)
     for j in 1:Nv
         axpby!(c[j], test_vectors[j], 1, x0)
