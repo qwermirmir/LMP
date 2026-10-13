@@ -115,6 +115,14 @@ function _amg_similar(x::WF3x1GPU)
 end
 _amg_similar(x) = similar(x)
 
+# f / c on the device: the same axpby as Base.:/(::WF3x1, ::Number), whose result
+# field comes from the slow LatticeDiracOperators similar.
+function _amg_scaled(f::WF3x1, c::Number)
+    g = _amg_similar(f)
+    axpby!(1 / c, f, 0, g)
+    return g
+end
+
 function _copy_wf(x::T) where {T<:WF3x1}
     y = _amg_similar(x)
     LatticeDiracOperators.substitute_fermion!(y, x)
@@ -3404,7 +3412,8 @@ function _amg_direct_near_null_update!(vector::WF3x1, D,
         setup, D, r_coarse;
         maxiter=coarse_maxiter,
         restart=coarse_restart,
-        tol=coarse_tol)
+        tol=coarse_tol,
+        arnoldi_mode=arnoldi_mode)
     prolongate_c2f!(correction, setup, e_coarse)
     if update_smoother == :sap
         sap_smooth!(correction, D, r_fine, setup;
@@ -3707,9 +3716,12 @@ end
 function _amg_coarse_gmres_restart_boundary(
         setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
         maxiter::Int=50, restart::Int=20, tol::Float64=1e-2,
+        arnoldi_mode::Symbol=:auto,
         coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
         flop_counter::Union{Nothing,Ref{Int}}=nothing,
         profile::Union{Nothing,AMGProfile}=nothing)
+    arnoldi_mode in (:auto, :scalar, :batched) ||
+        throw(ArgumentError("arnoldi_mode must be :auto, :scalar, or :batched"))
     x_c = similar(b_c)
     zero!(x_c)
     b_norm = _amg_profile_time!(profile, :coarse_rhs_norm) do
@@ -3733,6 +3745,18 @@ function _amg_coarse_gmres_restart_boundary(
     r_c = setup._gmres_r::CoarseVector
     H = setup._gmres_H
     e1 = setup._gmres_e1
+    # One classical Gram-Schmidt pass with reorthogonalization per Arnoldi step
+    # (four GEMVs) instead of j separate dot/axpby launches, each of which waits
+    # for its scalar on the host.
+    use_batched_arnoldi = b_c.data isa CuArray && arnoldi_mode != :scalar
+    if arnoldi_mode == :batched && !(b_c.data isa CuArray)
+        throw(ArgumentError("arnoldi_mode=:batched requires GPU coarse vectors"))
+    end
+    local arnoldi_basis, arnoldi_coeff_dev, arnoldi_coeff_host
+    if use_batched_arnoldi
+        arnoldi_basis, arnoldi_coeff_dev, arnoldi_coeff_host =
+            _ensure_gpu_coarse_arnoldi_cache!(setup, ncoarse, m)
+    end
 
     @inline function apply_Dc!(w, v)
         _amg_profile_time!(profile, :coarse_apply) do
@@ -3764,24 +3788,39 @@ function _amg_coarse_gmres_restart_boundary(
 
         fill!(H, zero(ComplexF64))
         V[1].data .= r_c.data ./ β
+        use_batched_arnoldi && (view(arnoldi_basis, :, 1) .= V[1].data)
         _amg_count_flops!(flop_counter, 2 * ncoarse)
 
         j_final = m
         for j in 1:m
             apply_Dc!(w_c, V[j])
-            for i in 1:j
-                H[i,j] = _amg_profile_time!(profile, :coarse_mgs_dot) do
-                    coarse_dot(V[i], w_c)
+            if use_batched_arnoldi
+                H[j+1,j] = _amg_profile_time!(profile, :coarse_batched_mgs) do
+                    _amg_gpu_batched_orthogonalize!(
+                        w_c.data, arnoldi_basis, j,
+                        arnoldi_coeff_dev, arnoldi_coeff_host)
                 end
-                _amg_profile_time!(profile, :coarse_mgs_axpby) do
-                    coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
+                @inbounds for i in 1:j
+                    H[i,j] = arnoldi_coeff_host[i]
                 end
                 _amg_count_flops!(flop_counter,
-                    _amg_complex_dot_flops(ncoarse) +
-                    _amg_complex_axpby_flops(ncoarse))
-            end
-            H[j+1,j] = _amg_profile_time!(profile, :coarse_mgs_norm) do
-                coarse_norm(w_c)
+                    2j * (_amg_complex_dot_flops(ncoarse) +
+                          _amg_complex_axpby_flops(ncoarse)))
+            else
+                for i in 1:j
+                    H[i,j] = _amg_profile_time!(profile, :coarse_mgs_dot) do
+                        coarse_dot(V[i], w_c)
+                    end
+                    _amg_profile_time!(profile, :coarse_mgs_axpby) do
+                        coarse_axpby!(-H[i,j], V[i], 1.0, w_c)
+                    end
+                    _amg_count_flops!(flop_counter,
+                        _amg_complex_dot_flops(ncoarse) +
+                        _amg_complex_axpby_flops(ncoarse))
+                end
+                H[j+1,j] = _amg_profile_time!(profile, :coarse_mgs_norm) do
+                    coarse_norm(w_c)
+                end
             end
             _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
             if abs(H[j+1,j]) < 1e-14
@@ -3791,6 +3830,7 @@ function _amg_coarse_gmres_restart_boundary(
             _amg_profile_time!(profile, :coarse_mgs_normalize) do
                 V[j+1].data .= w_c.data ./ H[j+1,j]
             end
+            use_batched_arnoldi && (view(arnoldi_basis, :, j + 1) .= V[j+1].data)
             _amg_count_flops!(flop_counter, 2 * ncoarse)
         end
 
@@ -3902,6 +3942,7 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
             _amg_coarse_gmres_restart_boundary(
                 setup, D, r_coarse;
                 maxiter=coarse_maxiter, restart=coarse_restart, tol=coarse_tol,
+                arnoldi_mode=coarse_arnoldi_mode,
                 coarse_apply_counter=coarse_apply_counter,
                 flop_counter=flop_counter,
                 profile=profile)
@@ -4214,7 +4255,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
         g  = zeros(ComplexF64, m + 1)
         g[1] = β
 
-        V[1] = r / β
+        V[1] = _amg_scaled(r, β)
         _outer_vector_flop_counter[] += 2 * nfine
 
         j_final = m
@@ -4272,7 +4313,7 @@ function fgmres(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 converged = true
                 break
             end
-            V[j+1] = w / H[j+1,j]
+            V[j+1] = _amg_scaled(w, H[j+1,j])
             _outer_vector_flop_counter[] += 2 * nfine
 
             for i = 1:(j-1)
