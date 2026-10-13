@@ -7,7 +7,7 @@ using LinearAlgebra
 using CUDA
 export DDalphaAMG_Setup, CoarseVector
 export setup_DDalphaAMG, solve_DDalphaAMG, vcycle
-export restrict_f2c, prolongate_c2f, coarse_apply
+export restrict_f2c, prolongate_c2f
 export restrict_f2c!, prolongate_c2f!, coarse_apply!
 export mr_smooth!, sap_smooth!
 export block_orthonormalize!
@@ -65,13 +65,7 @@ function coarse_norm(a::CoarseVector)
 end
 
 function coarse_axpby!(α, x::CoarseVector, β, y::CoarseVector)
-    if y.data isa CuArray
-        y.data .= α .* x.data .+ β .* y.data
-        return y
-    end
-    @inbounds @simd for i in eachindex(y.data)
-        y.data[i] = α * x.data[i] + β * y.data[i]
-    end
+    y.data .= α .* x.data .+ β .* y.data
     return y
 end
 
@@ -160,7 +154,7 @@ mutable struct DDalphaAMG_Setup{T<:WF3x1}
     NC::Int; NG::Int
     NBX::Int; NBY::Int; NBZ::Int; NBT::Int
     Nblocks::Int
-    Dc_matrix::Union{Nothing, Matrix{ComplexF64}}
+    Dc_matrix::Nothing        # unused; kept so the positional constructors stay unchanged
     coarse_stencil::Union{Nothing, Any}
     _gmres_V::Vector{CoarseVector}
     _gmres_w::Union{Nothing, CoarseVector}
@@ -175,6 +169,18 @@ end
 # Preserve the pre-mode positional constructor used by internal helpers and tests.
 DDalphaAMG_Setup{T}(args::Vararg{Any,23}) where {T<:WF3x1} =
     DDalphaAMG_Setup{T}(args..., :inverse_sap)
+
+# A setup that holds only the test vectors and the block layout, before any
+# coarse operator exists: used for setup smoothing and as the final setup shell.
+function _amg_vector_setup(template::WF3x1, test_vectors, r::Int, Nv::Int,
+                           setup_mode::Symbol=:inverse_sap)
+    NBX, NBY, NBZ, NBT = template.NX ÷ r, template.NY ÷ r, template.NZ ÷ r, template.NT ÷ r
+    return DDalphaAMG_Setup{typeof(template)}(
+        test_vectors, r, Nv, template.NX, template.NY, template.NZ, template.NT,
+        template.NC, template.NG, NBX, NBY, NBZ, NBT, NBX * NBY * NBZ * NBT,
+        nothing, nothing, CoarseVector[], nothing, nothing,
+        zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing, setup_mode)
+end
 
 @inline function _amg_validate_setup_mode(mode::Symbol)
     mode in (:inverse_sap, :direct_near_null) && return mode
@@ -300,10 +306,6 @@ function _amg_coarse_stencil_couplings_per_block(setup::DDalphaAMG_Setup)
 end
 
 function _amg_coarse_operator_flops_per_apply(setup::DDalphaAMG_Setup)
-    n = setup.Nv * setup.Nblocks
-    if setup.Dc_matrix !== nothing
-        return _amg_complex_matvec_flops(n, n)
-    end
     couplings = _amg_coarse_stencil_couplings_per_block(setup)
     return setup.Nblocks * couplings * _amg_complex_matvec_flops(setup.Nv, setup.Nv)
 end
@@ -316,7 +318,6 @@ end
 @inline _amg_fine_dofs(x::WF3x1) = length(x.f)
 @inline _amg_fine_dofs(setup::DDalphaAMG_Setup) =
     setup.NX * setup.NY * setup.NZ * setup.NT * setup.NC * setup.NG
-@inline _amg_coarse_dofs(setup::DDalphaAMG_Setup) = setup.Nv * setup.Nblocks
 @inline _amg_restrict_flops(setup::DDalphaAMG_Setup) =
     setup.Nv * _amg_fine_dofs(setup) * 8
 @inline _amg_prolongate_flops(setup::DDalphaAMG_Setup) =
@@ -790,50 +791,9 @@ function _ensure_gpu_cache!(setup)
     return cache
 end
 
-function _ddamg_fill_random_kernel!(x)
-    idx = threadIdx().x + (blockIdx().x - 1) * blockDim().x
-    if idx <= length(x)
-        x[idx] = ComplexF64(0.0)
-    end
-    return nothing
-end
-
 function random_fermion!(x::WF3x1GPU)
     x.f .= CUDA.randn(Float64, size(x.f)) .+ im .* CUDA.randn(Float64, size(x.f))
     return x
-end
-
-function _amg_restrict_kernel!(out, tv, x, block_sites, block_counts, nc_ng::Int32, Nv::Int32)
-    bid = Int32(blockIdx().x)
-    v = Int32(blockIdx().y)
-    tid = Int32(threadIdx().x)
-    bsz = Int32(blockDim().x)
-    sh = CUDA.@cuDynamicSharedMem(ComplexF64, Int(bsz))
-    total = block_counts[bid] * nc_ng
-    acc = ComplexF64(0.0)
-    p = tid
-    while p <= total
-        site_pos = (p - Int32(1)) ÷ nc_ng + Int32(1)
-        comp = (p - Int32(1)) % nc_ng + Int32(1)
-        site = block_sites[site_pos, bid]
-        fidx = (site - Int32(1)) * nc_ng + comp
-        @inbounds acc += conj(tv[fidx]) * x[fidx]
-        p += bsz
-    end
-    sh[tid] = acc
-    sync_threads()
-    half = bsz >> Int32(1)
-    while half > Int32(0)
-        if tid <= half
-            sh[tid] += sh[tid + half]
-        end
-        sync_threads()
-        half = half >> Int32(1)
-    end
-    if tid == Int32(1)
-        out[(bid - Int32(1)) * Nv + v] = sh[Int32(1)]
-    end
-    return nothing
 end
 
 function _amg_restrict_one_kernel!(out, tv, x, block_sites, block_counts,
@@ -1457,8 +1417,6 @@ end
     return (bx + by + bz + bt) & 1
 end
 
-@inline _amg_sap_schedule_code(::Val{:twocolor}) = Int32(0)
-@inline _amg_sap_schedule_code(::Val{:boundary8}) = Int32(1)
 @inline function _amg_sap_schedule_code(schedule::Symbol)
     schedule == :twocolor && return Int32(0)
     schedule == :boundary8 && return Int32(1)
@@ -2398,14 +2356,6 @@ end
 # ==========================================
 
 """
-    gamma5_sign(ig)
-
-Return the gamma5 sign for spin component `ig` using the convention
-`diag(-1, -1, +1, +1)`.
-"""
-@inline gamma5_sign(ig::Int) = ig <= 2 ? -1 : 1
-
-"""
     gamma5!(x::WF3x1)
 
 Apply gamma5 in place using the convention `diag(-1, -1, +1, +1)` for spin
@@ -2597,36 +2547,7 @@ Restrict a fine-grid vector to the coarse grid:
 `v_coarse[B, i] = <phi_i | x>_B`.
 """
 function restrict_f2c(setup::DDalphaAMG_Setup, x::WF3x1)
-    if x isa WF3x1GPU
-        cv = _coarse_vector(setup)
-        return restrict_f2c!(cv, setup, x)
-    end
-    r = setup.r; Nv = setup.Nv
-    NBX, NBY, NBZ, NBT = setup.NBX, setup.NBY, setup.NBZ, setup.NBT
-    NC, NG = setup.NC, setup.NG
-
-    cv = _coarse_vector(setup)
-
-    @inbounds for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
-        bidx = block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
-        for v = 1:Nv
-            val = zero(ComplexF64)
-            tv = setup.test_vectors[v]
-            for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
-                it = (bt-1)*r + lt; iz = (bz-1)*r + lz
-                iy = (by-1)*r + ly; ix = (bx-1)*r + lx
-                for ig = 1:NG
-                    for ic = 1:NC
-                        val += conj(tv[ic, ix, iy, iz, it, ig]) *
-                               x[ic, ix, iy, iz, it, ig]
-                    end
-                end
-            end
-            cv.data[(bidx-1)*Nv + v] = val
-        end
-    end
-
-    return cv
+    return restrict_f2c!(_coarse_vector(setup), setup, x)
 end
 
 """
@@ -2685,35 +2606,7 @@ Prolongate a coarse-grid vector to the fine grid:
 `x(site) = sum_i c[B(site), i] * phi_i(site)`.
 """
 function prolongate_c2f(setup::DDalphaAMG_Setup, cv::CoarseVector)
-    if setup.test_vectors[1] isa WF3x1GPU
-        f = _amg_similar(setup.test_vectors[1])
-        return prolongate_c2f!(f, setup, cv)
-    end
-    r = setup.r; Nv = setup.Nv
-    NBX, NBY, NBZ, NBT = setup.NBX, setup.NBY, setup.NBZ, setup.NBT
-    NC, NG = setup.NC, setup.NG
-
-    f = _amg_similar(setup.test_vectors[1])
-
-    @inbounds for bt = 1:NBT, bz = 1:NBZ, by = 1:NBY, bx = 1:NBX
-        bidx = block_linear_index(bx, by, bz, bt, NBX, NBY, NBZ)
-        base = (bidx-1)*Nv
-        for lt = 1:r, lz = 1:r, ly = 1:r, lx = 1:r
-            it = (bt-1)*r + lt; iz = (bz-1)*r + lz
-            iy = (by-1)*r + ly; ix = (bx-1)*r + lx
-            for ig = 1:NG
-                for ic = 1:NC
-                    val = zero(ComplexF64)
-                    for v = 1:Nv
-                        val += cv.data[base + v] * setup.test_vectors[v][ic, ix, iy, iz, it, ig]
-                    end
-                    f[ic, ix, iy, iz, it, ig] = val
-                end
-            end
-        end
-    end
-
-    return f
+    return prolongate_c2f!(_amg_similar(setup.test_vectors[1]), setup, cv)
 end
 
 """
@@ -2765,20 +2658,6 @@ end
 # ==========================================
 
 """
-    coarse_apply(setup, D, cv) -> CoarseVector
-
-Apply the matrix-free coarse operator `Dc = R * D * P`.
-The restriction is `R = P'`. For paper chiral coarsening, the prolongator
-already contains separately coarsened chiral sectors.
-"""
-function coarse_apply(setup::DDalphaAMG_Setup, D, cv::CoarseVector)
-    fine_v = prolongate_c2f(setup, cv)
-    Dfine_v = _amg_similar(fine_v)
-    _amg_mul_dirac!(Dfine_v, D, fine_v)
-    return restrict_f2c(setup, Dfine_v)
-end
-
-"""
     coarse_apply!(result, setup, D, cv, fine_buf1, fine_buf2) -> CoarseVector
 
 In-place coarse-operator application. `fine_buf1` stores the prolongated vector
@@ -2800,10 +2679,13 @@ end
 """
     precompute_coarse_operator!(setup, D; verbose=false, mode=:stencil)
 
-Build the coarse operator in one of two forms:
+Build the block-stencil coarse operator, with Nv x Nv couplings per block and
+neighbor:
 
-- `mode=:stencil` (default): block-stencil operator with Nv x Nv couplings per block/neighbor.
-- `mode=:dense`: full dense matrix Dc (legacy path).
+- `mode=:stencil` (default): probe the matrix-free coarse operator block by block.
+- `mode=:direct_stencil`: compute `P' D P` in one GPU kernel. It falls back to
+  `:stencil` on the CPU, for operators other than the fused Wilson operator, and
+  when a direction has 2 or fewer coarse blocks.
 """
 function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
                                      verbose::Bool=false,
@@ -2812,7 +2694,6 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
     Nblocks = setup.Nblocks
     n = Nv * Nblocks
 
-    setup.Dc_matrix = nothing
     setup.coarse_stencil = nothing
 
     if mode == :direct_stencil
@@ -2940,37 +2821,8 @@ function precompute_coarse_operator!(setup::DDalphaAMG_Setup, D;
             println("  coarse operator stencil precompute done")
         end
         return setup
-    elseif mode != :dense
-        throw(ArgumentError("unknown coarse operator mode: $mode (use :stencil or :dense)"))
     end
-    if setup.test_vectors[1] isa WF3x1GPU
-        throw(ArgumentError("mode=:dense is CPU-only; use mode=:stencil for GPU DDalphaAMG"))
-    end
-
-    if verbose
-        println("  dense coarse operator precompute done")
-    end
-
-    Dc = zeros(ComplexF64, n, n)
-    e_c = _coarse_vector(Nv, Nblocks, setup.test_vectors[1])
-    fine_buf1 = _amg_similar(setup.test_vectors[1])
-    fine_buf2 = _amg_similar(setup.test_vectors[1])
-    result_c = _coarse_vector(Nv, Nblocks, setup.test_vectors[1])
-
-    for j in 1:n
-        fill!(e_c.data, zero(ComplexF64))
-        e_c.data[j] = one(ComplexF64)
-        coarse_apply!(result_c, setup, D, e_c, fine_buf1, fine_buf2)
-        @inbounds for i in 1:n
-            Dc[i, j] = result_c.data[i]
-        end
-    end
-
-    setup.Dc_matrix = Dc
-    if verbose
-        println("  dense coarse operator precompute done")
-    end
-    return setup
+    throw(ArgumentError("unknown coarse operator mode: $mode (use :stencil or :direct_stencil)"))
 end
 
 
@@ -3193,7 +3045,6 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
                      nblock_gmres::Int=nblock_mr,
                      odd_even::Bool=true,
                      sap_schedule::Symbol=:boundary8,
-                     sparse_residual_update::Bool=true,
                      fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                      flop_counter::Union{Nothing,Ref{Int}}=nothing)
     block_solver in (:mr, :gmres) ||
@@ -3208,7 +3059,6 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
                                                         niter=niter,
                                                         nblock_mr=nblock_mr,
                                                         sap_schedule=sap_schedule,
-                                                        sparse_residual_update=sparse_residual_update,
                                                         fine_apply_counter=fine_apply_counter,
                                                         flop_counter=flop_counter)
         end
@@ -3217,7 +3067,6 @@ function sap_smooth!(x::WF3x1, D, b::WF3x1, setup::DDalphaAMG_Setup;
                                                niter=niter,
                                                nblock_mr=nblock_mr,
                                                sap_schedule=sap_schedule,
-                                               sparse_residual_update=sparse_residual_update,
                                                fine_apply_counter=fine_apply_counter,
                                                flop_counter=flop_counter)
         else
@@ -3473,14 +3322,13 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
                       profile::Union{Nothing,AMGProfile}=nothing)
     arnoldi_mode in (:auto, :scalar, :batched) ||
         throw(ArgumentError("arnoldi_mode must be :auto, :scalar, or :batched"))
-    has_Dc = setup.Dc_matrix !== nothing
     has_stencil = setup.coarse_stencil !== nothing
     op = has_stencil ? setup.coarse_stencil::CoarseStencilOperator : nothing
     use_odd_even = coarse_odd_even && has_stencil && _amg_can_coarse_odd_even(op)
 
     # Allocate a fine-grid buffer only when no precomputed operator is available.
     local fine_buf1, fine_buf2
-    if !has_Dc && !has_stencil
+    if !has_stencil
         fine_buf1 = _amg_similar(setup.test_vectors[1])
         fine_buf2 = _amg_similar(setup.test_vectors[1])
     end
@@ -3545,8 +3393,6 @@ function coarse_gmres(setup::DDalphaAMG_Setup, D, b_c::CoarseVector;
                 _amg_apply_coarse_odd_even_schur!(w, op, oe_self_inv, v, oe_tmp1, oe_tmp2, oe_tmp3)
             elseif has_stencil
                 apply_coarse_stencil!(w, op, v)
-            elseif has_Dc
-                mul!(w.data, setup.Dc_matrix, v.data)
             else
                 coarse_apply!(w, setup, D, v, fine_buf1, fine_buf2)
             end
@@ -3731,10 +3577,9 @@ function _amg_coarse_gmres_restart_boundary(
     _amg_count_flops!(flop_counter, _amg_complex_norm_flops(ncoarse))
     b_norm < 1e-30 && return x_c
 
-    has_Dc = setup.Dc_matrix !== nothing
     has_stencil = setup.coarse_stencil !== nothing
     local fine_buf1, fine_buf2
-    if !has_Dc && !has_stencil
+    if !has_stencil
         fine_buf1 = _amg_similar(setup.test_vectors[1])
         fine_buf2 = _amg_similar(setup.test_vectors[1])
     end
@@ -3762,8 +3607,6 @@ function _amg_coarse_gmres_restart_boundary(
         _amg_profile_time!(profile, :coarse_apply) do
             if has_stencil
                 apply_coarse_stencil!(w, setup.coarse_stencil, v)
-            elseif has_Dc
-                mul!(w.data, setup.Dc_matrix, v.data)
             else
                 coarse_apply!(w, setup, D, v, fine_buf1, fine_buf2)
             end
@@ -3889,7 +3732,6 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                 coarse_gmres_mode::Symbol=:incremental,
                 sap_odd_even::Bool=true,
                 sap_schedule::Symbol=:boundary8,
-                sparse_residual_update::Bool=true,
                 coarse_arnoldi_mode::Symbol=:auto,
                 coarse_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                 fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
@@ -3914,7 +3756,6 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                             block_solver=:mr, nblock_mr=sap_block_mr_steps,
                             odd_even=sap_odd_even,
                             sap_schedule=sap_schedule,
-                            sparse_residual_update=sparse_residual_update,
                             fine_apply_counter=fine_apply_counter,
                             flop_counter=flop_counter)
             else
@@ -3973,7 +3814,6 @@ function vcycle(D, b::WF3x1, setup::DDalphaAMG_Setup;
                             block_solver=:mr, nblock_mr=sap_block_mr_steps,
                             odd_even=sap_odd_even,
                             sap_schedule=sap_schedule,
-                            sparse_residual_update=sparse_residual_update,
                             fine_apply_counter=fine_apply_counter,
                             flop_counter=flop_counter)
             else
@@ -3990,7 +3830,6 @@ end
 function _sap_smooth_gpu_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalphaAMG_Setup;
                                      niter::Int=1, nblock_mr::Int=4,
                                      sap_schedule::Symbol=:boundary8,
-                                     sparse_residual_update::Bool=true,
                                      fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                                      flop_counter::Union{Nothing,Ref{Int}}=nothing)
     cache = _ensure_gpu_cache!(setup)
@@ -4045,7 +3884,7 @@ function _sap_smooth_gpu_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU, setup::DDalpha
                 nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code)
             _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
-            handled = sparse_residual_update && sap_schedule == :boundary8 &&
+            handled = sap_schedule == :boundary8 &&
                       _amg_boundary8_residual_update!(res, delta, D, setup, step_i)
             if !handled
                 _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
@@ -4062,7 +3901,6 @@ function _sap_smooth_gpu_odd_even_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
                                               setup::DDalphaAMG_Setup;
                                               niter::Int=1, nblock_mr::Int=4,
                                               sap_schedule::Symbol=:boundary8,
-                                              sparse_residual_update::Bool=true,
                                               fine_apply_counter::Union{Nothing,Ref{Int}}=nothing,
                                               flop_counter::Union{Nothing,Ref{Int}}=nothing)
     cache = _ensure_gpu_cache!(setup)
@@ -4152,7 +3990,7 @@ function _sap_smooth_gpu_odd_even_mr_batched!(x::WF3x1GPU, D, b::WF3x1GPU,
                 nc_ng, total, step, NBX, NBY, NBZ, NBT, schedule_code)
             _amg_count_flops!(flop_counter, _amg_complex_axpby_flops(_amg_fine_dofs(x)))
 
-            handled = sparse_residual_update && sap_schedule == :boundary8 &&
+            handled = sap_schedule == :boundary8 &&
                       _amg_boundary8_residual_update!(res, delta, D, setup, step_i)
             if !handled
                 _amg_mul_dirac!(Ddelta, D, delta; fine_apply_counter=fine_apply_counter)
@@ -4709,12 +4547,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                         println("  inverse-smoothing external test vectors with SAP stages 1:$(setup_sap_iters) ($(block_steps) $(block_name) steps per local block solve)...")
                     end
                 end
-                sap_setup = DDalphaAMG_Setup{typeof(template)}(
-                    test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
-                    NBX, NBY, NBZ, NBT, Nblocks, nothing,
-                    nothing,
-                    CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
-                )
+                sap_setup = _amg_vector_setup(template, test_vectors, r, Nv_smooth)
                 if direct_mode
                     _amg_initial_direct_smooth!(test_vectors, D, sap_setup;
                                                 smoother=:sap,
@@ -4740,12 +4573,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                         println("  inverse-smoothing external test vectors with MR stages 1:$nsmooth...")
                     end
                 end
-                external_setup = DDalphaAMG_Setup{typeof(template)}(
-                    test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
-                    NBX, NBY, NBZ, NBT, Nblocks, nothing,
-                    nothing,
-                    CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
-                )
+                external_setup = _amg_vector_setup(template, test_vectors, r, Nv_smooth)
                 if direct_mode
                     _amg_initial_direct_smooth!(test_vectors, D, external_setup;
                                                 smoother=:mr,
@@ -4771,12 +4599,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             _setup_fine_apply_counter = Ref(0)
             # Build near-null seeds and refine them with the selected adaptive
             # setup algorithm.
-            sap_setup = DDalphaAMG_Setup{typeof(template)}(
-                test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
-                NBX, NBY, NBZ, NBT, Nblocks, nothing,
-                nothing,
-                CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
-            )
+            sap_setup = _amg_vector_setup(template, test_vectors, r, Nv_smooth)
             setup_smoother in (:mr, :sap) ||
                 throw(ArgumentError("setup_smoother must be :mr or :sap, got $setup_smoother"))
             vcycle_update_smoother in (:mr, :sap) ||
@@ -4862,13 +4685,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
                     block_orthonormalize!(cur_vectors, r; normalize=block_normalize)
                 end
                 cur_Nv = length(cur_vectors)
-                cur_setup = DDalphaAMG_Setup{typeof(template)}(
-                    cur_vectors, r, cur_Nv, NX, NY, NZ, NT, NC, NG,
-                    NBX, NBY, NBZ, NBT, Nblocks, nothing,
-                    nothing,
-                    CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing,
-                    setup_mode
-                )
+                cur_setup = _amg_vector_setup(template, cur_vectors, r, cur_Nv, setup_mode)
                 precompute_coarse_operator!(cur_setup, D; mode=:direct_stencil)
                 r_coarse = direct_mode ? _coarse_vector(cur_Nv, Nblocks, template) : nothing
 
@@ -4934,12 +4751,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
             end
             # SAP needs a temporary setup for block-local smoothing.
             block_orthonormalize!(test_vectors, r; normalize=block_normalize)
-            pre_setup = DDalphaAMG_Setup{typeof(template)}(
-                test_vectors, r, Nv_smooth, NX, NY, NZ, NT, NC, NG,
-                NBX, NBY, NBZ, NBT, Nblocks, nothing,
-                nothing,
-                CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing
-            )
+            pre_setup = _amg_vector_setup(template, test_vectors, r, Nv_smooth)
             for v in 1:Nv_smooth
                 sap_smooth!(test_vectors[v], D, zero_rhs, pre_setup;
                             niter=setup_sap_iters,
@@ -4976,13 +4788,7 @@ function setup_DDalphaAMG(D, template::WF3x1, r::Int, Nv::Int;
         block_orthonormalize!(test_vectors, r; normalize=block_normalize)
     end
 
-    setup = DDalphaAMG_Setup{typeof(template)}(
-        test_vectors, r, Nv_setup, NX, NY, NZ, NT, NC, NG,
-        NBX, NBY, NBZ, NBT, Nblocks, nothing,
-        nothing,
-        CoarseVector[], nothing, nothing, zeros(ComplexF64, 0, 0), ComplexF64[], 0, nothing,
-        setup_mode
-    )
+    setup = _amg_vector_setup(template, test_vectors, r, Nv_setup, setup_mode)
 
     # Precompute the coarse operator for AMG solves. Matrix-free training losses
     # can skip this expensive assembly.

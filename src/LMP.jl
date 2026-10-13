@@ -115,7 +115,7 @@ export train
 # Multigrid solvers
 export DDalphaAMG_Setup, CoarseVector
 export setup_DDalphaAMG, solve_DDalphaAMG, vcycle
-export restrict_f2c, prolongate_c2f, coarse_apply
+export restrict_f2c, prolongate_c2f
 export restrict_f2c!, prolongate_c2f!, coarse_apply!
 export precompute_coarse_operator!
 export mr_smooth!, sap_smooth!

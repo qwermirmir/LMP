@@ -60,7 +60,6 @@ function gd_coarse_gmres(
     arnoldi_mode in (:auto, :scalar, :batched) || throw(ArgumentError(
         "arnoldi_mode must be :auto, :scalar, or :batched"))
 
-    has_Dc = setup.Dc_matrix !== nothing
     has_stencil = setup.coarse_stencil !== nothing
     op = has_stencil ?
          setup.coarse_stencil::DDalphaAMG.CoarseStencilOperator : nothing
@@ -68,7 +67,7 @@ function gd_coarse_gmres(
                    DDalphaAMG._amg_can_coarse_odd_even(op)
 
     local fine_buf1, fine_buf2
-    if !has_Dc && !has_stencil
+    if !has_stencil
         fine_buf1 = similar(setup.test_vectors[1])
         fine_buf2 = similar(setup.test_vectors[1])
     end
@@ -128,8 +127,6 @@ function gd_coarse_gmres(
                 oe_tmp1, oe_tmp2, oe_tmp3)
         elseif has_stencil
             DDalphaAMG.apply_coarse_stencil!(out, op, input)
-        elseif has_Dc
-            mul!(out.data, setup.Dc_matrix, input.data)
         else
             DDalphaAMG.coarse_apply!(
                 out, setup, D, input, fine_buf1, fine_buf2)
@@ -158,8 +155,6 @@ function gd_coarse_gmres(
         residual.data .= b_c.data
         if has_stencil
             DDalphaAMG.apply_coarse_stencil!(image, op, result)
-        elseif has_Dc
-            mul!(image.data, setup.Dc_matrix, result.data)
         else
             DDalphaAMG.coarse_apply!(
                 image, setup, D, result, fine_buf1, fine_buf2)
