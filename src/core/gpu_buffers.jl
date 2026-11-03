@@ -4,19 +4,19 @@
 # ---- Pack / Unpack fermion fields ----
 # Packing n fields uses one kernel launch instead of n copyto! calls.
 # The device pointers of the fields are cached under (buffer address, n), so
-
-# only the first call allocates. They are stored as UInt64 and reinterpreted
-# as LLVMPtr inside the kernel.
-const _field_ptr_cache = Dict{Tuple{UInt64,Int}, Tuple{UInt64, CuArray{UInt64,1}}}()
+# only the first call for a set of fields allocates. They are stored as UInt64
+# and reinterpreted as LLVMPtr inside the kernel. The whole pointer list is
+# compared: fields that are freed and reallocated (recomputed activations) can
+# get the old address for the first field and new ones for the others.
+const _field_ptr_cache = Dict{Tuple{UInt64,Int}, Tuple{Vector{UInt64}, CuArray{UInt64,1}}}()
 
 function _cached_field_ptrs!(buf::CuArray{ComplexF64,5}, fields)
-    n  = length(fields)
-    kb = reinterpret(UInt64, pointer(buf))
-    p0 = reinterpret(UInt64, pointer(fields[1].f))
-    k  = (kb, n)
+    n    = length(fields)
+    k    = (reinterpret(UInt64, pointer(buf)), n)
+    ptrs = UInt64[reinterpret(UInt64, pointer(fields[i].f)) for i in 1:n]
     cached = get(_field_ptr_cache, k, nothing)
-    if cached === nothing || cached[1] != p0
-        _field_ptr_cache[k] = (p0, CuArray([reinterpret(UInt64, pointer(fields[i].f)) for i in 1:n]))
+    if cached === nothing || cached[1] != ptrs
+        _field_ptr_cache[k] = (ptrs, CuArray(ptrs))
     end
     return _field_ptr_cache[k][2]
 end
