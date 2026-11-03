@@ -25,8 +25,7 @@ mutable struct Ritz_Layer <: Layer
     # Kept from the forward pass for the backward pass
     _Dz::Vector{Any}          # D z[i]
     _DdagDz::Vector{Any}      # D^dagger D z[i]
-    _VD::Vector{Any}          # backward work fields, one per input
-    _work::Vector{Any}        # backward work fields [psi, r]
+    _work::Vector{Any}        # backward work fields [psi, r, conj((D^dagger D - lambda_k) psi_k)]
     _ritz_init::Bool
     # Gram matrices and the eigen decomposition (CPU arrays)
     _A::Matrix{ComplexF64}
@@ -38,7 +37,7 @@ mutable struct Ritz_Layer <: Layer
     _m::Vector{ComplexF64}    # m_k = u_k^dagger B u_k
     function Ritz_Layer(D::Any, activation::ActivationFunction= Identity(),Out =1)
         new(D, activation, Out,
-            Any[], Any[], Any[], Any[], false,
+            Any[], Any[], Any[], false,
             Matrix{ComplexF64}(undef,0,0), Matrix{ComplexF64}(undef,0,0),
             Matrix{ComplexF64}(undef,0,0), Matrix{ComplexF64}(undef,0,0),
             Float64[], Matrix{ComplexF64}(undef,0,0), ComplexF64[])
@@ -171,6 +170,14 @@ function (layer::Ritz_Layer)(x::AbstractVector{<:WF3x1})
     return real(sum(layer._evals))
 end
 
+# D z[i] is only read by the Gram matrix A of the forward pass. With
+# LOW_MEMORY_TRAINING[] the checkpointed training loop frees it after the loss;
+# the next forward pass allocates it again.
+function _release_forward_only_buffers!(layer::Ritz_Layer)
+    layer._Dz = Any[]
+    return nothing
+end
+
 # Prints where NaN or Inf values appear: in A or B, in an input field, in
 # D times an input, or in the gauge links.
 function _report_ritz_nonfinite(A, B, x, Dx, D)
@@ -215,24 +222,16 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
     m     = layer._m
     DdagDz = layer._DdagDz
 
-    need_vd_reinit = isempty(layer._VD) || length(layer._VD) != l
-    if !need_vd_reinit
-        need_vd_reinit = typeof(layer._VD[1]) != typeof(z[1])
+    if length(layer._work) != 3 || typeof(layer._work[1]) != typeof(z[1])
+        layer._work = Any[_alloc_result_wf(z[1]) for _ in 1:3]
     end
-    if need_vd_reinit
-        layer._VD = Vector{Any}(undef, l)
-        for i in 1:l
-            layer._VD[i] = _alloc_result_wf(z[1])
-        end
-        layer._work = Any[_alloc_result_wf(z[1]), _alloc_result_wf(z[1])]  # [psi, r]
-    end
-
-    VD = layer._VD
     ψ  = layer._work[1]
     r  = layer._work[2]
+    vd = layer._work[3]
 
-    # VD[k] = conj((D^dagger D - lambda_k) psi_k), using
-    # D^dagger D psi_k = sum_j u[j,k] D^dagger D z[j].
+    # vd = conj((D^dagger D - lambda_k) psi_k), using
+    # D^dagger D psi_k = sum_j u[j,k] D^dagger D z[j]. Each delta[i] receives
+    # the k = 1..l terms in that order.
     for k in 1:l
         zero_wf!(ψ)
         zero_wf!(r)
@@ -241,12 +240,9 @@ function DeltaRule!(layer::Ritz_Layer, ::Identity, z::Vector{WF3x1}, delta::Vect
             axpby!(evecs[j,k], DdagDz[j], 1, r)     # r = D^dagger D psi
         end
         axpby!(1, r, -evals[k], ψ)                  # psi <- r - lambda_k psi
-        conj_fermion!(VD[k], ψ)
-    end
-
-    for i in 1:l
-        for k in 1:l
-            axpby!(2*evecs[i,k]/m[k], VD[k], 1, delta[i])
+        conj_fermion!(vd, ψ)
+        for i in 1:l
+            axpby!(2*evecs[i,k]/m[k], vd, 1, delta[i])
         end
     end
 
@@ -302,7 +298,6 @@ function _to_cpu(layer::Ritz_Layer)
     layer._ritz_init = false
     layer._Dz = Any[]
     layer._DdagDz = Any[]
-    layer._VD = Any[]
     layer._work = Any[]
     return layer
 end
@@ -312,7 +307,6 @@ function _to_gpu(layer::Ritz_Layer, blocks=nothing)
     layer._ritz_init = false
     layer._Dz = Any[]
     layer._DdagDz = Any[]
-    layer._VD = Any[]
     layer._work = Any[]
     return layer
 end
@@ -322,7 +316,6 @@ function _to_gpu(layer::Ritz_Layer, blocks, shared_U)
     layer._ritz_init = false
     layer._Dz = Any[]
     layer._DdagDz = Any[]
-    layer._VD = Any[]
     layer._work = Any[]
     return layer
 end

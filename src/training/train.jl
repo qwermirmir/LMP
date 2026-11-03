@@ -205,11 +205,11 @@ function train(opt::Opt, layers::Vector{T}, gauge_paths::Vector{String}, U_templ
             refresh_errors && refresh_forward_errors!(layers, D)
             if checkpointing
                 test_temp = Vector{ComplexF64}(undef, 1)
-                checkpoints = _checkpointed_forward_loss!(
+                _checkpointed_forward_loss!(
                     checkpoint_timer, fwd_names, layers, D, u,
-                    test_temp, 1, depth, activation_checkpoint_interval)
+                    test_temp, 1, depth, activation_checkpoint_interval;
+                    keep_checkpoints=false)
                 total += real(test_temp[1])
-                checkpoints = nothing
                 _clear_forward_caches!(layers)
                 fill!(u, nothing)
                 _force_cuda_reclaim!()

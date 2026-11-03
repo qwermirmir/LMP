@@ -28,6 +28,16 @@ end
 # ============================================================
 const _shared_gpu_pool = Dict{Tuple{Symbol,Int}, CuArray{ComplexF64,5}}()
 
+# With LOW_MEMORY_TRAINING[] = true, work buffers whose uses never overlap share
+# memory. Every PTLayer forward, DeltaRule! and gradient call and the Ritz Gram
+# matrices use at most one key of each group:
+#   :result_all, :d_buf, :ritz_x_all   (outputs, output deltas, Ritz inputs)
+#   :hopped_all, :ci_all, :ritz_dx_all (transported inputs, c_i, Ritz D x)
+# and :hop_temp alone. The training loop sets it (see propagation.jl).
+const LOW_MEMORY_TRAINING = Ref(false)
+const _SHARED_BUF_GROUP = Dict(:d_buf => :result_all, :ritz_x_all => :result_all,
+                               :ci_all => :hopped_all, :ritz_dx_all => :hopped_all)
+
 """
     get_shared_buf!(key, NC, NG, bs, rs, n) → CuArray{ComplexF64,5}
 
@@ -35,6 +45,7 @@ Shared 5D GPU work buffer of shape (NC, NG, bs, rs, n). The same (key, n)
 always returns the same CuArray, so all PTLayers share it.
 """
 function get_shared_buf!(key::Symbol, NC::Int, NG::Int, bs::Int, rs::Int, n::Int)
+    LOW_MEMORY_TRAINING[] && (key = get(_SHARED_BUF_GROUP, key, key))
     k = (key, n)
     buf = get(_shared_gpu_pool, k, nothing)
     if buf === nothing || size(buf, 3) != bs || size(buf, 4) != rs

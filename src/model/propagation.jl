@@ -231,6 +231,47 @@ function _is_checkpoint_activation(idx::Int, depth::Int, interval::Int)
     return idx == 1 || idx == depth || ((idx - 1) % interval == 0)
 end
 
+# With ACTIVATION_CHECKPOINT_HOST[] = true the kept activations are stored in host
+# memory and copied back to the GPU when their segment is recomputed (for lattices
+# where the kept activations do not fit next to the backward buffers).
+const ACTIVATION_CHECKPOINT_HOST = Ref(false)
+
+struct HostCheckpoint
+    template::Any                     # a GPU field of the same lattice, to allocate from
+    vectype::Type                     # the activation's vector type, restored as is
+    data::Vector{Array{ComplexF64,4}}
+end
+
+# One GPU field per lattice serves as the template of every host checkpoint, so
+# the checkpoints keep no GPU memory.
+const _HOST_CHECKPOINT_TEMPLATES = Dict{Any,Any}()
+
+function _checkpoint_store(fields)
+    if ACTIVATION_CHECKPOINT_HOST[] && fields isa AbstractVector && !isempty(fields) &&
+       first(fields) isa WF3x1GPU
+        f1 = first(fields)
+        template = get!(() -> _alloc_result_wf(f1), _HOST_CHECKPOINT_TEMPLATES,
+                        (CUDA.device(), size(f1.f)))
+        return HostCheckpoint(template, typeof(fields), [Array(f.f) for f in fields])
+    end
+    return deepcopy(fields)
+end
+
+# The restored fields come from _alloc_result_wf, which shares fshifted; `similar`
+# would allocate a second full field per restored field.
+_checkpoint_load(c) = c
+function _checkpoint_load(c::HostCheckpoint)
+    out = c.vectype(undef, length(c.data))
+    for (i, a) in enumerate(c.data)
+        out[i] = _alloc_result_wf(c.template)
+        copyto!(out[i].f, a)
+    end
+    return out
+end
+
+# Loss layers can free buffers that only their forward pass reads (see ritz.jl).
+_release_forward_only_buffers!(layer) = nothing
+
 # Frees the forward buffers of a layer so that only the kept activations
 # remain in memory.
 function _clear_layer_forward_cache!(layer)
@@ -266,18 +307,20 @@ function _clear_forward_caches!(layers, first_layer::Int=1, last_layer::Int=leng
 end
 
 # Forward pass that keeps only the checkpointed activations; returns them by
-# index and stores the loss in temp[b].
+# index and stores the loss in temp[b]. A forward pass for the loss alone (test
+# loss) passes keep_checkpoints=false.
 function _checkpointed_forward_loss!(to, fwd_names, layers, D, u::Vector{Any},
                                      temp::Vector{ComplexF64}, b::Int,
-                                     depth::Int, checkpoint_interval::Int)
+                                     depth::Int, checkpoint_interval::Int;
+                                     keep_checkpoints::Bool=true)
     checkpoints = Dict{Int,Any}(1 => [D])
     fill!(u, nothing)
     u[1] = checkpoints[1]
 
     for i in 1:(depth-1)
         @timeit to fwd_names[i] u[i+1] = layers[i](u[i])
-        if _is_checkpoint_activation(i + 1, depth, checkpoint_interval)
-            checkpoints[i+1] = deepcopy(u[i+1])
+        if keep_checkpoints && _is_checkpoint_activation(i + 1, depth, checkpoint_interval)
+            checkpoints[i+1] = _checkpoint_store(u[i+1])
         end
         if i > 1
             _clear_layer_forward_cache!(layers[i-1])
@@ -290,17 +333,23 @@ function _checkpointed_forward_loss!(to, fwd_names, layers, D, u::Vector{Any},
         GC.gc(false)
     end
     @timeit to fwd_names[depth] temp[b] = layers[depth](u[depth])
+    LOW_MEMORY_TRAINING[] && _release_forward_only_buffers!(layers[depth])
     _clear_layer_forward_cache!(layers[depth-1])
     u[depth] = nothing
     return checkpoints
 end
 
-# Recomputes the activations from u[start_idx] to u[stop_idx].
+# Recomputes the activations from u[start_idx] to u[stop_idx]. With
+# LOW_MEMORY_TRAINING[] the last one, u[stop_idx], is only recomputed where the
+# backward pass of the segment reads it: as the input of the loss layer and as
+# u[2] for layer 1. The other layers' backward passes read only their inputs
+# and output deltas.
 function _recompute_checkpoint_segment!(to, layers, u::Vector{Any}, checkpoints,
                                         start_idx::Int, stop_idx::Int)
     fill!(u, nothing)
-    u[start_idx] = checkpoints[start_idx]
-    for i in start_idx:(stop_idx-1)
+    u[start_idx] = _checkpoint_load(checkpoints[start_idx])
+    last_read = !LOW_MEMORY_TRAINING[] || stop_idx == length(layers) || stop_idx == 2
+    for i in start_idx:(stop_idx - (last_read ? 1 : 2))
         @timeit to "checkpoint_recompute" u[i+1] = layers[i](u[i])
     end
     return nothing
