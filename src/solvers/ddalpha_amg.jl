@@ -503,6 +503,34 @@ function apply_coarse_stencil!(out::CoarseVector, op::CoarseStencilOperator, x::
     return out
 end
 
+"""
+    _amg_coarse_stencil_part!(out, op, x, self_color, hop_color)
+
+Apply part of the coarse stencil: on blocks of color `self_color` the
+block-diagonal term `A_bb x_b`, on blocks of color `hop_color` the sum of the
+nearest-neighbor terms, and zero on all other blocks. A color of -1 selects no
+blocks. Each stencil entry is read only where it is needed, so the odd-even
+Schur complement reads the stencil once instead of twice.
+
+The terms are summed in the same order as in `apply_coarse_stencil!`. When `x`
+vanishes on the blocks whose terms are skipped, the selected entries therefore
+equal those of the full application exactly. On the CPU this simply applies the
+full stencil. Experiment scripts count each call as one coarse stencil
+application, like a call to `apply_coarse_stencil!`.
+"""
+function _amg_coarse_stencil_part!(out::CoarseVector, op::CoarseStencilOperator, x::CoarseVector, self_color::Integer, hop_color::Integer)
+    if out.data isa CuArray
+        fill!(out.data, zero(ComplexF64))
+        threads = max(32, min(256, op.Nv))
+        @cuda threads=threads blocks=op.Nblocks _amg_coarse_stencil_part_kernel!(
+            out.data, op.self, op.plus, op.minus, op.nb_plus, op.nb_minus, x.data,
+            Int32(op.Nv), Int32(op.Nblocks), Int32(op.NBX), Int32(op.NBY), Int32(op.NBZ),
+            Int32(self_color), Int32(hop_color))
+        return out
+    end
+    return apply_coarse_stencil!(out, op, x)
+end
+
 function _amg_coarse_self_inverse_gpu(self::CuArray{ComplexF64,3})
     self_lu = copy(self)
     self_inv = similar(self)
@@ -615,33 +643,42 @@ function _amg_coarse_blockdiag_solve!(out::CoarseVector, op::CoarseStencilOperat
     return out
 end
 
+# Odd-even reduction of the coarse system (color 0 = even blocks, 1 = odd).
+# Neighboring blocks always have opposite colors, and every input below vanishes
+# on one color: x_even on odd blocks, and the block-diagonal solves on even
+# blocks. Each step therefore applies only the part of the stencil that can be
+# nonzero (see _amg_coarse_stencil_part!).
+
+# Right-hand side of the Schur system: b_e - A_eo A_oo^{-1} b_o.
 function _amg_coarse_odd_even_rhs!(out::CoarseVector, op::CoarseStencilOperator,
                                    self_inv, rhs::CoarseVector,
                                    tmp1::CoarseVector, tmp2::CoarseVector,
                                    tmp3::CoarseVector)
     _amg_coarse_color_mask!(tmp1, op, rhs, 1)
     _amg_coarse_blockdiag_solve!(tmp2, op, self_inv, tmp1, 1)
-    apply_coarse_stencil!(tmp3, op, tmp2)
+    _amg_coarse_stencil_part!(tmp3, op, tmp2, -1, 0)           # A_eo tmp2
     _amg_coarse_color_diff!(out, op, rhs, tmp3, 0)
     return out
 end
 
+# Schur complement on even blocks: (A_ee - A_eo A_oo^{-1} A_oe) x_e.
 function _amg_apply_coarse_odd_even_schur!(out::CoarseVector, op::CoarseStencilOperator,
                                            self_inv, x_even::CoarseVector,
                                            tmp1::CoarseVector, tmp2::CoarseVector,
                                            tmp3::CoarseVector)
-    apply_coarse_stencil!(tmp1, op, x_even)
+    _amg_coarse_stencil_part!(tmp1, op, x_even, 0, 1)          # A_ee x_e, A_oe x_e
     _amg_coarse_blockdiag_solve!(tmp2, op, self_inv, tmp1, 1)
-    apply_coarse_stencil!(tmp3, op, tmp2)
+    _amg_coarse_stencil_part!(tmp3, op, tmp2, -1, 0)           # A_eo tmp2
     _amg_coarse_color_diff!(out, op, tmp1, tmp3, 0)
     return out
 end
 
+# Full solution from the even part: x_o = A_oo^{-1} (b_o - A_oe x_e).
 function _amg_coarse_odd_even_reconstruct!(out::CoarseVector, op::CoarseStencilOperator,
                                            self_inv, x_even::CoarseVector,
                                            rhs::CoarseVector, tmp1::CoarseVector,
                                            tmp2::CoarseVector, tmp3::CoarseVector)
-    apply_coarse_stencil!(tmp1, op, x_even)
+    _amg_coarse_stencil_part!(tmp1, op, x_even, -1, 1)         # A_oe x_e
     _amg_coarse_color_diff!(tmp2, op, rhs, tmp1, 1)
     _amg_coarse_blockdiag_solve!(tmp3, op, self_inv, tmp2, 1)
     out.data .= x_even.data
@@ -726,10 +763,6 @@ function _ensure_gpu_cache!(setup)
     setup.test_vectors[1] isa WF3x1GPU || return nothing
     cache = hasproperty(setup, :_gpu_cache) ? setup._gpu_cache : nothing
     if cache isa Dict && get(cache, :r, nothing) == setup.r
-        if !haskey(cache, :boundary8_affected_sites)
-            cache[:boundary8_affected_sites] = _amg_build_boundary8_affected_sites(
-                Array(cache[:bmap]), setup.test_vectors[1].blockinfo, setup)
-        end
         return cache
     end
 
@@ -783,7 +816,6 @@ function _ensure_gpu_cache!(setup)
         :block_sites => CuArray(sites),
         :block_counts => CuArray(counts),
         :max_count => Int(max_count),
-        :boundary8_affected_sites => _amg_build_boundary8_affected_sites(bmap, bi, setup),
     )
     if hasproperty(setup, :_gpu_cache)
         setup._gpu_cache = cache
@@ -1092,6 +1124,37 @@ function _amg_coarse_stencil_kernel!(out, self, plus, minus, nb_plus, nb_minus, 
             end
         end
         out[dst] = acc
+    end
+    return nothing
+end
+
+# Same loops as _amg_coarse_stencil_kernel!, restricted by block color.
+function _amg_coarse_stencil_part_kernel!(out, self, plus, minus, nb_plus, nb_minus, x,
+                                          Nv::Int32, Nblocks::Int32,
+                                          NBX::Int32, NBY::Int32, NBZ::Int32,
+                                          self_color::Int32, hop_color::Int32)
+    bid = Int32(blockIdx().x)
+    i = Int32(threadIdx().x)
+    if bid <= Nblocks && i <= Nv
+        color = Int32(_amg_block_color_from_bid(bid, NBX, NBY, NBZ))
+        acc = ComplexF64(0.0)
+        if color == self_color
+            for j in Int32(1):Nv
+                acc += self[i, j, bid] * x[(bid - Int32(1)) * Nv + j]
+            end
+        elseif color == hop_color
+            for mu in Int32(1):Int32(4)
+                sm = nb_minus[bid, mu]
+                sp = nb_plus[bid, mu]
+                for j in Int32(1):Nv
+                    acc += plus[i, j, sm, mu] * x[(sm - Int32(1)) * Nv + j]
+                    if sp != sm
+                        acc += minus[i, j, sp, mu] * x[(sp - Int32(1)) * Nv + j]
+                    end
+                end
+            end
+        end
+        out[(bid - Int32(1)) * Nv + i] = acc
     end
     return nothing
 end
@@ -2046,6 +2109,17 @@ function _amg_boundary8_residual_update_kernel!(res, delta, affected_sites,
     return nothing
 end
 
+# Sites whose residual changes in each step of the :boundary8 SAP schedule. Only
+# that schedule needs them, and building them takes about 0.1 s on CPU for a
+# 16^3x32 lattice, so they are added to the GPU cache on first use.
+function _amg_boundary8_affected_sites!(setup)
+    cache = _ensure_gpu_cache!(setup)
+    get!(cache, :boundary8_affected_sites) do
+        _amg_build_boundary8_affected_sites(
+            Array(cache[:bmap]), setup.test_vectors[1].blockinfo, setup)
+    end
+end
+
 function _amg_boundary8_residual_update!(res::WF3x1, delta::WF3x1, D,
                                          setup::DDalphaAMG_Setup, step::Integer)
     if !(res isa WF3x1GPU && delta isa WF3x1GPU && 0 <= step <= 7 &&
@@ -2053,7 +2127,7 @@ function _amg_boundary8_residual_update!(res::WF3x1, delta::WF3x1, D,
         return false
     end
 
-    affected_sites = _ensure_gpu_cache!(setup)[:boundary8_affected_sites][step + 1]
+    affected_sites = _amg_boundary8_affected_sites!(setup)[step + 1]
     naffected = length(affected_sites)
     naffected == 0 && return true
     threads = 256
